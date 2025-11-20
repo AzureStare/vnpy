@@ -13,8 +13,36 @@ from vnpy.trader.constant import Interval
 from vnpy.trader.utility import extract_vt_symbol
 
 from .logger import logger
-from .dataset import AlphaDataset, to_datetime
-from .model import AlphaModel
+
+try:
+    from .dataset import AlphaDataset, to_datetime
+except ModuleNotFoundError as dataset_error:
+
+    class AlphaDataset:  # type: ignore
+        """Stub that raises informative error when optional deps are missing."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            raise ModuleNotFoundError(
+                "AlphaDataset requires optional dependency 'alphalens'."
+            ) from dataset_error
+
+    def to_datetime(value: datetime | str) -> datetime:
+        """Fallback parser when alphalens (dataset dependency) is absent."""
+        if isinstance(value, datetime):
+            return value
+        return datetime.fromisoformat(value)
+
+try:
+    from .model import AlphaModel
+except ModuleNotFoundError as model_error:
+
+    class AlphaModel:  # type: ignore
+        """Stub that raises informative error when optional deps are missing."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            raise ModuleNotFoundError(
+                "AlphaModel requires optional dependency 'alphalens'/'lightgbm'."
+            ) from model_error
 
 
 class AlphaLab:

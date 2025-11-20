@@ -1,0 +1,1254 @@
+{
+  "trade_date": "2023-02-21",
+  "symbol_count": 208,
+  "symbols": [
+    {
+      "symbol": "AAPL",
+      "close": 148.48,
+      "adv_usd": 9775463505.92,
+      "med_vol": 65836904.0
+    },
+    {
+      "symbol": "ABBV",
+      "close": 152,
+      "adv_usd": 888437568.0,
+      "med_vol": 5844984.0
+    },
+    {
+      "symbol": "ABNB",
+      "close": 128.78,
+      "adv_usd": 706112072.64,
+      "med_vol": 5483088.0
+    },
+    {
+      "symbol": "ABT",
+      "close": 103.65,
+      "adv_usd": 476500868.32500005,
+      "med_vol": 4597210.5
+    },
+    {
+      "symbol": "ACN",
+      "close": 269.15,
+      "adv_usd": 574514536.2249999,
+      "med_vol": 2134551.5
+    },
+    {
+      "symbol": "ADBE",
+      "close": 346.7,
+      "adv_usd": 865438607.25,
+      "med_vol": 2496217.5
+    },
+    {
+      "symbol": "ADI",
+      "close": 185.97,
+      "adv_usd": 654839237.73,
+      "med_vol": 3521209.0
+    },
+    {
+      "symbol": "ADM",
+      "close": 81.4,
+      "adv_usd": 253619119.60000002,
+      "med_vol": 3115714.0
+    },
+    {
+      "symbol": "ADP",
+      "close": 224.68,
+      "adv_usd": 433679245.78000003,
+      "med_vol": 1930208.5
+    },
+    {
+      "symbol": "AI",
+      "close": 21.63,
+      "adv_usd": 414569534.82,
+      "med_vol": 19166414.0
+    },
+    {
+      "symbol": "ALB",
+      "close": 241.96,
+      "adv_usd": 332187730.86,
+      "med_vol": 1372903.5
+    },
+    {
+      "symbol": "ALGN",
+      "close": 304,
+      "adv_usd": 314962392.0,
+      "med_vol": 1036060.5
+    },
+    {
+      "symbol": "AMAT",
+      "close": 111.28,
+      "adv_usd": 621728648.84,
+      "med_vol": 5587065.5
+    },
+    {
+      "symbol": "AMD",
+      "close": 76.77,
+      "adv_usd": 3819942503.055,
+      "med_vol": 49758271.5
+    },
+    {
+      "symbol": "AMGN",
+      "close": 238.24,
+      "adv_usd": 540793840.96,
+      "med_vol": 2269954.0
+    },
+    {
+      "symbol": "AMT",
+      "close": 204.65,
+      "adv_usd": 384016106.45,
+      "med_vol": 1876453.0
+    },
+    {
+      "symbol": "AMZN",
+      "close": 94.58,
+      "adv_usd": 6606153992.67,
+      "med_vol": 69847261.5
+    },
+    {
+      "symbol": "ANET",
+      "close": 33.6325,
+      "adv_usd": 281819363.32,
+      "med_vol": 8379376.0
+    },
+    {
+      "symbol": "APD",
+      "close": 277.51,
+      "adv_usd": 254538138.465,
+      "med_vol": 917221.5
+    },
+    {
+      "symbol": "AVGO",
+      "close": 58.154,
+      "adv_usd": 1138696900.1100001,
+      "med_vol": 19580715.0
+    },
+    {
+      "symbol": "AXP",
+      "close": 173.48,
+      "adv_usd": 549333527.6999999,
+      "med_vol": 3166552.5
+    },
+    {
+      "symbol": "BA",
+      "close": 205.52,
+      "adv_usd": 1125976463.92,
+      "med_vol": 5478671.0
+    },
+    {
+      "symbol": "BAC",
+      "close": 34.52,
+      "adv_usd": 1187920846.2800002,
+      "med_vol": 34412539.0
+    },
+    {
+      "symbol": "BDX",
+      "close": 239.5,
+      "adv_usd": 279516139.0,
+      "med_vol": 1167082.0
+    },
+    {
+      "symbol": "BK",
+      "close": 50.43,
+      "adv_usd": 255071863.77,
+      "med_vol": 5057939.0
+    },
+    {
+      "symbol": "BMY",
+      "close": 71.22,
+      "adv_usd": 614260356.99,
+      "med_vol": 8624829.5
+    },
+    {
+      "symbol": "BRK.B",
+      "close": 302.72,
+      "adv_usd": 961148865.6000001,
+      "med_vol": 3175042.5
+    },
+    {
+      "symbol": "BSX",
+      "close": 46.23,
+      "adv_usd": 285391728.34499997,
+      "med_vol": 6173301.5
+    },
+    {
+      "symbol": "BX",
+      "close": 90.73,
+      "adv_usd": 387291756.505,
+      "med_vol": 4268618.5
+    },
+    {
+      "symbol": "C",
+      "close": 49.84,
+      "adv_usd": 835827415.9200001,
+      "med_vol": 16770213.0
+    },
+    {
+      "symbol": "CAT",
+      "close": 240.71,
+      "adv_usd": 743074658.52,
+      "med_vol": 3087012.0
+    },
+    {
+      "symbol": "CB",
+      "close": 208.77,
+      "adv_usd": 338097691.365,
+      "med_vol": 1619474.5
+    },
+    {
+      "symbol": "CDNS",
+      "close": 192.65,
+      "adv_usd": 290251402.575,
+      "med_vol": 1506625.5
+    },
+    {
+      "symbol": "CHTR",
+      "close": 377.91,
+      "adv_usd": 413538221.07000005,
+      "med_vol": 1094277.0
+    },
+    {
+      "symbol": "CI",
+      "close": 293.98,
+      "adv_usd": 441998783.01000005,
+      "med_vol": 1503499.5
+    },
+    {
+      "symbol": "CL",
+      "close": 74.26,
+      "adv_usd": 300556656.56,
+      "med_vol": 4047356.0
+    },
+    {
+      "symbol": "CMCSA",
+      "close": 37.84,
+      "adv_usd": 714794024.1200001,
+      "med_vol": 18889905.5
+    },
+    {
+      "symbol": "CME",
+      "close": 187.89,
+      "adv_usd": 347317483.34999996,
+      "med_vol": 1848515.0
+    },
+    {
+      "symbol": "CMG",
+      "close": 31.3852,
+      "adv_usd": 446437208.14000005,
+      "med_vol": 14224450.0
+    },
+    {
+      "symbol": "CNC",
+      "close": 72.27,
+      "adv_usd": 270973618.74,
+      "med_vol": 3749462.0
+    },
+    {
+      "symbol": "COF",
+      "close": 108.15,
+      "adv_usd": 354444861.75,
+      "med_vol": 3277345.0
+    },
+    {
+      "symbol": "COIN",
+      "close": 62.07,
+      "adv_usd": 1201792636.44,
+      "med_vol": 19361892.0
+    },
+    {
+      "symbol": "COP",
+      "close": 105.31,
+      "adv_usd": 588252603.34,
+      "med_vol": 5585914.0
+    },
+    {
+      "symbol": "COST",
+      "close": 501.74,
+      "adv_usd": 850440519.5500001,
+      "med_vol": 1694982.5
+    },
+    {
+      "symbol": "CRM",
+      "close": 161.62,
+      "adv_usd": 1355279459.8500001,
+      "med_vol": 8385592.5
+    },
+    {
+      "symbol": "CRWD",
+      "close": 112.43,
+      "adv_usd": 527623477.795,
+      "med_vol": 4692906.5
+    },
+    {
+      "symbol": "CSCO",
+      "close": 49.69,
+      "adv_usd": 891034371.8499999,
+      "med_vol": 17931865.0
+    },
+    {
+      "symbol": "CSX",
+      "close": 30.59,
+      "adv_usd": 388399853.45,
+      "med_vol": 12696955.0
+    },
+    {
+      "symbol": "CTSH",
+      "close": 64.66,
+      "adv_usd": 314944570.14,
+      "med_vol": 4870779.0
+    },
+    {
+      "symbol": "CVS",
+      "close": 87.62,
+      "adv_usd": 863256861.22,
+      "med_vol": 9852281.0
+    },
+    {
+      "symbol": "CVX",
+      "close": 161,
+      "adv_usd": 1431941486.5,
+      "med_vol": 8894046.5
+    },
+    {
+      "symbol": "D",
+      "close": 58.1,
+      "adv_usd": 277780050.8,
+      "med_vol": 4781068.0
+    },
+    {
+      "symbol": "DAL",
+      "close": 37.1,
+      "adv_usd": 319462368.05,
+      "med_vol": 8610845.5
+    },
+    {
+      "symbol": "DASH",
+      "close": 58.06,
+      "adv_usd": 267090224.70000002,
+      "med_vol": 4600245.0
+    },
+    {
+      "symbol": "DDOG",
+      "close": 78.52,
+      "adv_usd": 347569368.9,
+      "med_vol": 4426507.5
+    },
+    {
+      "symbol": "DE",
+      "close": 427.17,
+      "adv_usd": 583776502.38,
+      "med_vol": 1366614.0
+    },
+    {
+      "symbol": "DG",
+      "close": 226.61,
+      "adv_usd": 396722387.935,
+      "med_vol": 1750683.5
+    },
+    {
+      "symbol": "DHR",
+      "close": 250.79,
+      "adv_usd": 626887850.475,
+      "med_vol": 2499652.5
+    },
+    {
+      "symbol": "DIS",
+      "close": 102.09,
+      "adv_usd": 1113676176.165,
+      "med_vol": 10908768.5
+    },
+    {
+      "symbol": "DOW",
+      "close": 56.84,
+      "adv_usd": 290203980.78000003,
+      "med_vol": 5105629.5
+    },
+    {
+      "symbol": "DUK",
+      "close": 97.68,
+      "adv_usd": 296321364.24,
+      "med_vol": 3033593.0
+    },
+    {
+      "symbol": "DVN",
+      "close": 53.73,
+      "adv_usd": 403763165.37,
+      "med_vol": 7514669.0
+    },
+    {
+      "symbol": "DXCM",
+      "close": 114.01,
+      "adv_usd": 268438996.21500003,
+      "med_vol": 2354521.5
+    },
+    {
+      "symbol": "EA",
+      "close": 112.02,
+      "adv_usd": 280056665.19,
+      "med_vol": 2500059.5
+    },
+    {
+      "symbol": "EL",
+      "close": 249.99,
+      "adv_usd": 352357780.125,
+      "med_vol": 1409487.5
+    },
+    {
+      "symbol": "ELV",
+      "close": 478.82,
+      "adv_usd": 481544006.98,
+      "med_vol": 1005689.0
+    },
+    {
+      "symbol": "EMR",
+      "close": 82.05,
+      "adv_usd": 269133640.875,
+      "med_vol": 3280117.5
+    },
+    {
+      "symbol": "ENPH",
+      "close": 201.65,
+      "adv_usd": 890609507.325,
+      "med_vol": 4416610.5
+    },
+    {
+      "symbol": "EOG",
+      "close": 119.23,
+      "adv_usd": 349588083.04,
+      "med_vol": 2932048.0
+    },
+    {
+      "symbol": "ETN",
+      "close": 170.76,
+      "adv_usd": 287266730.46,
+      "med_vol": 1682283.5
+    },
+    {
+      "symbol": "ETSY",
+      "close": 124.845,
+      "adv_usd": 341382285.405,
+      "med_vol": 2734449.0
+    },
+    {
+      "symbol": "EXPE",
+      "close": 108.03,
+      "adv_usd": 270690284.865,
+      "med_vol": 2505695.5
+    },
+    {
+      "symbol": "FANG",
+      "close": 134.21,
+      "adv_usd": 270222641.615,
+      "med_vol": 2013431.5
+    },
+    {
+      "symbol": "FCX",
+      "close": 42.66,
+      "adv_usd": 514072794.23999995,
+      "med_vol": 12050464.0
+    },
+    {
+      "symbol": "FDX",
+      "close": 205.65,
+      "adv_usd": 308130741.90000004,
+      "med_vol": 1498326.0
+    },
+    {
+      "symbol": "FIS",
+      "close": 67.11,
+      "adv_usd": 365148932.61,
+      "med_vol": 5441051.0
+    },
+    {
+      "symbol": "FISV",
+      "close": 113.82,
+      "adv_usd": 325892041.85999995,
+      "med_vol": 2863223.0
+    },
+    {
+      "symbol": "FSLR",
+      "close": 160.99,
+      "adv_usd": 282752291.15500003,
+      "med_vol": 1756334.5
+    },
+    {
+      "symbol": "FTNT",
+      "close": 59.71,
+      "adv_usd": 315602190.785,
+      "med_vol": 5285583.5
+    },
+    {
+      "symbol": "GD",
+      "close": 233.52,
+      "adv_usd": 287803125.12,
+      "med_vol": 1232456.0
+    },
+    {
+      "symbol": "GE",
+      "close": 65.6504,
+      "adv_usd": 582229888.4871869,
+      "med_vol": 8868641.9045
+    },
+    {
+      "symbol": "GILD",
+      "close": 84.64,
+      "adv_usd": 512026379.04,
+      "med_vol": 6049461.0
+    },
+    {
+      "symbol": "GIS",
+      "close": 80.16,
+      "adv_usd": 273299868.71999997,
+      "med_vol": 3409429.5
+    },
+    {
+      "symbol": "GM",
+      "close": 41.13,
+      "adv_usd": 579969914.1750001,
+      "med_vol": 14100897.5
+    },
+    {
+      "symbol": "GOOG",
+      "close": 92.05,
+      "adv_usd": 2656931522.1749997,
+      "med_vol": 28864003.5
+    },
+    {
+      "symbol": "GOOGL",
+      "close": 91.79,
+      "adv_usd": 3204169613.69,
+      "med_vol": 34907611.0
+    },
+    {
+      "symbol": "GS",
+      "close": 361.12,
+      "adv_usd": 787475064.08,
+      "med_vol": 2180646.5
+    },
+    {
+      "symbol": "HAL",
+      "close": 36.4,
+      "adv_usd": 336472845.8,
+      "med_vol": 9243759.5
+    },
+    {
+      "symbol": "HCA",
+      "close": 256.09,
+      "adv_usd": 308848125.26,
+      "med_vol": 1206014.0
+    },
+    {
+      "symbol": "HD",
+      "close": 295.5,
+      "adv_usd": 907154415.75,
+      "med_vol": 3069896.5
+    },
+    {
+      "symbol": "HON",
+      "close": 196.76,
+      "adv_usd": 571614362.6,
+      "med_vol": 2905135.0
+    },
+    {
+      "symbol": "HSY",
+      "close": 240.9,
+      "adv_usd": 253476786.75,
+      "med_vol": 1052207.5
+    },
+    {
+      "symbol": "HUBS",
+      "close": 386,
+      "adv_usd": 282258061.0,
+      "med_vol": 731238.5
+    },
+    {
+      "symbol": "HUM",
+      "close": 503.38,
+      "adv_usd": 519295113.77,
+      "med_vol": 1031616.5
+    },
+    {
+      "symbol": "IBM",
+      "close": 131.71,
+      "adv_usd": 580224499.635,
+      "med_vol": 4405318.5
+    },
+    {
+      "symbol": "IDXX",
+      "close": 478.17,
+      "adv_usd": 252692044.60500002,
+      "med_vol": 528456.5
+    },
+    {
+      "symbol": "INTC",
+      "close": 26.06,
+      "adv_usd": 955955566.14,
+      "med_vol": 36682869.0
+    },
+    {
+      "symbol": "INTU",
+      "close": 396.26,
+      "adv_usd": 523604689.28999996,
+      "med_vol": 1321366.5
+    },
+    {
+      "symbol": "ISRG",
+      "close": 233.58,
+      "adv_usd": 384184442.28000003,
+      "med_vol": 1644766.0
+    },
+    {
+      "symbol": "JNJ",
+      "close": 158,
+      "adv_usd": 1117658425.0,
+      "med_vol": 7073787.5
+    },
+    {
+      "symbol": "JPM",
+      "close": 139.63,
+      "adv_usd": 1243325072.195,
+      "med_vol": 8904426.5
+    },
+    {
+      "symbol": "KHC",
+      "close": 39.87,
+      "adv_usd": 269470445.49,
+      "med_vol": 6758727.0
+    },
+    {
+      "symbol": "KLAC",
+      "close": 378.34,
+      "adv_usd": 469627956.07,
+      "med_vol": 1241285.5
+    },
+    {
+      "symbol": "KO",
+      "close": 59.8,
+      "adv_usd": 846909726.0,
+      "med_vol": 14162370.0
+    },
+    {
+      "symbol": "LCID",
+      "close": 99,
+      "adv_usd": 260729563.05,
+      "med_vol": 2633631.95
+    },
+    {
+      "symbol": "LHX",
+      "close": 212.43,
+      "adv_usd": 321722685.84000003,
+      "med_vol": 1514488.0
+    },
+    {
+      "symbol": "LIN",
+      "close": 324.56,
+      "adv_usd": 729928461.96,
+      "med_vol": 2248978.5
+    },
+    {
+      "symbol": "LLY",
+      "close": 327.51,
+      "adv_usd": 833811639.12,
+      "med_vol": 2545912.0
+    },
+    {
+      "symbol": "LMT",
+      "close": 479.19,
+      "adv_usd": 681950383.485,
+      "med_vol": 1423131.5
+    },
+    {
+      "symbol": "LNG",
+      "close": 143.88,
+      "adv_usd": 251598783.48,
+      "med_vol": 1748671.0
+    },
+    {
+      "symbol": "LOW",
+      "close": 201.85,
+      "adv_usd": 570112709.375,
+      "med_vol": 2824437.5
+    },
+    {
+      "symbol": "LRCX",
+      "close": 47.829,
+      "adv_usd": 597876609.5550001,
+      "med_vol": 12500295.0
+    },
+    {
+      "symbol": "LULU",
+      "close": 314.11,
+      "adv_usd": 472917733.8,
+      "med_vol": 1505580.0
+    },
+    {
+      "symbol": "LVS",
+      "close": 56.35,
+      "adv_usd": 253233152.725,
+      "med_vol": 4493933.5
+    },
+    {
+      "symbol": "MA",
+      "close": 355.96,
+      "adv_usd": 982061781.5799999,
+      "med_vol": 2758910.5
+    },
+    {
+      "symbol": "MAR",
+      "close": 170.68,
+      "adv_usd": 300529589.04,
+      "med_vol": 1760778.0
+    },
+    {
+      "symbol": "MCD",
+      "close": 268.55,
+      "adv_usd": 750271498.85,
+      "med_vol": 2793787.0
+    },
+    {
+      "symbol": "MCHP",
+      "close": 80.68,
+      "adv_usd": 368216016.76000005,
+      "med_vol": 4563907.0
+    },
+    {
+      "symbol": "MCK",
+      "close": 361.51,
+      "adv_usd": 311475208.45,
+      "med_vol": 861595.0
+    },
+    {
+      "symbol": "MCO",
+      "close": 294.84,
+      "adv_usd": 253015471.79999998,
+      "med_vol": 858145.0
+    },
+    {
+      "symbol": "MDB",
+      "close": 210.61,
+      "adv_usd": 280839905.295,
+      "med_vol": 1333459.5
+    },
+    {
+      "symbol": "MDLZ",
+      "close": 66.6,
+      "adv_usd": 383677604.99999994,
+      "med_vol": 5760925.0
+    },
+    {
+      "symbol": "MDT",
+      "close": 85.49,
+      "adv_usd": 522004077.24999994,
+      "med_vol": 6106025.0
+    },
+    {
+      "symbol": "MET",
+      "close": 71.05,
+      "adv_usd": 270345143.425,
+      "med_vol": 3804998.5
+    },
+    {
+      "symbol": "META",
+      "close": 172.08,
+      "adv_usd": 4930923404.52,
+      "med_vol": 28654831.5
+    },
+    {
+      "symbol": "MMM",
+      "close": 91.3462,
+      "adv_usd": 326223942.328856,
+      "med_vol": 3571291.88
+    },
+    {
+      "symbol": "MO",
+      "close": 47.44,
+      "adv_usd": 329322360.24,
+      "med_vol": 6941871.0
+    },
+    {
+      "symbol": "MPC",
+      "close": 123.07,
+      "adv_usd": 428737728.29999995,
+      "med_vol": 3483690.0
+    },
+    {
+      "symbol": "MRK",
+      "close": 109.07,
+      "adv_usd": 903822897.7049999,
+      "med_vol": 8286631.5
+    },
+    {
+      "symbol": "MRNA",
+      "close": 160.09,
+      "adv_usd": 489336216.88,
+      "med_vol": 3056632.0
+    },
+    {
+      "symbol": "MRVL",
+      "close": 42.6,
+      "adv_usd": 421121064.6,
+      "med_vol": 9885471.0
+    },
+    {
+      "symbol": "MS",
+      "close": 97.62,
+      "adv_usd": 635541636.0600001,
+      "med_vol": 6510363.0
+    },
+    {
+      "symbol": "MSFT",
+      "close": 252.67,
+      "adv_usd": 7508704680.455,
+      "med_vol": 29717436.5
+    },
+    {
+      "symbol": "MU",
+      "close": 57.6,
+      "adv_usd": 702907689.6,
+      "med_vol": 12203258.5
+    },
+    {
+      "symbol": "NEE",
+      "close": 73.66,
+      "adv_usd": 688309461.5799999,
+      "med_vol": 9344413.0
+    },
+    {
+      "symbol": "NEM",
+      "close": 45.17,
+      "adv_usd": 296890914.235,
+      "med_vol": 6572745.5
+    },
+    {
+      "symbol": "NET",
+      "close": 61.94,
+      "adv_usd": 315712887.44,
+      "med_vol": 5097076.0
+    },
+    {
+      "symbol": "NFLX",
+      "close": 33.75,
+      "adv_usd": 2541038006.25,
+      "med_vol": 75290015.0
+    },
+    {
+      "symbol": "NKE",
+      "close": 121.1,
+      "adv_usd": 689027392.9,
+      "med_vol": 5689739.0
+    },
+    {
+      "symbol": "NOC",
+      "close": 473.95,
+      "adv_usd": 563622761.85,
+      "med_vol": 1189203.0
+    },
+    {
+      "symbol": "NOW",
+      "close": 431.86,
+      "adv_usd": 727867856.4300001,
+      "med_vol": 1685425.5
+    },
+    {
+      "symbol": "NSC",
+      "close": 224.55,
+      "adv_usd": 272916273.6,
+      "med_vol": 1215392.0
+    },
+    {
+      "symbol": "NUE",
+      "close": 163.54,
+      "adv_usd": 276948203.09,
+      "med_vol": 1693458.5
+    },
+    {
+      "symbol": "NVDA",
+      "close": 20.655,
+      "adv_usd": 10180224892.800001,
+      "med_vol": 492869760.0
+    },
+    {
+      "symbol": "NXPI",
+      "close": 181.41,
+      "adv_usd": 374971658.145,
+      "med_vol": 2066984.5
+    },
+    {
+      "symbol": "ODFL",
+      "close": 171.35,
+      "adv_usd": 250837037.45,
+      "med_vol": 1463887.0
+    },
+    {
+      "symbol": "ON",
+      "close": 79.28,
+      "adv_usd": 472378860.08,
+      "med_vol": 5958361.0
+    },
+    {
+      "symbol": "ORCL",
+      "close": 86.2,
+      "adv_usd": 526352328.1,
+      "med_vol": 6106175.5
+    },
+    {
+      "symbol": "ORLY",
+      "close": 57.342,
+      "adv_usd": 415186041.195,
+      "med_vol": 7240522.5
+    },
+    {
+      "symbol": "OXY",
+      "close": 59.82,
+      "adv_usd": 691449240.51,
+      "med_vol": 11558830.5
+    },
+    {
+      "symbol": "PANW",
+      "close": 83.445,
+      "adv_usd": 712873388.685,
+      "med_vol": 8543033.0
+    },
+    {
+      "symbol": "PEP",
+      "close": 176.18,
+      "adv_usd": 886649105.76,
+      "med_vol": 5032632.0
+    },
+    {
+      "symbol": "PFE",
+      "close": 42.7,
+      "adv_usd": 982562910.7,
+      "med_vol": 23010841.0
+    },
+    {
+      "symbol": "PG",
+      "close": 139.91,
+      "adv_usd": 963303854.88,
+      "med_vol": 6885168.0
+    },
+    {
+      "symbol": "PGR",
+      "close": 142.58,
+      "adv_usd": 327914395.25,
+      "med_vol": 2299862.5
+    },
+    {
+      "symbol": "PH",
+      "close": 343.54,
+      "adv_usd": 309932340.65000004,
+      "med_vol": 902172.5
+    },
+    {
+      "symbol": "PINS",
+      "close": 24.45,
+      "adv_usd": 267963234.67499998,
+      "med_vol": 10959641.5
+    },
+    {
+      "symbol": "PLD",
+      "close": 123.48,
+      "adv_usd": 317859684.66,
+      "med_vol": 2574179.5
+    },
+    {
+      "symbol": "PM",
+      "close": 99.98,
+      "adv_usd": 410787526.06,
+      "med_vol": 4108697.0
+    },
+    {
+      "symbol": "PNC",
+      "close": 155.48,
+      "adv_usd": 301416559.85999995,
+      "med_vol": 1938619.5
+    },
+    {
+      "symbol": "PSA",
+      "close": 298.9,
+      "adv_usd": 254885779.39999998,
+      "med_vol": 852746.0
+    },
+    {
+      "symbol": "PSX",
+      "close": 99.65,
+      "adv_usd": 289264418.6,
+      "med_vol": 2902804.0
+    },
+    {
+      "symbol": "PYPL",
+      "close": 75.24,
+      "adv_usd": 1006048674.18,
+      "med_vol": 13371194.5
+    },
+    {
+      "symbol": "QCOM",
+      "close": 123.7,
+      "adv_usd": 914636810.4,
+      "med_vol": 7393992.0
+    },
+    {
+      "symbol": "RBLX",
+      "close": 37.56,
+      "adv_usd": 411056339.52000004,
+      "med_vol": 10943992.0
+    },
+    {
+      "symbol": "RCL",
+      "close": 71.76,
+      "adv_usd": 265157828.52,
+      "med_vol": 3695064.5
+    },
+    {
+      "symbol": "ROKU",
+      "close": 65.63,
+      "adv_usd": 437459258.94,
+      "med_vol": 6665538.0
+    },
+    {
+      "symbol": "RTX",
+      "close": 100.65,
+      "adv_usd": 465449332.425,
+      "med_vol": 4624434.5
+    },
+    {
+      "symbol": "SBUX",
+      "close": 104.78,
+      "adv_usd": 604689833.15,
+      "med_vol": 5771042.5
+    },
+    {
+      "symbol": "SCHW",
+      "close": 79.9,
+      "adv_usd": 649128893.35,
+      "med_vol": 8124266.5
+    },
+    {
+      "symbol": "SEDG",
+      "close": 294.51,
+      "adv_usd": 288518930.325,
+      "med_vol": 979657.5
+    },
+    {
+      "symbol": "SHOP",
+      "close": 41.42,
+      "adv_usd": 839136395.36,
+      "med_vol": 20259208.0
+    },
+    {
+      "symbol": "SHW",
+      "close": 223.22,
+      "adv_usd": 338724296.12,
+      "med_vol": 1517446.0
+    },
+    {
+      "symbol": "SLB",
+      "close": 53.4,
+      "adv_usd": 471014967.0,
+      "med_vol": 8820505.0
+    },
+    {
+      "symbol": "SNOW",
+      "close": 151.26,
+      "adv_usd": 704996162.61,
+      "med_vol": 4660823.5
+    },
+    {
+      "symbol": "SPGI",
+      "close": 350.79,
+      "adv_usd": 439213635.3,
+      "med_vol": 1252070.0
+    },
+    {
+      "symbol": "STT",
+      "close": 89.17,
+      "adv_usd": 276135146.59000003,
+      "med_vol": 3096727.0
+    },
+    {
+      "symbol": "STZ",
+      "close": 223.11,
+      "adv_usd": 308958712.02000004,
+      "med_vol": 1384782.0
+    },
+    {
+      "symbol": "SYK",
+      "close": 261.22,
+      "adv_usd": 305069172.86,
+      "med_vol": 1167863.0
+    },
+    {
+      "symbol": "TEAM",
+      "close": 165.15,
+      "adv_usd": 392914558.125,
+      "med_vol": 2379137.5
+    },
+    {
+      "symbol": "TFC",
+      "close": 47.14,
+      "adv_usd": 270324942.82,
+      "med_vol": 5734513.0
+    },
+    {
+      "symbol": "TGT",
+      "close": 166.22,
+      "adv_usd": 472020169.93,
+      "med_vol": 2839731.5
+    },
+    {
+      "symbol": "TJX",
+      "close": 78.82,
+      "adv_usd": 411044841.83,
+      "med_vol": 5214981.5
+    },
+    {
+      "symbol": "TMO",
+      "close": 550.77,
+      "adv_usd": 737584850.145,
+      "med_vol": 1339188.5
+    },
+    {
+      "symbol": "TMUS",
+      "close": 147.09,
+      "adv_usd": 684491552.04,
+      "med_vol": 4653556.0
+    },
+    {
+      "symbol": "TRV",
+      "close": 185.25,
+      "adv_usd": 250935389.25,
+      "med_vol": 1354577.0
+    },
+    {
+      "symbol": "TSCO",
+      "close": 46.808,
+      "adv_usd": 262175352.64,
+      "med_vol": 5601080.0
+    },
+    {
+      "symbol": "TSLA",
+      "close": 197.37,
+      "adv_usd": 37798160738.13,
+      "med_vol": 191509149.0
+    },
+    {
+      "symbol": "TXN",
+      "close": 170.76,
+      "adv_usd": 958792639.8,
+      "med_vol": 5614855.0
+    },
+    {
+      "symbol": "U",
+      "close": 36.48,
+      "adv_usd": 430350091.2,
+      "med_vol": 11796877.5
+    },
+    {
+      "symbol": "UAL",
+      "close": 48.2,
+      "adv_usd": 345271132.3,
+      "med_vol": 7163301.5
+    },
+    {
+      "symbol": "UBER",
+      "close": 34.2,
+      "adv_usd": 849166916.4000001,
+      "med_vol": 24829442.0
+    },
+    {
+      "symbol": "UNH",
+      "close": 491.31,
+      "adv_usd": 1717694439.1200001,
+      "med_vol": 3496152.0
+    },
+    {
+      "symbol": "UNP",
+      "close": 193.75,
+      "adv_usd": 565629584.375,
+      "med_vol": 2919378.5
+    },
+    {
+      "symbol": "UPS",
+      "close": 178.46,
+      "adv_usd": 445401895.68,
+      "med_vol": 2495808.0
+    },
+    {
+      "symbol": "URI",
+      "close": 445.62,
+      "adv_usd": 303153726.33,
+      "med_vol": 680296.5
+    },
+    {
+      "symbol": "USB",
+      "close": 47.69,
+      "adv_usd": 344107719.59,
+      "med_vol": 7215511.0
+    },
+    {
+      "symbol": "V",
+      "close": 220.62,
+      "adv_usd": 1156275707.67,
+      "med_vol": 5241028.5
+    },
+    {
+      "symbol": "VLO",
+      "close": 132.2,
+      "adv_usd": 472992629.29999995,
+      "med_vol": 3577856.5
+    },
+    {
+      "symbol": "VRTX",
+      "close": 292.48,
+      "adv_usd": 388599018.56,
+      "med_vol": 1328634.5
+    },
+    {
+      "symbol": "VZ",
+      "close": 39.2,
+      "adv_usd": 720460465.2,
+      "med_vol": 18379093.5
+    },
+    {
+      "symbol": "WDAY",
+      "close": 181.92,
+      "adv_usd": 328821127.68,
+      "med_vol": 1807504.0
+    },
+    {
+      "symbol": "WFC",
+      "close": 46.24,
+      "adv_usd": 846676294.64,
+      "med_vol": 18310473.5
+    },
+    {
+      "symbol": "WM",
+      "close": 152.54,
+      "adv_usd": 257359005.04999998,
+      "med_vol": 1687157.5
+    },
+    {
+      "symbol": "WMT",
+      "close": 49.11,
+      "adv_usd": 759769244.595,
+      "med_vol": 15470764.5
+    },
+    {
+      "symbol": "XOM",
+      "close": 111.17,
+      "adv_usd": 1829597172.84,
+      "med_vol": 16457652.0
+    },
+    {
+      "symbol": "ZS",
+      "close": 127.84,
+      "adv_usd": 308745169.52,
+      "med_vol": 2415090.5
+    },
+    {
+      "symbol": "ZTS",
+      "close": 169.84,
+      "adv_usd": 399824080.48,
+      "med_vol": 2354122.0
+    }
+  ]
+}

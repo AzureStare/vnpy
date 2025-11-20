@@ -3,6 +3,8 @@
 *.pyo
 *.pyd
 *.egg-info/
+.venv/
+
 
 # Jupyter
 .ipynb_checkpoints
@@ -14,6 +16,8 @@
 *.wpu
 .vs
 x64
+.cursor/rules/
+
 
 # Temp
 build
@@ -40,3 +44,17 @@ _templates
 
 # Alpha
 lab/
+
+# strategy
+flagship/docs/
+
+# config file
+vt_setting.json
+.env
+
+# ta-lib source code (should not be committed)
+ta-lib-0.6.4/
+ta-lib-0.6.4-src.tar.gz
+
+# flagship data (universe files, etc.)
+flagship/data/

@@ -24,7 +24,7 @@ SETTINGS: dict = {
     "email.sender": "",
     "email.receiver": "",
 
-    "datafeed.name": "",
+    "datafeed.name": "polygon",
     "datafeed.username": "",
     "datafeed.password": "",
 
