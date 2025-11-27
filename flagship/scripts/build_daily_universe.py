@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from flagship.config import create_polygon_client
 from vnpy.trader.logger import logger
 from vnpy.trader.setting import SETTINGS
+from vnpy.trader.utility import ZoneInfo
 
 if TYPE_CHECKING:
     from polygon.rest import RESTClient
@@ -68,10 +69,18 @@ def fetch_daily_bars(
             limit=50000,
         )
 
+        # Polygon API 返回 UTC 时间戳，需要转换为美东时间（EST/EDT）
+        utc_tz = timezone.utc
+        eastern_tz = ZoneInfo("America/New_York")
+
         bars = []
         for agg in aggs:
+            # Polygon 返回的是 UTC 时间戳（毫秒），先转换为 UTC datetime
+            utc_datetime = datetime.fromtimestamp(agg.timestamp / 1000, tz=utc_tz)
+            # 转换为美东时间，然后获取日期
+            eastern_datetime = utc_datetime.astimezone(eastern_tz)
             bars.append({
-                "date": datetime.fromtimestamp(agg.timestamp / 1000).date(),
+                "date": eastern_datetime.date(),
                 "open": agg.open,
                 "high": agg.high,
                 "low": agg.low,

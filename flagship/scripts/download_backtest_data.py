@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.logger import logger
 from vnpy.trader.object import BarData
 from vnpy.trader.setting import SETTINGS
+from vnpy.trader.utility import ZoneInfo
 from vnpy.alpha.lab import AlphaLab
 
 from flagship.config import (
@@ -161,9 +162,16 @@ def download_bars_for_symbols(
             logger.debug(f"[download_bars_for_symbols] {symbol}: 获取到 {len(aggs)} 条原始数据")
 
             # 转换为 BarData 列表（保存所有数据，包括历史数据，用于因子计算）
+            # Polygon API 返回 UTC 时间戳，需要转换为美东时间（EST/EDT）
+            utc_tz = timezone.utc
+            eastern_tz = ZoneInfo("America/New_York")
+            
             bar_data_list = []
             for agg in aggs:
-                bar_datetime = datetime.fromtimestamp(agg.timestamp / 1000)
+                # Polygon 返回的是 UTC 时间戳（毫秒），先转换为 UTC datetime
+                utc_datetime = datetime.fromtimestamp(agg.timestamp / 1000, tz=utc_tz)
+                # 转换为美东时间，然后移除时区信息（保存为 naive datetime）
+                bar_datetime = utc_datetime.astimezone(eastern_tz).replace(tzinfo=None)
                 # 保存所有数据（包括历史数据），用于后续因子计算
                 
                 bar = BarData(

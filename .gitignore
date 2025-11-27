@@ -2,9 +2,13 @@
 *.pyc
 *.pyo
 *.pyd
+__pycache__/
 *.egg-info/
 .venv/
-
+.pytest_cache/
+.mypy_cache/
+*.so
+*.egg
 
 # Jupyter
 .ipynb_checkpoints
@@ -18,10 +22,9 @@
 x64
 .cursor/rules/
 
-
 # Temp
-build
-dist
+build/
+dist/
 *.local
 
 # VeighNa
@@ -58,3 +61,10 @@ ta-lib-0.6.4-src.tar.gz
 
 # flagship data (universe files, etc.)
 flagship/data/
+
+
+# Logs
+*.log
+logs/
+nohup.out
+*.out

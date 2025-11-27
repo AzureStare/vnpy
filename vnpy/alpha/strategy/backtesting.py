@@ -401,6 +401,163 @@ class BacktestingEngine:
         logger.info("策略统计指标计算完成")
         return statistics
 
+    def get_trade_list(self) -> pl.DataFrame:
+        """
+        生成详细的交易清单，包含所有交易信息。
+        
+        Returns:
+            包含以下列的DataFrame：
+            - trade_id: 交易编号
+            - vt_symbol: 合约代码
+            - direction: 方向（做多/做空）
+            - entry_datetime: 入场日期/时间
+            - exit_datetime: 离场日期/时间（如果已平仓）
+            - entry_signal: 开仓信号说明
+            - exit_signal: 平仓信号说明
+            - entry_price: 入场价格
+            - exit_price: 离场价格（如果已平仓）
+            - position_size: 仓位大小（股数）
+            - position_value: 仓位价值（USD）
+            - net_pnl: 净损益（USD）
+            - net_pnl_pct: 净损益百分比
+            - max_trade_profit: 最大交易获利（USD）
+            - max_trade_profit_pct: 最大交易获利百分比
+            - max_trade_loss: 最大交易亏损（USD）
+            - max_trade_loss_pct: 最大交易亏损百分比
+        """
+        from collections import defaultdict
+        
+        # 跟踪每个持仓的交易信息
+        position_trades: dict[str, list[TradeData]] = defaultdict(list)
+        for trade in self.trades.values():
+            position_trades[trade.vt_symbol].append(trade)
+        
+        # 获取策略实例以访问信号信息
+        strategy = self.strategy
+        entry_reasons = getattr(strategy, 'trade_entry_reasons', {})
+        exit_reasons = getattr(strategy, 'trade_exit_reasons', {})
+        entry_prices = getattr(strategy, 'entry_prices', {})
+        entry_highs = getattr(strategy, 'entry_highs', {})
+        
+        rows = []
+        trade_id = 0
+        
+        # 按合约分组处理交易
+        for vt_symbol, trades in position_trades.items():
+            # 按时间排序
+            trades.sort(key=lambda t: t.datetime if t.datetime else datetime.min)
+            
+            # 分离开仓和平仓交易
+            long_trades = [t for t in trades if t.direction == Direction.LONG]
+            short_trades = [t for t in trades if t.direction == Direction.SHORT]
+            
+            # 匹配开仓和平仓
+            i = 0
+            for long_trade in long_trades:
+                trade_id += 1
+                
+                entry_price = long_trade.price
+                entry_datetime = long_trade.datetime
+                entry_signal = entry_reasons.get(vt_symbol, "开仓")
+                
+                # 查找对应的平仓交易
+                exit_trade = None
+                if i < len(short_trades):
+                    exit_trade = short_trades[i]
+                    i += 1
+                
+                position_size = long_trade.volume
+                position_value = entry_price * position_size
+                
+                if exit_trade:
+                    exit_price = exit_trade.price
+                    exit_datetime = exit_trade.datetime
+                    exit_signal = exit_reasons.get(vt_symbol, "平仓")
+                    
+                    # 计算净损益
+                    net_pnl = (exit_price - entry_price) * position_size
+                    net_pnl_pct = (exit_price / entry_price - 1) * 100 if entry_price > 0 else 0
+                    
+                    # 计算最大获利和亏损（基于entry_highs）
+                    entry_high = entry_highs.get(vt_symbol, entry_price)
+                    max_profit_price = entry_high
+                    max_profit = (max_profit_price - entry_price) * position_size
+                    max_profit_pct = (max_profit_price / entry_price - 1) * 100 if entry_price > 0 else 0
+                    max_loss_price = min(entry_price, exit_price)
+                    max_loss = (max_loss_price - entry_price) * position_size
+                    max_loss_pct = (max_loss_price / entry_price - 1) * 100 if entry_price > 0 else 0
+                else:
+                    # 未平仓
+                    exit_price = None
+                    exit_datetime = None
+                    exit_signal = "持仓中"
+                    net_pnl = 0
+                    net_pnl_pct = 0
+                    entry_high = entry_highs.get(vt_symbol, entry_price)
+                    max_profit_price = entry_high
+                    max_profit = (max_profit_price - entry_price) * position_size
+                    max_profit_pct = (max_profit_price / entry_price - 1) * 100 if entry_price > 0 else 0
+                    max_loss = 0
+                    max_loss_pct = 0
+                
+                rows.append({
+                    "trade_id": trade_id,
+                    "vt_symbol": vt_symbol,
+                    "direction": "做多",
+                    "entry_datetime": entry_datetime,
+                    "exit_datetime": exit_datetime,
+                    "entry_signal": entry_signal,
+                    "exit_signal": exit_signal,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "position_size": position_size,
+                    "position_value": position_value,
+                    "net_pnl": net_pnl,
+                    "net_pnl_pct": net_pnl_pct,
+                    "max_trade_profit": max_profit,
+                    "max_trade_profit_pct": max_profit_pct,
+                    "max_trade_loss": max_loss,
+                    "max_trade_loss_pct": max_loss_pct,
+                })
+        
+        if not rows:
+            return pl.DataFrame()
+        
+        df = pl.DataFrame(rows)
+        return df
+    
+    def show_trade_list(self) -> None:
+        """显示交易清单"""
+        trade_df = self.get_trade_list()
+        if trade_df.is_empty():
+            logger.info("无交易记录")
+            return
+        
+        logger.info("\n" + "=" * 100)
+        logger.info("交易清单")
+        logger.info("=" * 100)
+        
+        # 格式化显示
+        for row in trade_df.iter_rows(named=True):
+            logger.info(f"\n交易 #{row['trade_id']}")
+            logger.info(f"  合约: {row['vt_symbol']}")
+            logger.info(f"  类型: {row['direction']}")
+            entry_dt_str = row['entry_datetime'].strftime('%Y年%m月%d日, %H:%M') if row['entry_datetime'] else 'N/A'
+            logger.info(f"  入场: {entry_dt_str}, 价格: {row['entry_price']:.2f} USD")
+            logger.info(f"  开仓信号: {row['entry_signal']}")
+            if row['exit_datetime']:
+                exit_dt_str = row['exit_datetime'].strftime('%Y年%m月%d日, %H:%M')
+                logger.info(f"  离场: {exit_dt_str}, 价格: {row['exit_price']:.2f} USD")
+                logger.info(f"  平仓信号: {row['exit_signal']}")
+            else:
+                logger.info(f"  离场: 持仓中")
+            logger.info(f"  仓位大小: {row['position_size']:.0f} 股 ({row['position_value']/1000:.2f} K USD)")
+            logger.info(f"  净损益: {row['net_pnl']:.2f} USD ({row['net_pnl_pct']:.2f}%)")
+            logger.info(f"  最大交易获利: {row['max_trade_profit']:.2f} USD ({row['max_trade_profit_pct']:.2f}%)")
+            logger.info(f"  最大交易亏损: {row['max_trade_loss']:.2f} USD ({row['max_trade_loss_pct']:.2f}%)")
+        
+        logger.info("\n" + "=" * 100)
+
     def show_chart(self) -> None:
         """Display chart"""
         df: pl.DataFrame = self.daily_df

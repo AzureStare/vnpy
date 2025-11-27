@@ -10,6 +10,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import sys
+from typing import Any
 
 import polars as pl
 
@@ -203,6 +204,20 @@ def run_backtest(
         if not vt_symbols_list:
             logger.error(f"[run_backtest] 回测股票池为空")
             raise RuntimeError("Empty vt_symbols universe for backtest")
+    
+    # 添加 VIX 和 VIX3M 到回测合约列表（策略需要这些数据来计算杠杆）
+    vix_symbols = ["VIX.CBOE", "VIX3M.CBOE"]
+    for vix_symbol in vix_symbols:
+        if vix_symbol not in vt_symbols_list:
+            # 检查 lab 中是否有 VIX 数据
+            vix_bars = lab.load_bar_data(vix_symbol, Interval.DAILY, start, end)
+            if vix_bars:
+                vt_symbols_list.append(vix_symbol)
+                logger.info(f"[run_backtest] 添加 VIX 数据: {vix_symbol} ({len(vix_bars)} 条数据)")
+            else:
+                logger.warning(f"[run_backtest] VIX 数据不存在: {vix_symbol}，策略将使用默认杠杆")
+    
+    vt_symbols_list = sorted(vt_symbols_list)
 
     # 默认策略参数
     if strategy_setting is None:
@@ -280,6 +295,10 @@ def run_backtest(
     logger.info("=" * 60)
     for k, v in stats.items():
         logger.info(f"{k}: {v}")
+
+    # 显示交易清单
+    logger.info(f"[run_backtest] 显示交易清单...")
+    engine.show_trade_list()
 
     # 显示净值曲线和回撤图表
     logger.info(f"[run_backtest] 显示回测图表...")
