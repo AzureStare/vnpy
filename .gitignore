@@ -45,6 +45,12 @@ _templates
 .DS_Store
 *.mo
 
+# macOS resource fork files (should be ignored on all platforms)
+._*
+.DS_Store
+.AppleDouble
+.LSOverride
+
 # Alpha
 lab/
 
@@ -68,3 +74,10 @@ flagship/data/
 logs/
 nohup.out
 *.out
+
+# ta-lib build files
+ta-lib-0.6.4/
+ta-lib-0.6.4-src.tar.gz
+
+# Backtest reports
+backtest_report/

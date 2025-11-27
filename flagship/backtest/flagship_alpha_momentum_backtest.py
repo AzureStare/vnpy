@@ -25,6 +25,69 @@ from vnpy.alpha import AlphaLab, BacktestingEngine
 from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
 
 
+def save_backtest_report(
+    lab: AlphaLab,
+    engine: BacktestingEngine,
+    stats: dict[str, Any],
+    start: datetime,
+    end: datetime,
+    signal_name: str,
+) -> None:
+    """
+    保存回测报告到文件。
+    
+    保存内容：
+    1. 统计指标（JSON）
+    2. 每日净值数据（Parquet）
+    3. 交易清单（Parquet）
+    """
+    from datetime import datetime as dt
+    
+    # 创建报告目录（保存在项目根目录）
+    from flagship.config import PROJECT_ROOT
+    report_dir = PROJECT_ROOT / "backtest_report"
+    report_dir.mkdir(exist_ok=True)
+    
+    # 生成报告文件名（基于日期范围）
+    start_str = start.strftime("%Y%m%d")
+    end_str = end.strftime("%Y%m%d")
+    report_prefix = f"{signal_name}_{start_str}_{end_str}"
+    
+    # 1. 保存统计指标（JSON）
+    stats_file = report_dir / f"{report_prefix}_stats.json"
+    stats_data = {
+        "backtest_info": {
+            "signal_name": signal_name,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "report_generated_at": dt.now().isoformat(),
+        },
+        "statistics": stats,
+    }
+    import json
+    with open(stats_file, "w", encoding="UTF-8") as f:
+        json.dump(stats_data, f, indent=2, ensure_ascii=False)
+    logger.info(f"[save_backtest_report] 统计指标已保存: {stats_file}")
+    
+    # 2. 保存每日净值数据（Parquet）
+    if hasattr(engine, 'daily_df') and engine.daily_df is not None:
+        daily_file = report_dir / f"{report_prefix}_daily.parquet"
+        engine.daily_df.write_parquet(daily_file)
+        logger.info(f"[save_backtest_report] 每日净值数据已保存: {daily_file}")
+    
+    # 3. 保存交易清单（Parquet）
+    trade_df = engine.get_trade_list()
+    if not trade_df.is_empty():
+        trade_file = report_dir / f"{report_prefix}_trades.parquet"
+        trade_df.write_parquet(trade_file)
+        logger.info(f"[save_backtest_report] 交易清单已保存: {trade_file}")
+        logger.info(f"[save_backtest_report] 交易记录数: {len(trade_df)}")
+    else:
+        logger.warning(f"[save_backtest_report] 无交易记录，跳过交易清单保存")
+    
+    logger.info(f"[save_backtest_report] 回测报告已保存到: {report_dir}")
+
+
 def load_signal(lab: AlphaLab, name: str) -> pl.DataFrame:
     """
     加载模型信号用于回测。
@@ -89,7 +152,7 @@ def generate_naive_signal(
             .alias("ret")
         ).with_columns(
             pl.col("ret")
-            .rolling_mean(15, min_periods=5)
+            .rolling_mean(15, min_samples=5)
             .alias("score")
         )
 
@@ -146,6 +209,35 @@ def run_backtest(
     vt_symbols_list: list[str] = []
     signal_df: pl.DataFrame | None = None
 
+    # 步骤 1: 如果有 universe 文件，先筛选股票池（投资范围 $U_t$）
+    universe_dir = Path(lab_path).parent.parent / "flagship" / "data" / "universe"
+    if universe_dir.exists():
+        logger.info(f"[run_backtest] 发现 universe 目录，尝试加载股票池...")
+        from flagship.backtest.prepare_and_backtest import collect_symbols_from_universe_files
+        from datetime import date as date_type
+        
+        try:
+            universe_symbols = collect_symbols_from_universe_files(
+                start_date=date_type.fromisoformat(start.date().isoformat()),
+                end_date=date_type.fromisoformat(end.date().isoformat()),
+                universe_dir=universe_dir,
+            )
+            if universe_symbols:
+                logger.info(f"[run_backtest] 从 universe 文件收集到 {len(universe_symbols)} 个股票")
+                logger.info(f"[run_backtest] 后续将只对这些股票进行回测（投资范围 $U_t$）")
+                # 转换为 vt_symbol 格式（添加交易所后缀）
+                # 注意：这里假设都是 NASDAQ，实际应该从数据中推断
+                universe_vt_symbols = [f"{s}.NASDAQ" for s in universe_symbols]
+            else:
+                logger.warning(f"[run_backtest] Universe 文件为空，将使用信号中的所有股票")
+                universe_vt_symbols = None
+        except Exception as exc:
+            logger.warning(f"[run_backtest] 加载 universe 文件失败: {exc}，将使用信号中的所有股票")
+            universe_vt_symbols = None
+    else:
+        logger.info(f"[run_backtest] 未找到 universe 目录，将使用信号中的所有股票")
+        universe_vt_symbols = None
+
     # 尝试加载信号
     logger.info(f"[run_backtest] 尝试加载信号文件: {signal_name}")
     try:
@@ -198,6 +290,15 @@ def run_backtest(
                     filtered_df = signal_df
             
             signal_df = filtered_df
+            
+            # 如果指定了 universe，只保留 universe 中的股票
+            if universe_vt_symbols is not None:
+                before_universe_filter = len(signal_df)
+                signal_df = signal_df.filter(pl.col("vt_symbol").is_in(universe_vt_symbols))
+                after_universe_filter = len(signal_df)
+                logger.info(f"[run_backtest] Universe 筛选: {before_universe_filter} -> {after_universe_filter} 行")
+                logger.info(f"[run_backtest] 投资范围 $U_t$ 包含 {len(universe_vt_symbols)} 个股票，信号中有 {signal_df['vt_symbol'].n_unique()} 个")
+            
             vt_symbols_list = sorted(signal_df["vt_symbol"].unique().to_list())
             logger.info(f"[run_backtest] 过滤后合约数: {len(vt_symbols_list)}")
         
@@ -245,17 +346,69 @@ def run_backtest(
     logger.info(f"[run_backtest]   - 年化交易日: {annual_days}")
     logger.info(f"[run_backtest] 策略参数: {strategy_setting}")
     
-    # 为所有合约添加交易配置（避免 KeyError）
-    logger.info(f"[run_backtest] 添加合约交易配置...")
+    # 为所有合约添加交易配置（避免 KeyError）- 批量优化版本
+    logger.info(f"[run_backtest] 批量添加合约交易配置...")
+    import json
+    from pathlib import Path
+    
+    # 批量加载现有配置（容错处理）
+    contracts: dict = {}
+    contract_path = lab.contract_path
+    if contract_path.exists():
+        try:
+            with open(contract_path, encoding="UTF-8") as f:
+                contracts = json.load(f)
+        except json.JSONDecodeError as e:
+            logger.warning(f"[run_backtest] 合约配置文件 JSON 格式错误: {e}，将重新创建")
+            # 备份损坏的文件
+            import shutil
+            backup_path = contract_path.with_suffix('.json.corrupted')
+            shutil.copy(contract_path, backup_path)
+            logger.warning(f"[run_backtest] 已备份损坏文件到: {backup_path}")
+            contracts = {}
+    
+    # 批量更新配置（确保所有必需字段都存在）
+    new_count = 0
+    updated_count = 0
+    required_fields = ["long_rate", "short_rate", "size", "pricetick"]
+    default_config = {
+        "long_rate": 0.0003,
+        "short_rate": 0.0003,
+        "size": 1,
+        "pricetick": 0.01
+    }
+    
     for vt_symbol in vt_symbols_list:
-        lab.add_contract_setting(
-            vt_symbol,
-            long_rate=0.0003,
-            short_rate=0.0003,
-            size=1,
-            pricetick=0.01,
-        )
-    logger.info(f"[run_backtest] 已为 {len(vt_symbols_list)} 个合约添加交易配置")
+        if vt_symbol not in contracts:
+            contracts[vt_symbol] = default_config.copy()
+            new_count += 1
+        else:
+            # 检查并补充缺失的字段
+            needs_update = False
+            for field in required_fields:
+                if field not in contracts[vt_symbol]:
+                    contracts[vt_symbol][field] = default_config[field]
+                    needs_update = True
+            if needs_update:
+                updated_count += 1
+    
+    # 一次性保存所有配置
+    if new_count > 0 or updated_count > 0:
+        with open(contract_path, mode="w+", encoding="UTF-8") as f:
+            json.dump(
+                contracts,
+                f,
+                indent=4,
+                ensure_ascii=False
+            )
+        if new_count > 0 and updated_count > 0:
+            logger.info(f"[run_backtest] 已为 {new_count} 个新合约添加配置，更新了 {updated_count} 个合约的配置（共 {len(vt_symbols_list)} 个合约）")
+        elif new_count > 0:
+            logger.info(f"[run_backtest] 已为 {new_count} 个新合约添加交易配置（共 {len(vt_symbols_list)} 个合约）")
+        else:
+            logger.info(f"[run_backtest] 已更新 {updated_count} 个合约的配置（共 {len(vt_symbols_list)} 个合约）")
+    else:
+        logger.info(f"[run_backtest] 所有 {len(vt_symbols_list)} 个合约的配置已存在且完整")
     
     engine = BacktestingEngine(lab)
     engine.set_parameters(
@@ -303,6 +456,10 @@ def run_backtest(
     # 显示净值曲线和回撤图表
     logger.info(f"[run_backtest] 显示回测图表...")
     engine.show_chart()
+    
+    # 保存回测报告
+    logger.info(f"[run_backtest] 保存回测报告...")
+    save_backtest_report(lab, engine, stats, start, end, signal_name)
     logger.info(f"[run_backtest] 回测流程全部完成")
 
 

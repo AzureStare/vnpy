@@ -72,11 +72,11 @@ def build_signal(
     lab = AlphaLab(str(lab_path))
     logger.debug(f"[build_signal] AlphaLab 初始化完成")
 
-    # 自动发现已有日线合约
+    # 自动发现已有日线合约（过滤 Mac 隐藏文件）
     logger.info(f"[build_signal] 扫描日线数据目录: {lab.daily_path}")
-    daily_files = sorted(lab.daily_path.glob("*.parquet"))
+    daily_files = sorted([p for p in lab.daily_path.glob("*.parquet") if not p.name.startswith("._")])
     vt_symbols = [p.stem for p in daily_files]
-    logger.info(f"[build_signal] 发现 {len(vt_symbols)} 个日线数据文件")
+    logger.info(f"[build_signal] 发现 {len(vt_symbols)} 个日线数据文件（已过滤隐藏文件）")
     
     if not vt_symbols:
         logger.error(f"[build_signal] 在 {lab.daily_path} 下未发现任何日线 parquet 文件")
