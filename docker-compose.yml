@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: vnpy_flagship_db
+    environment:
+      POSTGRES_USER: vnpy
+      POSTGRES_PASSWORD: change_me
+      POSTGRES_DB: vnpy
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vnpy -d vnpy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vnpy_flagship_app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Timezone for cron schedule
+      TZ: America/New_York
+
+      # Optional env overrides for Postgres (pg_ticker_db.py supports env override)
+      DATABASE_HOST: db
+      DATABASE_PORT: "5432"
+      DATABASE_DATABASE: vnpy
+      DATABASE_USER: vnpy
+      DATABASE_PASSWORD: change_me
+
+      # Cron schedule inside container (default: 09:00 ET, Mon-Fri)
+      FLAGSHIP_CRON_SCHEDULE: "0 9 * * 1-5"
+      FLAGSHIP_CRON_COMMAND: "/app/flagship/paper_trading/run_full_daily_cycle.sh"
+    volumes:
+      # Persist AlphaLab data and logs
+      - ./lab:/app/lab
+      - ./logs:/app/logs
+      # Inject your local vt_setting.json (DO NOT bake secrets into image)
+      - ./vt_setting.json:/app/vt_setting.json:ro
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+

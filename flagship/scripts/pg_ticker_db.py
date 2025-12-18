@@ -10,6 +10,7 @@ Postgres ticker 数据库工具模块。
 from __future__ import annotations
 
 import json
+import os
 from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any, Iterator
@@ -36,12 +37,19 @@ def get_pg_connection_params() -> dict[str, Any]:
             f"Please configure vt_setting.json with database.name=postgresql"
         )
 
+    # Docker/Server 部署场景：允许用环境变量覆盖连接参数（优先级更高）
+    env_host = os.getenv("DATABASE_HOST")
+    env_port = os.getenv("DATABASE_PORT")
+    env_db = os.getenv("DATABASE_DATABASE")
+    env_user = os.getenv("DATABASE_USER")
+    env_password = os.getenv("DATABASE_PASSWORD")
+
     return {
-        "host": SETTINGS.get("database.host", "localhost"),
-        "port": SETTINGS.get("database.port", 5432),
-        "database": SETTINGS.get("database.database", "vnpy"),
-        "user": SETTINGS.get("database.user", "postgres"),
-        "password": SETTINGS.get("database.password", ""),
+        "host": env_host or SETTINGS.get("database.host", "localhost"),
+        "port": int(env_port) if env_port else SETTINGS.get("database.port", 5432),
+        "database": env_db or SETTINGS.get("database.database", "vnpy"),
+        "user": env_user or SETTINGS.get("database.user", "postgres"),
+        "password": env_password if env_password is not None else SETTINGS.get("database.password", ""),
     }
 
 
@@ -317,4 +325,28 @@ def get_ticker_market_caps_batch(
                 row[0]: float(row[1]) if row[1] is not None else 0.0
                 for row in cur.fetchall()
             }
+
+
+def get_selected_symbols_in_range(start_date: date, end_date: date) -> list[str]:
+    """
+    从 daily_selection 表中查询指定日期范围内被选中的去重 vt_symbol 列表。
+
+    用于“静态过滤后的 universe（U）”训练/推理：训练只在该范围内出现过的标的集合上进行。
+    """
+    if start_date > end_date:
+        raise ValueError(f"start_date must be <= end_date, got {start_date} > {end_date}")
+
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT vt_symbol
+                FROM daily_selection
+                WHERE trade_date >= %s AND trade_date <= %s
+                ORDER BY vt_symbol;
+                """,
+                (start_date, end_date),
+            )
+            rows = cur.fetchall()
+            return [row[0] for row in rows]
 

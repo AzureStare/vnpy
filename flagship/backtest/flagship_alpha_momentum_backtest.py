@@ -14,15 +14,23 @@ from typing import Any
 
 import polars as pl
 
-from flagship.config import PROJECT_ROOT
-
+# 动态注入项目根路径
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import json
+from datetime import date
+
 from vnpy.trader.constant import Interval
 from vnpy.trader.logger import logger
+from vnpy.trader.setting import SETTINGS
 from vnpy.alpha import AlphaLab, BacktestingEngine
 from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
+from flagship.config import VT_SETTING_PATH
+from flagship.scripts.pg_ticker_db import get_pg_connection
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 
 def save_backtest_report(
@@ -116,6 +124,45 @@ def load_signal(lab: AlphaLab, name: str) -> pl.DataFrame:
     return signal_df
 
 
+def load_daily_selection_from_postgres(
+    start_date: date,
+    end_date: date,
+) -> dict[date, list[str]]:
+    """
+    从PostgreSQL加载每日选股结果。
+    
+    Returns:
+        字典，key为交易日期，value为该日选中的vt_symbol列表
+    """
+    # 重新加载配置
+    if VT_SETTING_PATH.exists():
+        try:
+            setting_data = json.loads(VT_SETTING_PATH.read_text(encoding="utf-8"))
+            SETTINGS.update(setting_data)
+        except Exception as exc:
+            logger.warning(f"Failed to reload vt_setting.json: {exc}")
+    
+    daily_selections: dict[date, list[str]] = {}
+    
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT trade_date, vt_symbol
+                FROM daily_selection
+                WHERE trade_date >= %s AND trade_date <= %s
+                ORDER BY trade_date, vt_symbol
+            """, (start_date, end_date))
+            
+            for row in cur.fetchall():
+                trade_date, vt_symbol = row
+                if trade_date not in daily_selections:
+                    daily_selections[trade_date] = []
+                daily_selections[trade_date].append(vt_symbol)
+    
+    logger.info(f"从PostgreSQL加载了 {len(daily_selections)} 个交易日的选股结果")
+    return daily_selections
+
+
 def infer_vt_symbols_from_lab(lab: AlphaLab, interval: Interval) -> list[str]:
     """当信号/股票池缺失时，从 lab 存储推断 vt_symbols"""
     folder = lab.minute_path if interval == Interval.MINUTE else lab.daily_path
@@ -170,18 +217,64 @@ def generate_naive_signal(
     return pl.DataFrame(rows).select(["datetime", "vt_symbol", "score"]).rename({"score": "signal"})
 
 
+def setup_backtest_logging(
+    lab_path: str | Path,
+    start: datetime,
+    end: datetime,
+    signal_name: str,
+) -> Path:
+    """
+    设置回测日志文件。
+    
+    Returns:
+        日志文件路径
+    """
+    # 确保 lab_path 是 Path 对象
+    lab_path_obj = Path(lab_path)
+    if not lab_path_obj.is_absolute():
+        # 如果是相对路径，基于项目根目录
+        lab_path_obj = PROJECT_ROOT / lab_path_obj
+    
+    log_dir = lab_path_obj / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 生成日志文件名：backtest_YYYYMMDD_HHMMSS_start_end_signal.log
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    start_str = start.strftime("%Y%m%d")
+    end_str = end.strftime("%Y%m%d")
+    signal_short = signal_name.replace("flagship_alpha_momentum", "fam").replace("_signal", "")
+    
+    log_filename = f"backtest_{timestamp}_{start_str}_{end_str}_{signal_short}.log"
+    log_path = log_dir / log_filename
+    
+    # 使用 loguru 的 add 方法添加文件输出
+    # loguru 的格式：{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {message}
+    logger.add(
+        sink=str(log_path),
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {message}",
+        encoding="utf-8",
+        enqueue=True,  # 异步写入，提高性能
+    )
+    
+    return log_path
+
+
 def run_backtest(
     lab_path: str | Path,
     start: datetime,
     end: datetime,
-    interval: Interval = Interval.DAILY,
+    interval: Interval = Interval.MINUTE,
     signal_name: str = "flagship_alpha_momentum",
     initial_capital: int = 1_000_000,
     risk_free: float = 0.02,
     annual_days: int = 252,
     strategy_setting: dict[str, Any] | None = None,
     vt_symbols: list[str] | None = None,
-) -> None:
+    min_score_threshold: float = 0.5,
+    use_postgres_selection: bool = True,
+    commission_rate: float | None = None,
+) -> dict[str, Any] | None:
     """
     运行 Flagship Alpha-Momentum 策略回测。
 
@@ -195,66 +288,66 @@ def run_backtest(
         risk_free: 无风险利率
         annual_days: 年化交易日数
         strategy_setting: 策略参数字典
+        commission_rate: 交易佣金费率（默认为 None，优先从 strategy_setting 读取，否则默认为 0.0）
     """
+    # 设置日志文件（必须在记录日志之前）
+    log_path = setup_backtest_logging(lab_path, start, end, signal_name)
+    
+    logger.info("=" * 80)
     logger.info(f"[run_backtest] 开始运行回测")
     logger.info(f"[run_backtest] Lab 路径: {lab_path}")
     logger.info(f"[run_backtest] 回测日期范围: {start} 到 {end}")
     logger.info(f"[run_backtest] K线周期: {interval}")
     logger.info(f"[run_backtest] 信号文件名: {signal_name}")
     logger.info(f"[run_backtest] 初始资金: {initial_capital:,}")
+    logger.info(f"[run_backtest] 使用PostgreSQL选股: {use_postgres_selection}")
+    logger.info(f"[run_backtest] 日志文件: {log_path}")
+    logger.info("=" * 80)
     
     lab = AlphaLab(str(lab_path))
     logger.debug(f"[run_backtest] AlphaLab 初始化完成")
 
     vt_symbols_list: list[str] = []
     signal_df: pl.DataFrame | None = None
-
-    # 步骤 1: 如果有 universe 文件，先筛选股票池（投资范围 $U_t$）
-    universe_dir = Path(lab_path).parent.parent / "flagship" / "data" / "universe"
-    if universe_dir.exists():
-        logger.info(f"[run_backtest] 发现 universe 目录，尝试加载股票池...")
-        from flagship.backtest.prepare_and_backtest import collect_symbols_from_universe_files
-        from datetime import date as date_type
-        
+    daily_selections: dict[date, list[str]] | None = None
+    
+    # 如果使用PostgreSQL选股，加载每日选股结果
+    if use_postgres_selection:
         try:
-            universe_symbols = collect_symbols_from_universe_files(
-                start_date=date_type.fromisoformat(start.date().isoformat()),
-                end_date=date_type.fromisoformat(end.date().isoformat()),
-                universe_dir=universe_dir,
+            daily_selections = load_daily_selection_from_postgres(
+                start_date=start.date(),
+                end_date=end.date(),
             )
-            if universe_symbols:
-                logger.info(f"[run_backtest] 从 universe 文件收集到 {len(universe_symbols)} 个股票")
-                logger.info(f"[run_backtest] 后续将只对这些股票进行回测（投资范围 $U_t$）")
-                # 转换为 vt_symbol 格式（添加交易所后缀）
-                # 注意：这里假设都是 NASDAQ，实际应该从数据中推断
-                universe_vt_symbols = [f"{s}.NASDAQ" for s in universe_symbols]
-            else:
-                logger.warning(f"[run_backtest] Universe 文件为空，将使用信号中的所有股票")
-                universe_vt_symbols = None
+            if daily_selections:
+                # 合并所有交易日的选股结果作为候选股票池
+                all_selected_symbols = set()
+                for symbols in daily_selections.values():
+                    all_selected_symbols.update(symbols)
+                vt_symbols_list = sorted(list(all_selected_symbols))
+                logger.info(f"[run_backtest] 从PostgreSQL加载了 {len(vt_symbols_list)} 只候选股票")
         except Exception as exc:
-            logger.warning(f"[run_backtest] 加载 universe 文件失败: {exc}，将使用信号中的所有股票")
-            universe_vt_symbols = None
-    else:
-        logger.info(f"[run_backtest] 未找到 universe 目录，将使用信号中的所有股票")
-        universe_vt_symbols = None
+            logger.warning(f"[run_backtest] 从PostgreSQL加载选股结果失败: {exc}，将使用信号文件或lab推断")
+            daily_selections = None
 
+    # Universe 文件选股（legacy）已废弃：当前以 PostgreSQL daily_selection 为主。
+    # 如需强制限定回测标的，请通过 run_backtest(vt_symbols=...) 传入。
     # 尝试加载信号
     logger.info(f"[run_backtest] 尝试加载信号文件: {signal_name}")
+    signal_df = None
     try:
         signal_df = load_signal(lab, signal_name)
-        vt_symbols_list = sorted(signal_df["vt_symbol"].unique().to_list())
-        logger.info(f"[run_backtest] 成功加载信号: {len(vt_symbols_list)} 个合约, {len(signal_df)} 行数据")
+        logger.info(f"[run_backtest] 成功加载信号: {len(signal_df)} 行数据")
     except RuntimeError as exc:
         logger.warning(f"[run_backtest] 信号文件不存在: {exc}")
         logger.info(f"[run_backtest] 从 lab 推断股票列表...")
         # 如果信号不存在，从 lab 推断股票列表并生成占位信号
-        vt_symbols_list = infer_vt_symbols_from_lab(lab, interval)
-        if not vt_symbols_list:
+        inferred_symbols = infer_vt_symbols_from_lab(lab, interval)
+        if not inferred_symbols:
             logger.error(f"[run_backtest] 无法推断股票列表，lab 中无数据")
             raise RuntimeError("No vt_symbols found in lab and no signal available")
         
         logger.info(f"[run_backtest] 生成占位信号（基于滚动收益率）...")
-        signal_df = generate_naive_signal(lab, vt_symbols_list, interval, start, end)
+        signal_df = generate_naive_signal(lab, inferred_symbols, interval, start, end)
         logger.warning(f"[run_backtest] 使用占位信号，建议先构建正式信号")
 
     # 如果指定了 vt_symbols，使用指定的；否则从信号或 lab 推断
@@ -263,8 +356,8 @@ def run_backtest(
         logger.info(f"[run_backtest] 使用指定的 vt_symbols: {len(vt_symbols)} 个")
         vt_symbols_list = vt_symbols
     else:
-        # 过滤信号到回测日期范围（使用 <= 而不是 <，因为回测日期是当天的收盘）
-        logger.info(f"[run_backtest] 过滤信号到回测日期范围...")
+        # 第一步：过滤信号到回测日期范围
+        logger.info(f"[run_backtest] 第一步：过滤信号到回测日期范围...")
         if signal_df is not None:
             before_filter = len(signal_df)
             logger.debug(f"[run_backtest] 信号数据日期范围: {signal_df['datetime'].min()} 到 {signal_df['datetime'].max()}")
@@ -275,7 +368,7 @@ def run_backtest(
                 (pl.col("datetime") >= start) & (pl.col("datetime") <= end)
             )
             after_filter = len(filtered_df)
-            logger.info(f"[run_backtest] 信号过滤: {before_filter} -> {after_filter} 行")
+            logger.info(f"[run_backtest] 日期过滤: {before_filter} -> {after_filter} 行")
             
             # 如果过滤后为空，使用最近的信号数据（回测日期之前的最后一个交易日）
             if after_filter == 0:
@@ -290,17 +383,34 @@ def run_backtest(
                     filtered_df = signal_df
             
             signal_df = filtered_df
-            
-            # 如果指定了 universe，只保留 universe 中的股票
-            if universe_vt_symbols is not None:
-                before_universe_filter = len(signal_df)
-                signal_df = signal_df.filter(pl.col("vt_symbol").is_in(universe_vt_symbols))
-                after_universe_filter = len(signal_df)
-                logger.info(f"[run_backtest] Universe 筛选: {before_universe_filter} -> {after_universe_filter} 行")
-                logger.info(f"[run_backtest] 投资范围 $U_t$ 包含 {len(universe_vt_symbols)} 个股票，信号中有 {signal_df['vt_symbol'].n_unique()} 个")
-            
-            vt_symbols_list = sorted(signal_df["vt_symbol"].unique().to_list())
-            logger.info(f"[run_backtest] 过滤后合约数: {len(vt_symbols_list)}")
+
+        # 第二步：如果使用 PostgreSQL 选股，按每日选股结果过滤信号（ADV、价格等基础条件已在选股时完成）
+        if daily_selections and signal_df is not None:
+            logger.info("[run_backtest] 第二步：根据 PostgreSQL 每日选股结果过滤信号（按交易日）...")
+            filtered_rows: list[dict[str, Any]] = []
+            for row in signal_df.iter_rows(named=True):
+                trade_date = row["datetime"].date()
+                vt_symbol = row["vt_symbol"]
+                if trade_date in daily_selections and vt_symbol in daily_selections[trade_date]:
+                    filtered_rows.append(row)
+
+            if filtered_rows:
+                signal_df = pl.DataFrame(filtered_rows)
+                vt_symbols_list = sorted(signal_df["vt_symbol"].unique().to_list())
+                logger.info(
+                    f"[run_backtest] PostgreSQL选股过滤后: {len(signal_df)} 行信号, {len(vt_symbols_list)} 只股票"
+                )
+            else:
+                logger.warning("[run_backtest] PostgreSQL选股过滤后信号为空，将使用原始信号的股票列表")
+                vt_symbols_list = sorted(signal_df["vt_symbol"].unique().to_list())
+                logger.info(f"[run_backtest] 使用信号中的所有股票: {len(vt_symbols_list)} 只")
+        else:
+            if signal_df is not None:
+                vt_symbols_list = sorted(signal_df["vt_symbol"].unique().to_list())
+                logger.info(f"[run_backtest] 未使用PostgreSQL选股，使用信号中的所有股票: {len(vt_symbols_list)} 只")
+            else:
+                logger.error(f"[run_backtest] 无法确定股票列表")
+                raise RuntimeError("Cannot determine vt_symbols list")
         
         if not vt_symbols_list:
             logger.error(f"[run_backtest] 回测股票池为空")
@@ -323,8 +433,8 @@ def run_backtest(
     # 默认策略参数
     if strategy_setting is None:
         strategy_setting = {
-            "top_n": 12,
-            "min_score_threshold": 0.5,
+            "top_n": 5,  # 修改为 Top 5
+            "min_score_threshold": min_score_threshold,
             "min_holding_days": 2,
             "max_holding_days": 5,
             "cash_ratio": 0.95,
@@ -336,6 +446,21 @@ def run_backtest(
             "stop_loss_atr_multiplier": 2.5,
             "max_daily_drawdown": 0.04,
         }
+    else:
+        strategy_setting = dict(strategy_setting)
+        strategy_setting["min_score_threshold"] = strategy_setting.get(
+            "min_score_threshold", min_score_threshold
+        )
+
+    # 确定佣金费率
+    # 优先级: 1. strategy_setting['commission_rate']  2. commission_rate 参数  3. 默认值 0.0 (Alpaca)
+    effective_commission_rate = 0.0
+    if "commission_rate" in strategy_setting:
+        effective_commission_rate = float(strategy_setting["commission_rate"])
+    elif commission_rate is not None:
+        effective_commission_rate = commission_rate
+    
+    logger.info(f"[run_backtest] 交易佣金费率: {effective_commission_rate}")
 
     # 配置回测引擎
     logger.info(f"[run_backtest] 初始化回测引擎...")
@@ -346,69 +471,72 @@ def run_backtest(
     logger.info(f"[run_backtest]   - 年化交易日: {annual_days}")
     logger.info(f"[run_backtest] 策略参数: {strategy_setting}")
     
-    # 为所有合约添加交易配置（避免 KeyError）- 批量优化版本
-    logger.info(f"[run_backtest] 批量添加合约交易配置...")
-    import json
-    from pathlib import Path
-    
-    # 批量加载现有配置（容错处理）
-    contracts: dict = {}
+    # 为所有合约添加交易配置（避免 KeyError）- 批量写入版本
+    logger.info("[run_backtest] 批量添加合约交易配置...")
+
+    contracts: dict[str, Any] = {}
     contract_path = lab.contract_path
     if contract_path.exists():
         try:
             with open(contract_path, encoding="UTF-8") as f:
                 contracts = json.load(f)
-        except json.JSONDecodeError as e:
-            logger.warning(f"[run_backtest] 合约配置文件 JSON 格式错误: {e}，将重新创建")
-            # 备份损坏的文件
-            import shutil
-            backup_path = contract_path.with_suffix('.json.corrupted')
-            shutil.copy(contract_path, backup_path)
-            logger.warning(f"[run_backtest] 已备份损坏文件到: {backup_path}")
+        except json.JSONDecodeError as exc:
+            logger.warning(f"[run_backtest] 合约配置文件 JSON 损坏: {exc}，将重新创建")
+            # 备份损坏文件
+            try:
+                import shutil
+
+                backup_path = contract_path.with_suffix(".json.corrupted")
+                shutil.copy(contract_path, backup_path)
+                logger.warning(f"[run_backtest] 已备份损坏文件到: {backup_path}")
+            except Exception:
+                pass
             contracts = {}
-    
-    # 批量更新配置（确保所有必需字段都存在）
-    new_count = 0
-    updated_count = 0
+        except OSError as exc:
+            logger.warning(f"[run_backtest] 读取合约配置失败: {exc}，将重新创建")
+            contracts = {}
+
     required_fields = ["long_rate", "short_rate", "size", "pricetick"]
     default_config = {
-        "long_rate": 0.0003,
-        "short_rate": 0.0003,
+        "long_rate": float(effective_commission_rate),
+        "short_rate": float(effective_commission_rate),
         "size": 1,
-        "pricetick": 0.01
+        "pricetick": 0.01,
     }
-    
+
+    new_count = 0
+    updated_count = 0
     for vt_symbol in vt_symbols_list:
-        if vt_symbol not in contracts:
-            contracts[vt_symbol] = default_config.copy()
+        if vt_symbol not in contracts or not isinstance(contracts.get(vt_symbol), dict):
+            contracts[vt_symbol] = dict(default_config)
             new_count += 1
-        else:
-            # 检查并补充缺失的字段
-            needs_update = False
-            for field in required_fields:
-                if field not in contracts[vt_symbol]:
-                    contracts[vt_symbol][field] = default_config[field]
-                    needs_update = True
-            if needs_update:
-                updated_count += 1
-    
-    # 一次性保存所有配置
+            continue
+
+        needs_update = False
+        for field in required_fields:
+            if field not in contracts[vt_symbol]:
+                contracts[vt_symbol][field] = default_config[field]
+                needs_update = True
+
+        # 确保费率与本次回测一致
+        if contracts[vt_symbol].get("long_rate") != default_config["long_rate"]:
+            contracts[vt_symbol]["long_rate"] = default_config["long_rate"]
+            needs_update = True
+        if contracts[vt_symbol].get("short_rate") != default_config["short_rate"]:
+            contracts[vt_symbol]["short_rate"] = default_config["short_rate"]
+            needs_update = True
+
+        if needs_update:
+            updated_count += 1
+
     if new_count > 0 or updated_count > 0:
         with open(contract_path, mode="w+", encoding="UTF-8") as f:
-            json.dump(
-                contracts,
-                f,
-                indent=4,
-                ensure_ascii=False
-            )
-        if new_count > 0 and updated_count > 0:
-            logger.info(f"[run_backtest] 已为 {new_count} 个新合约添加配置，更新了 {updated_count} 个合约的配置（共 {len(vt_symbols_list)} 个合约）")
-        elif new_count > 0:
-            logger.info(f"[run_backtest] 已为 {new_count} 个新合约添加交易配置（共 {len(vt_symbols_list)} 个合约）")
-        else:
-            logger.info(f"[run_backtest] 已更新 {updated_count} 个合约的配置（共 {len(vt_symbols_list)} 个合约）")
+            json.dump(contracts, f, indent=4, ensure_ascii=False)
+        logger.info(
+            f"[run_backtest] 合约配置写入完成：新增 {new_count}，更新 {updated_count}，总计 {len(vt_symbols_list)}"
+        )
     else:
-        logger.info(f"[run_backtest] 所有 {len(vt_symbols_list)} 个合约的配置已存在且完整")
+        logger.info(f"[run_backtest] 合约配置已完整（共 {len(vt_symbols_list)}）")
     
     engine = BacktestingEngine(lab)
     engine.set_parameters(
@@ -435,12 +563,35 @@ def run_backtest(
     logger.info(f"[run_backtest] 回测执行完成")
 
     logger.info(f"[run_backtest] 计算回测结果...")
-    engine.calculate_result()
+    daily_df = engine.calculate_result()
     logger.info(f"[run_backtest] 结果计算完成")
+
+    if daily_df is None:
+        logger.warning("[run_backtest] 无成交记录，跳过统计与图表输出")
+        return None
 
     logger.info(f"[run_backtest] 计算统计指标...")
     stats = engine.calculate_statistics()
     logger.info(f"[run_backtest] 统计指标计算完成")
+
+    # 确定报告文件夹名称（FROM_TO_Scenario格式）并获取regime信息
+    from flagship.backtest.index_regime_windows import REGIME_WINDOWS
+    report_folder_name = None
+    matched_regime = None
+    for regime in REGIME_WINDOWS:
+        if regime.start == start.date() and regime.end == end.date():
+            # 格式：20240102_20240412_regime01
+            report_folder_name = f"{regime.start.strftime('%Y%m%d')}_{regime.end.strftime('%Y%m%d')}_regime{regime.id:02d}"
+            matched_regime = regime
+            break
+    
+    if report_folder_name is None:
+        # 如果没有匹配的regime，使用日期范围
+        report_folder_name = f"{start.date().strftime('%Y%m%d')}_{end.date().strftime('%Y%m%d')}_backtest"
+    
+    report_dir = lab.lab_path / "report" / report_folder_name
+    report_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"[run_backtest] 报告文件夹: {report_dir}")
 
     # 打印关键统计指标
     logger.info("\n" + "=" * 60)
@@ -449,18 +600,596 @@ def run_backtest(
     for k, v in stats.items():
         logger.info(f"{k}: {v}")
 
-    # 显示交易清单
-    logger.info(f"[run_backtest] 显示交易清单...")
-    engine.show_trade_list()
+    # 获取交易清单DataFrame
+    trade_list_df = engine.get_trade_list()
+    trade_list_path = report_dir / "trade_list.csv"
+    if trade_list_df is not None and not trade_list_df.is_empty():
+        # 使用UTF-8-BOM编码保存CSV，确保Excel等工具正确显示中文
+        # Polars的write_csv不支持BOM，需要手动添加
+        import io
+        csv_buffer = io.StringIO()
+        trade_list_df.write_csv(csv_buffer)
+        csv_content = csv_buffer.getvalue()
+        
+        # 添加UTF-8 BOM标记
+        with open(trade_list_path, 'w', encoding='utf-8-sig') as f:
+            f.write(csv_content)
+        logger.info(f"[run_backtest] 交易清单已保存（UTF-8-BOM）: {trade_list_path}")
+    else:
+        logger.warning("[run_backtest] 交易清单为空")
+        trade_list_path = None
 
-    # 显示净值曲线和回撤图表
-    logger.info(f"[run_backtest] 显示回测图表...")
-    engine.show_chart()
+    # 生成包含图表的HTML报告
+    logger.info(f"[run_backtest] 生成HTML回测报告（包含图表）...")
+    try:
+        html_report_path = report_dir / "report.html"
+        
+        # 尝试加载数据集名称（用于因子有效性计算）
+        dataset_name = None
+        if hasattr(engine.strategy, 'dataset_name'):
+            dataset_name = engine.strategy.dataset_name
+        else:
+            # 尝试从信号文件名推断数据集名称
+            if signal_name and "regime" in signal_name:
+                # 如果是lgb信号（LightGBM训练的信号），使用对应的lgb数据集
+                if "_lgb_signal" in signal_name:
+                    # 提取regime ID，例如 flagship_alpha_mom_regime02_lgb_signal -> flagship_alpha_mom_regime02_lgb
+                    import re
+                    match = re.search(r'regime(\d+)', signal_name)
+                    if match:
+                        regime_id = int(match.group(1))
+                        dataset_name = f"flagship_alpha_mom_regime{regime_id:02d}_lgb"
+                    else:
+                        # 回退到v5数据集（因为lgb信号是基于v5因子训练的）
+                        dataset_name = "flagship_alpha_momentum_v5"
+                # v5信号使用v5数据集
+                elif "_v5_" in signal_name or signal_name.endswith("_v5_signal"):
+                    dataset_name = "flagship_alpha_momentum_v5"
+                # 其他情况默认使用v5数据集（不再使用v4）
+                else:
+                    dataset_name = "flagship_alpha_momentum_v5"
+            else:
+                # 默认使用v5数据集
+                dataset_name = "flagship_alpha_momentum_v5"
+        
+        # 保存统计结果到临时文件（用于生成报告）
+        import json
+        stats_path = report_dir / "statistics.json"
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False, default=str)
+        
+        generate_html_report_with_charts(
+            engine=engine,
+            stats=stats,
+            trade_list_path=trade_list_path,
+            output_path=html_report_path,
+            signal_name=signal_name,
+            dataset_name=dataset_name,
+            lab=lab,
+            regime=matched_regime,
+        )
+        logger.info(f"[run_backtest] HTML报告已生成: {html_report_path}")
+    except Exception as exc:
+        logger.warning(f"[run_backtest] 生成HTML报告失败: {exc}", exc_info=True)
     
-    # 保存回测报告
-    logger.info(f"[run_backtest] 保存回测报告...")
-    save_backtest_report(lab, engine, stats, start, end, signal_name)
+    logger.info("=" * 80)
     logger.info(f"[run_backtest] 回测流程全部完成")
+    logger.info(f"[run_backtest] 日志文件已保存: {log_path}")
+    logger.info("=" * 80)
+    
+    # loguru 会自动管理 sink，不需要手动移除
+    # 如果需要移除，可以使用 logger.remove(sink_id)，但通常不需要
+    
+    return stats
+
+
+def generate_performance_summary(trade_list_path: Path) -> dict:
+    """从交易清单生成表现摘要"""
+    if not trade_list_path.exists():
+        return {}
+    
+    df = pl.read_csv(trade_list_path)
+    
+    if df.is_empty():
+        return {}
+    
+    # 使用小写列名（实际 DataFrame 的列名）
+    pnl_col = "net_pnl" if "net_pnl" in df.columns else "Net PnL"
+    pnl_pct_col = "net_pnl_pct" if "net_pnl_pct" in df.columns else "Net PnL %"
+    balance_entry_col = "balance_at_entry" if "balance_at_entry" in df.columns else "Balance at Entry"
+    position_size_col = "position_size" if "position_size" in df.columns else "Position Size"
+    positions_entry_col = "positions_at_entry" if "positions_at_entry" in df.columns else "Positions at Entry"
+    
+    # 计算总交易数
+    total_trades = len(df)
+    
+    # 计算盈利交易数
+    profitable_trades = df.filter(pl.col(pnl_col) > 0)
+    winning_trades_count = len(profitable_trades)
+    winning_trades_pct = (winning_trades_count / total_trades * 100) if total_trades > 0 else 0
+    
+    # 计算总盈亏
+    total_pnl = df[pnl_col].sum()
+    total_pnl_pct = (total_pnl / df[balance_entry_col].sum() * 100) if df[balance_entry_col].sum() > 0 else 0
+    
+    # 计算毛利润和毛亏损
+    gross_profit = profitable_trades[pnl_col].sum() if not profitable_trades.is_empty() else 0
+    losing_trades = df.filter(pl.col(pnl_col) < 0)
+    gross_loss = abs(losing_trades[pnl_col].sum()) if not losing_trades.is_empty() else 0
+    
+    # 计算盈利因子
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 0
+    
+    # 计算平均盈亏
+    avg_pnl = df[pnl_col].mean()
+    avg_pnl_pct = (avg_pnl / df[balance_entry_col].mean() * 100) if df[balance_entry_col].mean() > 0 else 0
+    
+    # 计算平均盈利交易和平均亏损交易
+    avg_winning_trade = profitable_trades[pnl_col].mean() if not profitable_trades.is_empty() else 0
+    avg_losing_trade = losing_trades[pnl_col].mean() if not losing_trades.is_empty() else 0
+    
+    # 计算最大盈利和最大亏损交易
+    max_profit_trade = df[pnl_col].max()
+    max_loss_trade = df[pnl_col].min()
+    
+    # 计算最大持仓数量
+    max_position_size = df[position_size_col].max()
+    
+    # 计算最大合同持有量（从 Positions at Entry/Exit 中提取）
+    max_contracts_held = 0
+    if positions_entry_col in df.columns:
+        for pos_str in df[positions_entry_col]:
+            if pos_str and isinstance(pos_str, str):
+                pos_count = len([s for s in pos_str.split(", ") if s.strip()])
+                max_contracts_held = max(max_contracts_held, pos_count)
+    
+    return {
+        "total_trades": total_trades,
+        "winning_trades": {
+            "count": winning_trades_count,
+            "percentage": winning_trades_pct,
+        },
+        "total_pnl": {
+            "value": float(total_pnl),
+            "percentage": float(total_pnl_pct),
+        },
+        "gross_profit": float(gross_profit),
+        "gross_loss": float(gross_loss),
+        "profit_factor": float(profit_factor),
+        "average_pnl": {
+            "value": float(avg_pnl),
+            "percentage": float(avg_pnl_pct),
+        },
+        "average_winning_trade": float(avg_winning_trade),
+        "average_losing_trade": float(avg_losing_trade),
+        "max_profit_trade": float(max_profit_trade),
+        "max_loss_trade": float(max_loss_trade),
+        "max_position_size": float(max_position_size),
+        "max_contracts_held": int(max_contracts_held),
+    }
+
+
+def generate_html_report_with_charts(
+    engine: BacktestingEngine,
+    stats: dict[str, Any],
+    trade_list_path: Path | None,
+    output_path: Path,
+    signal_name: str,
+    dataset_name: str,
+    lab: AlphaLab,
+    regime: Any | None = None,
+) -> None:
+    """生成包含图表的HTML报告（包含所有原有内容）"""
+    from datetime import datetime
+    import json
+    
+    # 1. 生成plotly图表
+    df = engine.daily_df
+    
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        subplot_titles=["Balance", "Drawdown", "Daily Pnl"],
+        vertical_spacing=0.08,
+        row_heights=[0.4, 0.3, 0.3],
+    )
+    
+    # Balance曲线
+    balance_line = go.Scatter(
+        x=df["date"],
+        y=df["balance"],
+        mode="lines",
+        name="Balance",
+        line=dict(color="blue", width=2),
+    )
+    
+    # Drawdown曲线
+    drawdown_scatter = go.Scatter(
+        x=df["date"],
+        y=df["drawdown"],
+        fillcolor="rgba(255, 0, 0, 0.3)",
+        fill='tozeroy',
+        mode="lines",
+        name="Drawdown",
+        line=dict(color="red", width=1),
+    )
+    
+    # Daily PnL柱状图
+    colors = ['green' if x >= 0 else 'red' for x in df["net_pnl"]]
+    pnl_bar = go.Bar(
+        x=df["date"],
+        y=df["net_pnl"],
+        name="Daily Pnl",
+        marker=dict(color=colors),
+    )
+    
+    fig.add_trace(balance_line, row=1, col=1)
+    fig.add_trace(drawdown_scatter, row=2, col=1)
+    fig.add_trace(pnl_bar, row=3, col=1)
+    
+    fig.update_layout(
+        height=1200,
+        width=1400,
+        title_text=f"回测图表 - {stats.get('start_date', 'N/A')} 至 {stats.get('end_date', 'N/A')}",
+        title_x=0.5,
+        showlegend=True,
+    )
+    
+    # 更新x轴标签
+    fig.update_xaxes(title_text="日期", row=3, col=1)
+    fig.update_yaxes(title_text="余额", row=1, col=1)
+    fig.update_yaxes(title_text="回撤", row=2, col=1)
+    fig.update_yaxes(title_text="每日盈亏", row=3, col=1)
+    
+    # 将图表转换为HTML（包含plotly.js CDN）
+    chart_html = fig.to_html(include_plotlyjs='cdn', div_id="backtest-charts", full_html=False)
+    
+    # 2. 生成因子有效性数据（可选，如果模块不存在则跳过）
+    
+    factor_validity = {}
+    try:
+        from vnpy.alpha.dataset import Segment
+        from flagship.model.evaluate_signal_quality import evaluate_metrics  # type: ignore
+        # 加载数据集（如果不存在则报错，不再回退）
+        dataset = None
+        if dataset_name:
+            try:
+                dataset = lab.load_dataset(dataset_name)
+                if dataset is None:
+                    raise ValueError(f"数据集 {dataset_name} 不存在")
+            except Exception as e:
+                logger.error(f"[generate_html_report_with_charts] 无法加载数据集 {dataset_name}: {e}")
+                raise ValueError(f"数据集 {dataset_name} 不存在或加载失败，请确保使用v5数据集") from e
+        
+        signal_df = lab.load_signal(signal_name)
+        if dataset and signal_df is not None and not signal_df.is_empty():
+            factor_validity = evaluate_metrics(dataset, signal_df, Segment.TEST, quantiles=5)
+    except ImportError:
+        logger.debug("[generate_html_report_with_charts] evaluate_signal_quality 模块不存在，跳过因子有效性计算")
+    except ValueError as exc:
+        # ValueError表示数据集不存在，这是严重错误，记录并继续（不中断报告生成）
+        logger.error(f"[generate_html_report_with_charts] {exc}")
+    except Exception as exc:
+        logger.warning(f"[generate_html_report_with_charts] 计算因子有效性失败: {exc}")
+    
+    # 3. 生成交易表现摘要
+    performance_summary = {}
+    if trade_list_path and trade_list_path.exists():
+        try:
+            performance_summary = generate_performance_summary(trade_list_path)
+        except Exception as exc:
+            logger.warning(f"[generate_html_report_with_charts] 生成交易表现摘要失败: {exc}")
+    
+    # 4. 读取交易清单（用于显示前20条）
+    trade_list_preview_html = ""
+    if trade_list_path and trade_list_path.exists():
+        try:
+            trade_df = pl.read_csv(trade_list_path)
+            if not trade_df.is_empty():
+                # 选择关键列
+                display_cols = []
+                col_mapping = {
+                    "Trade ID": "trade_id",
+                    "Symbol": "vt_symbol",
+                    "Direction": "direction",
+                    "Entry Time": "entry_datetime",
+                    "Exit Time": "exit_datetime",
+                    "Entry Price": "entry_price",
+                    "Exit Price": "exit_price",
+                    "Position Size": "position_size",
+                    "Net PnL": "net_pnl",
+                    "Net PnL %": "net_pnl_pct",
+                }
+                
+                headers = []
+                available_cols = []
+                for display_name, col_name in col_mapping.items():
+                    if col_name in trade_df.columns:
+                        headers.append(display_name)
+                        available_cols.append(col_name)
+                
+                if headers:
+                    trade_list_preview_html = "<h2>交易清单</h2>\n"
+                    trade_list_preview_html += f"<p>完整的交易清单请查看 CSV 文件: <a href='{trade_list_path.name}'>{trade_list_path.name}</a></p>\n"
+                    trade_list_preview_html += "<h3>交易清单预览（前20条）</h3>\n"
+                    trade_list_preview_html += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%; font-size: 12px;'>\n"
+                    trade_list_preview_html += "<tr>" + "".join([f"<th style='text-align: left; background-color: #f0f0f0;'>{h}</th>" for h in headers]) + "</tr>\n"
+                    
+                    preview_df = trade_df.head(20).select(available_cols)
+                    for row in preview_df.iter_rows(named=True):
+                        trade_list_preview_html += "<tr>"
+                        for col in available_cols:
+                            val = row.get(col)
+                            if val is None:
+                                trade_list_preview_html += "<td></td>"
+                            elif isinstance(val, float):
+                                if col in ["entry_price", "exit_price", "net_pnl"]:
+                                    trade_list_preview_html += f"<td style='text-align: right;'>{val:,.2f}</td>"
+                                elif col == "net_pnl_pct":
+                                    trade_list_preview_html += f"<td style='text-align: right;'>{val:.2f}%</td>"
+                                elif col == "position_size":
+                                    trade_list_preview_html += f"<td style='text-align: right;'>{val:,.0f}</td>"
+                                else:
+                                    trade_list_preview_html += f"<td style='text-align: right;'>{val:.4f}</td>"
+                            elif isinstance(val, (int, str)):
+                                trade_list_preview_html += f"<td>{val}</td>"
+                            else:
+                                trade_list_preview_html += f"<td>{str(val)}</td>"
+                        trade_list_preview_html += "</tr>\n"
+                    trade_list_preview_html += "</table>\n"
+        except Exception as exc:
+            logger.warning(f"[generate_html_report_with_charts] 读取交易清单失败: {exc}")
+    
+    # 5. 生成HTML内容
+    report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 生成regime信息HTML
+    regime_html = ""
+    if regime is not None:
+        # 使用更突出的格式显示regime信息
+        regime_html = f"""
+    <div style="background-color: #e8f4f8; border-left: 4px solid #2196F3; padding: 15px; margin: 20px 0;">
+        <h2 style="color: #1976D2; margin-top: 0;">市场状态 (Market Regime)</h2>
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+                <td style="padding: 5px; width: 150px;"><strong>Regime ID</strong>:</td>
+                <td style="padding: 5px;">{regime.id}</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;"><strong>标签</strong>:</td>
+                <td style="padding: 5px;">{regime.label}</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;"><strong>市场特征</strong>:</td>
+                <td style="padding: 5px; color: #d32f2f; font-weight: bold;">{regime.feature}</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;"><strong>起始日期</strong>:</td>
+                <td style="padding: 5px;">{regime.start}</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;"><strong>结束日期</strong>:</td>
+                <td style="padding: 5px;">{regime.end}</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;"><strong>开盘价</strong>:</td>
+                <td style="padding: 5px;">{regime.open_price:,.2f}</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;"><strong>收盘价</strong>:</td>
+                <td style="padding: 5px;">{regime.close_price:,.2f}</td>
+            </tr>
+            <tr>
+                <td style="padding: 5px;"><strong>涨跌幅</strong>:</td>
+                <td style="padding: 5px; color: {'#d32f2f' if regime.pct_change < 0 else '#388e3c'}; font-weight: bold;">
+                    {regime.pct_change:+.2f}%
+                </td>
+            </tr>
+        </table>
+    </div>
+"""
+    
+    # 格式化数值
+    def format_value(v: Any) -> str:
+        if isinstance(v, (int, float)):
+            if abs(v) >= 1e6:
+                return f"{v/1e6:.2f}M"
+            elif abs(v) >= 1e3:
+                return f"{v/1e3:.2f}K"
+            elif isinstance(v, float):
+                return f"{v:.4f}"
+            else:
+                return str(v)
+        return str(v)
+    
+    # 因子验证HTML
+    factor_validity_html = ""
+    if factor_validity:
+        factor_validity_html = "<h2>因子验证预测能力</h2>\n"
+        factor_validity_html += f"<p><strong>样本数</strong>: {factor_validity.get('sample_size', 'N/A'):,}</p>\n"
+        coverage = factor_validity.get('coverage', 0)
+        if isinstance(coverage, (int, float)):
+            factor_validity_html += f"<p><strong>覆盖率</strong>: {coverage * 100:.2f}%</p>\n"
+        
+        ic = factor_validity.get("ic", {})
+        if ic and ic.get('mean') is not None:
+            factor_validity_html += "<h3>IC 指标（Information Coefficient）</h3>\n"
+            factor_validity_html += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%;'>\n"
+            factor_validity_html += "<tr><th>指标</th><th>数值</th></tr>\n"
+            factor_validity_html += f"<tr><td>IC 均值</td><td style='text-align: right;'>{ic.get('mean', 0):.4f}</td></tr>\n"
+            factor_validity_html += f"<tr><td>IC 标准差</td><td style='text-align: right;'>{ic.get('std', 0):.4f}</td></tr>\n"
+            if ic.get('t_value') is not None:
+                factor_validity_html += f"<tr><td>IC t 值</td><td style='text-align: right;'>{ic.get('t_value', 0):.4f}</td></tr>\n"
+            if ic.get('icir') is not None:
+                factor_validity_html += f"<tr><td><strong>IC IR</strong></td><td style='text-align: right;'><strong>{ic.get('icir', 0):.4f}</strong></td></tr>\n"
+            factor_validity_html += "</table>\n"
+            factor_validity_html += "<p><em>IC IR = IC均值 / IC标准差，衡量因子预测能力的稳定性</em></p>\n"
+        
+        rank_ic = factor_validity.get("rank_ic", {})
+        if rank_ic and rank_ic.get('mean') is not None:
+            factor_validity_html += "<h3>Rank IC 指标（Rank Information Coefficient）</h3>\n"
+            factor_validity_html += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%;'>\n"
+            factor_validity_html += "<tr><th>指标</th><th>数值</th></tr>\n"
+            factor_validity_html += f"<tr><td>Rank IC 均值</td><td style='text-align: right;'>{rank_ic.get('mean', 0):.4f}</td></tr>\n"
+            factor_validity_html += f"<tr><td>Rank IC 标准差</td><td style='text-align: right;'>{rank_ic.get('std', 0):.4f}</td></tr>\n"
+            if rank_ic.get('t_value') is not None:
+                factor_validity_html += f"<tr><td>Rank IC t 值</td><td style='text-align: right;'>{rank_ic.get('t_value', 0):.4f}</td></tr>\n"
+            if rank_ic.get('icir') is not None:
+                factor_validity_html += f"<tr><td><strong>Rank IC IR</strong></td><td style='text-align: right;'><strong>{rank_ic.get('icir', 0):.4f}</strong></td></tr>\n"
+            factor_validity_html += "</table>\n"
+            factor_validity_html += "<p><em>Rank IC IR = Rank IC均值 / Rank IC标准差，衡量因子排序能力的稳定性</em></p>\n"
+        
+        quantile_returns = factor_validity.get("quantile_returns", [])
+        if quantile_returns:
+            factor_validity_html += "<h3>分位数收益分析</h3>\n"
+            factor_validity_html += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%;'>\n"
+            factor_validity_html += "<tr><th>分位数</th><th>平均收益</th><th>样本数</th></tr>\n"
+            for qr in quantile_returns:
+                factor_validity_html += f"<tr><td>{qr.get('quantile', 'N/A')}</td><td style='text-align: right;'>{qr.get('avg_return', 0):.4f}</td><td style='text-align: right;'>{qr.get('count', 0)}</td></tr>\n"
+            factor_validity_html += "</table>\n"
+        
+        turnover = factor_validity.get("top_quantile_turnover", {})
+        if turnover:
+            factor_validity_html += "<h3>Top 分位换手率</h3>\n"
+            factor_validity_html += f"<p><strong>平均换手率</strong>: {turnover.get('average', 'N/A')}</p>\n"
+            factor_validity_html += f"<p><strong>统计天数</strong>: {turnover.get('count', 0)}</p>\n"
+    
+    # 回测统计指标HTML
+    backtest_stats_html = "<h2>回测统计指标</h2>\n"
+    backtest_stats_html += f"<p><strong>起始日期</strong>: {stats.get('start_date', 'N/A')}</p>\n"
+    backtest_stats_html += f"<p><strong>结束日期</strong>: {stats.get('end_date', 'N/A')}</p>\n"
+    total_days = stats.get('total_days', 0)
+    if isinstance(total_days, str):
+        total_days = int(total_days)
+    backtest_stats_html += f"<p><strong>总交易日</strong>: {total_days}</p>\n"
+    profit_days = stats.get('profit_days', 0)
+    if isinstance(profit_days, str):
+        profit_days = int(profit_days)
+    backtest_stats_html += f"<p><strong>盈利交易日</strong>: {profit_days}</p>\n"
+    loss_days = stats.get('loss_days', 0)
+    if isinstance(loss_days, str):
+        loss_days = int(loss_days)
+    backtest_stats_html += f"<p><strong>亏损交易日</strong>: {loss_days}</p>\n"
+    backtest_stats_html += f"<p><strong>起始资金</strong>: {float(stats.get('capital', 0)):,.2f}</p>\n"
+    backtest_stats_html += f"<p><strong>结束资金</strong>: {float(stats.get('end_balance', 0)):,.2f}</p>\n"
+    backtest_stats_html += f"<p><strong>总收益率</strong>: {float(stats.get('total_return', 0)):.2f}%</p>\n"
+    backtest_stats_html += f"<p><strong>年化收益</strong>: {float(stats.get('annual_return', 0)):.2f}%</p>\n"
+    backtest_stats_html += f"<p><strong>最大回撤</strong>: {float(stats.get('max_drawdown', 0)):,.2f} ({float(stats.get('max_ddpercent', 0)):.2f}%)</p>\n"
+    max_dd_duration = stats.get('max_drawdown_duration', 0)
+    if isinstance(max_dd_duration, str):
+        max_dd_duration = int(max_dd_duration)
+    backtest_stats_html += f"<p><strong>最大回撤持续时间</strong>: {max_dd_duration} 天</p>\n"
+    backtest_stats_html += f"<p><strong>买入持有回报</strong>: {float(stats.get('buy_hold_return', 0)):.2f}%</p>\n"
+    backtest_stats_html += f"<p><strong>平均股权上涨</strong>: {float(stats.get('avg_equity_runup', 0)):,.2f} ({float(stats.get('avg_equity_runup_pct', 0)):.2f}%)</p>\n"
+    backtest_stats_html += f"<p><strong>平均股权上涨持续时间</strong>: {float(stats.get('avg_equity_runup_duration', 0)):.1f} 天</p>\n"
+    backtest_stats_html += f"<p><strong>最大股权上涨</strong>: {float(stats.get('max_equity_runup', 0)):,.2f} ({float(stats.get('max_equity_runup_pct', 0)):.2f}%)</p>\n"
+    backtest_stats_html += f"<p><strong>平均股权回撤</strong>: {float(stats.get('avg_equity_drawdown', 0)):,.2f} ({float(stats.get('avg_equity_drawdown_pct', 0)):.2f}%)</p>\n"
+    backtest_stats_html += f"<p><strong>平均股权回撤持续时间</strong>: {float(stats.get('avg_equity_drawdown_duration', 0)):.1f} 天</p>\n"
+    backtest_stats_html += f"<p><strong>Sharpe Ratio</strong>: {float(stats.get('sharpe_ratio', 0)):.4f}</p>\n"
+    backtest_stats_html += f"<p><strong>收益回撤比</strong>: {float(stats.get('return_drawdown_ratio', 0)):.4f}</p>\n"
+    
+    # 交易表现摘要HTML
+    performance_html = ""
+    if performance_summary:
+        performance_html = "<h2>交易表现摘要</h2>\n"
+        performance_html += f"<p><strong>总交易数</strong>: {performance_summary.get('total_trades', 'N/A')}</p>\n"
+        performance_html += f"<p><strong>盈利交易</strong>: {performance_summary.get('winning_trades', 'N/A')} ({performance_summary.get('win_rate', 0) * 100:.2f}%)</p>\n"
+        performance_html += f"<p><strong>总盈亏</strong>: {float(performance_summary.get('total_net_pnl', 0)):,.2f} ({float(performance_summary.get('total_net_pnl_pct', 0)):.2f}%)</p>\n"
+        performance_html += f"<p><strong>毛利润</strong>: {float(performance_summary.get('gross_profit', 0)):,.2f}</p>\n"
+        performance_html += f"<p><strong>毛亏损</strong>: {float(performance_summary.get('gross_loss', 0)):,.2f}</p>\n"
+        performance_html += f"<p><strong>盈利因子</strong>: {float(performance_summary.get('profit_factor', 0)):.4f}</p>\n"
+        performance_html += f"<p><strong>平均盈亏</strong>: {float(performance_summary.get('avg_net_pnl', 0)):,.2f} ({float(performance_summary.get('avg_net_pnl_pct', 0)):.2f}%)</p>\n"
+        performance_html += f"<p><strong>平均盈利交易</strong>: {float(performance_summary.get('avg_winning_trade', 0)):,.2f}</p>\n"
+        performance_html += f"<p><strong>平均亏损交易</strong>: {float(performance_summary.get('avg_losing_trade', 0)):,.2f}</p>\n"
+        performance_html += f"<p><strong>最大盈利交易</strong>: {float(performance_summary.get('max_winning_trade', 0)):,.2f}</p>\n"
+        performance_html += f"<p><strong>最大亏损交易</strong>: {float(performance_summary.get('max_losing_trade', 0)):,.2f}</p>\n"
+        performance_html += f"<p><strong>最大持仓数量</strong>: {int(performance_summary.get('max_position_size', 0)):,}</p>\n"
+        performance_html += f"<p><strong>最大合同持有量</strong>: {performance_summary.get('max_contracts_held', 'N/A')}</p>\n"
+    
+    # 完整的HTML报告
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Flagship Alpha-Momentum 综合回测报告</title>
+    <script>
+    window.MathJax = {{
+      tex: {{
+        inlineMath: [['$', '$'], ['\\\\(', '\\\\)']]
+      }}
+    }};
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Ubuntu", sans-serif;
+            margin: 20px;
+            line-height: 1.6;
+        }}
+        h1 {{
+            color: #333;
+            border-bottom: 2px solid #333;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            color: #555;
+            margin-top: 30px;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 5px;
+        }}
+        h3 {{
+            color: #777;
+            margin-top: 20px;
+        }}
+        table {{
+            margin: 20px 0;
+            border-collapse: collapse;
+            width: 100%;
+        }}
+        th {{
+            background-color: #f0f0f0;
+            font-weight: bold;
+            padding: 8px;
+            text-align: left;
+        }}
+        td {{
+            padding: 8px;
+        }}
+        .note {{
+            background-color: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 10px;
+            margin: 20px 0;
+        }}
+    </style>
+</head>
+<body>
+    <h1>Flagship Alpha-Momentum 综合回测报告</h1>
+    <p><strong>报告生成时间</strong>: {report_date}</p>
+    <p><strong>数据集</strong>: {dataset_name}</p>
+    <p><strong>信号名称</strong>: {signal_name}</p>
+    
+    {regime_html}
+    
+    <div class="note">
+        <strong>注意</strong>: 本报告中的价格数据为未调整价格（unadjusted prices），与Polygon API的 <code>adjusted=true</code> 参数返回的调整后价格可能不同。调整后价格会考虑拆股、分红等因素对历史价格的影响。
+    </div>
+    
+    {factor_validity_html}
+    
+    {backtest_stats_html}
+    
+    {performance_html}
+    
+    <h2>回测图表</h2>
+    {chart_html}
+    
+    {trade_list_preview_html}
+</body>
+</html>"""
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
 
 
 def main() -> None:
@@ -489,8 +1218,8 @@ def main() -> None:
         "--interval",
         type=str,
         choices=["daily", "minute"],
-        default="daily",
-        help="K线周期（默认 daily）",
+        default="minute",
+        help="K线周期（默认 minute，分钟线回测）",
     )
     parser.add_argument(
         "--signal-name",
@@ -503,6 +1232,29 @@ def main() -> None:
         type=int,
         default=1_000_000,
         help="初始资金（默认 1,000,000）",
+    )
+    parser.add_argument(
+        "--min-score-threshold",
+        type=float,
+        default=0.5,
+        help="Score 选股阈值（默认 0.5）",
+    )
+    parser.add_argument(
+        "--use-postgres-selection",
+        action="store_true",
+        default=True,
+        help="使用PostgreSQL每日选股结果（默认启用）",
+    )
+    parser.add_argument(
+        "--no-postgres-selection",
+        dest="use_postgres_selection",
+        action="store_false",
+        help="不使用PostgreSQL每日选股结果",
+    )
+    parser.add_argument(
+        "--commission-rate",
+        type=float,
+        help="交易佣金费率 (例如 0.0001 表示万分之一)",
     )
     args = parser.parse_args()
 
@@ -517,6 +1269,9 @@ def main() -> None:
         interval=interval,
         signal_name=args.signal_name,
         initial_capital=args.capital,
+        min_score_threshold=args.min_score_threshold,
+        use_postgres_selection=args.use_postgres_selection,
+        commission_rate=args.commission_rate,
     )
 
 
