@@ -14,11 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from vnpy.trader.logger import logger
+from vnpy.trader.constant import Interval
 from vnpy.alpha.lab import AlphaLab
 from vnpy.alpha.dataset import Segment
 from flagship.paper_trading.config import (
     LAB_PATH, LIVE_MODEL_PATH, DAILY_SIGNAL_FILE, CURRENT_REGIME_ID
 )
+from flagship.paper_trading.ensure_data_completeness import get_daily_selection_from_postgres
 from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
 from flagship.backtest.index_regime_windows import get_regime_window
 
@@ -61,35 +63,26 @@ def run_live_inference(
     # We need enough history for factors (e.g., ~120 days).
     start_date = target_date - timedelta(days=180) 
     
-    # Define a "dummy" test period that covers our target date
-    # The dataset class uses these periods to slice data.
-    # For inference, we want the "test" segment to include our target date.
-    test_period = (
-        (target_date - timedelta(days=5)).isoformat(), # small buffer before
-        (target_date + timedelta(days=5)).isoformat()  # small buffer after
-    )
-    
-    # Dummy train/valid periods (not used for inference but required by init)
-    train_period = (
-        (start_date).isoformat(),
-        (start_date + timedelta(days=30)).isoformat()
-    )
-    valid_period = (
-        (start_date + timedelta(days=31)).isoformat(),
-        (start_date + timedelta(days=60)).isoformat()
-    )
+    # Define periods (train/valid not used for inference but required by init)
+    train_period = (start_date.isoformat(), (start_date + timedelta(days=30)).isoformat())
+    valid_period = ((start_date + timedelta(days=31)).isoformat(), (start_date + timedelta(days=60)).isoformat())
+    # For inference, ensure TEST covers the whole window including target_date
+    test_period = (start_date.isoformat(), target_date.isoformat())
 
     logger.info(f"[run_live_inference] Loading bar data from {start_date}...")
     
-    # Detect symbols (load all available or use selection)
-    daily_files = sorted(lab.daily_path.glob("*.parquet"))
-    vt_symbols = [p.stem for p in daily_files]
+    # Preferred: use Postgres daily_selection universe for target_date (static filtered universe U_t)
+    vt_symbols = get_daily_selection_from_postgres(target_date)
+    if not vt_symbols:
+        logger.warning(f"[run_live_inference] No daily_selection for {target_date}, falling back to lab symbols.")
+        daily_files = sorted(lab.daily_path.glob("*.parquet"))
+        vt_symbols = [p.stem for p in daily_files]
     
     raw_df = lab.load_bar_df(
         vt_symbols=vt_symbols,
-        interval=None, # Daily by default in load_bar_df if interval is None/Daily
+        interval=Interval.DAILY,
         start=start_date.isoformat(),
-        end=test_period[1],
+        end=target_date.isoformat(),
         extended_days=0
     )
     
@@ -130,10 +123,11 @@ def run_live_inference(
         else:
              raise RuntimeError("No inference data available.")
 
-    # Feature columns expected by the model
-    # We need to get these from the dataset or define them matching training
-    # FlagshipAlphaMomentumV5Dataset.feature_cols should be populated after process_data
-    feature_cols = dataset.feature_cols
+    # Feature columns expected by the model (use the trained model feature list)
+    feature_cols = booster.feature_name()
+    missing_features = [c for c in feature_cols if c not in target_df.columns]
+    if missing_features:
+        raise RuntimeError(f"[run_live_inference] Missing features in inference df: {missing_features[:20]}")
     
     logger.info(f"[run_live_inference] Predicting with {len(feature_cols)} features...")
     

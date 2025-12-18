@@ -404,12 +404,20 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
         if dynamic_weights is None or dynamic_weights.is_empty():
             raise ValueError("动态权重计算失败：IC/IR 结果为空，请检查数据/label 可用性")
 
-        df_z = df_z.join(dynamic_weights, on="datetime", how="left")
-        df_z = df_z.with_columns([
-            (pl.col("weight_mom").fill_null(0.0)).alias("weight_mom"),
-            (pl.col("weight_vwap").fill_null(0.0)).alias("weight_vwap"),
-            (pl.col("weight_trend").fill_null(0.0)).alias("weight_trend"),
-        ])
+        # Join weights by datetime, then forward-fill for dates where label is unavailable (e.g. live inference last N days)
+        df_z = df_z.join(dynamic_weights, on="datetime", how="left").sort(["datetime", "vt_symbol"])
+        df_z = df_z.with_columns(
+            [
+                # forward fill then fallback to 0
+                pl.col("weight_mom").fill_null(strategy="forward").fill_null(0.0).alias("weight_mom"),
+                pl.col("weight_vwap").fill_null(strategy="forward").fill_null(0.0).alias("weight_vwap"),
+                pl.col("weight_trend").fill_null(strategy="forward").fill_null(0.0).alias("weight_trend"),
+                # IR fields are optional for reporting; forward-fill only
+                pl.col("ir_mom").fill_null(strategy="forward").alias("ir_mom"),
+                pl.col("ir_vwap").fill_null(strategy="forward").alias("ir_vwap"),
+                pl.col("ir_trend").fill_null(strategy="forward").alias("ir_trend"),
+            ]
+        )
         df_z = df_z.with_columns(
             (
                 pl.col("weight_mom") * pl.col("z_mom")

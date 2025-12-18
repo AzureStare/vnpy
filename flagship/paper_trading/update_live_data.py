@@ -16,6 +16,7 @@ from vnpy.trader.logger import logger
 from vnpy.trader.constant import Interval
 from flagship.paper_trading.config import LAB_PATH
 from flagship.scripts.download_backtest_data import download_bars_for_symbols, load_daily_universe
+from flagship.scripts.pg_ticker_db import get_pg_connection
 
 def get_last_trading_day() -> date:
     """
@@ -24,6 +25,19 @@ def get_last_trading_day() -> date:
     (In a real production system, this should check a trading calendar API)
     """
     return date.today() - timedelta(days=1)
+
+
+def _load_daily_selection_vt_symbols(trade_date: date) -> list[str]:
+    """从 Postgres 的 daily_selection 读取某天选股 vt_symbol 列表。"""
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT vt_symbol FROM daily_selection WHERE trade_date = %s",
+                (trade_date,),
+            )
+            rows = cur.fetchall()
+            return [row[0] for row in rows]
+
 
 def update_live_data(
     lab_path: Path = LAB_PATH,
@@ -37,36 +51,46 @@ def update_live_data(
         lab_path: Path to AlphaLab directory
         lookback_days: Number of days to look back and download (to cover weekends/holidays)
         universe_file: Optional path to a JSON universe file. If None, it might need to 
-                       rely on existing symbols in the lab or Postgres (not fully implemented here).
+                       use Postgres daily_selection for the last trading day.
     """
-    end_date = get_last_trading_day()
+    # 1) Determine the effective end_date by probing daily_selection (handles weekends/holidays)
+    probe_date = get_last_trading_day()
+    end_date = probe_date
+    daily_vt_symbols: list[str] = []
+    if universe_file is None:
+        for _ in range(max(1, lookback_days + 2)):
+            try:
+                daily_vt_symbols = _load_daily_selection_vt_symbols(probe_date)
+            except Exception as exc:
+                logger.warning(f"[update_live_data] 读取 daily_selection 失败 {probe_date}: {exc}")
+                daily_vt_symbols = []
+
+            if daily_vt_symbols:
+                end_date = probe_date
+                break
+            probe_date = probe_date - timedelta(days=1)
+
     start_date = end_date - timedelta(days=lookback_days)
     
     logger.info(f"[update_live_data] Updating data from {start_date} to {end_date}")
     
     # 1. Determine Universe
-    symbols = []
+    symbols: list[str] = []
     if universe_file and universe_file.exists():
         symbols = load_daily_universe(universe_file)
         logger.info(f"[update_live_data] Loaded {len(symbols)} symbols from {universe_file}")
     else:
-        # Fallback: Load symbols that already exist in the lab
-        # This assumes we are trading a fixed set or the set already in the lab is sufficient
-        import polars as pl
-        # A simple way to get all symbols is to check the file list if structured by symbol,
-        # but AlphaLab structure is usually by date/file.
-        # Alternatively, query Postgres if available.
-        try:
-            from flagship.scripts.pg_ticker_db import get_ref_tickers
-            tickers = get_ref_tickers(active=True)
-            symbols = [t['symbol'] for t in tickers]
-            logger.info(f"[update_live_data] Loaded {len(symbols)} active symbols from Postgres")
-        except ImportError:
-            logger.warning("[update_live_data] Postgres not available and no universe file provided.")
-            logger.warning("[update_live_data] Scanning lab directory for existing symbols (this might be slow or inaccurate)...")
-            # Minimal fallback: scan a recent parquet file if possible, or fail
-            # For now, let's assume we need *some* source.
-            pass
+        # Preferred: Use Postgres daily_selection for end_date (static filtered universe U_t)
+        if not daily_vt_symbols:
+            daily_vt_symbols = _load_daily_selection_vt_symbols(end_date)
+
+        if not daily_vt_symbols:
+            logger.error(f"[update_live_data] daily_selection 为空（{end_date}），无法确定更新范围")
+            return
+
+        # download_bars_for_symbols expects raw symbol (no exchange suffix)
+        symbols = sorted({vt.split(".")[0] for vt in daily_vt_symbols})
+        logger.info(f"[update_live_data] Using daily_selection universe: {len(symbols)} symbols ({end_date})")
 
     if not symbols:
         logger.error("[update_live_data] No symbols found to update. Aborting.")

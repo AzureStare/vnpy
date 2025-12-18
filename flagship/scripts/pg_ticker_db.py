@@ -27,9 +27,33 @@ except ImportError:
 from vnpy.trader.setting import SETTINGS
 from vnpy.trader.logger import logger
 
+# Flagship 项目约定：优先使用项目根目录的 vt_setting.json（而不是 ~/.vntrader/vt_setting.json）
+try:
+    from flagship.config import VT_SETTING_PATH
+except Exception:  # pragma: no cover
+    VT_SETTING_PATH = None  # type: ignore
+
+
+def _load_project_vt_setting() -> None:
+    """
+    将项目根目录的 vt_setting.json 合并进 vnpy.trader.setting.SETTINGS。
+
+    背景：vn.py 默认从 ~/.vntrader/vt_setting.json 读取配置；但本仓库的统一入口是项目根目录 vt_setting.json。
+    """
+    if VT_SETTING_PATH is None:
+        return
+    try:
+        if VT_SETTING_PATH.exists():
+            data = json.loads(VT_SETTING_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                SETTINGS.update(data)
+    except Exception as exc:
+        logger.warning(f"[pg_ticker_db] Failed to load project vt_setting.json: {exc}")
+
 
 def get_pg_connection_params() -> dict[str, Any]:
     """从 SETTINGS 读取 Postgres 连接参数。"""
+    _load_project_vt_setting()
     db_name = SETTINGS.get("database.name", "").lower()
     if db_name != "postgresql":
         raise ValueError(
