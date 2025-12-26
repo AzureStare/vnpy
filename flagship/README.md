@@ -1,134 +1,143 @@
-# Flagship Capital Alpha-Momentum (FCAM) Strategy
+# Flagship Alpha-Momentum (FCAM)
 
-独立策略项目，基于 vnpy 框架实现 Flagship Alpha-Momentum 量化策略。
+本目录是 **Flagship Alpha-Momentum** 策略项目代码，基于 vn.py 的 `vnpy.alpha` 研究/回测框架实现：
+- 数据准备与增量更新（Polygon → AlphaLab parquet）
+- 因子建模与训练（LightGBM）
+- 信号生成与报告输出（HTML）
+- 纸面交易（Alpaca Paper）日常自动化 + 盘中分钟级退出守护
 
-## 架构说明
+## 快速开始（本地）
 
-- **`vnpy/`**：量化交易框架库（不包含业务逻辑）
-- **`flagship/`**：独立策略项目，使用 vnpy 库实现完整的量化策略流程
-  - 数据清洗与预处理
-  - 因子发现与建模
-  - 策略执行与回测
+### 1) Python 版本与依赖
 
-## 项目结构
+- Python：`>=3.10`（仓库 `pyproject.toml`）
+- 安装（在仓库根目录执行）：
 
-```
-flagship/
-├── data/              # 数据目录
-│   ├── raw/           # 原始数据（Polygon API 拉取）
-│   ├── cleaned/       # 清洗后数据
-│   └── universe/      # 动态股票池
-├── scripts/           # 数据清洗与预处理脚本
-│   ├── __init__.py
-│   ├── pg_ticker_db.py                    # Postgres ticker 数据库工具
-│   ├── sync_tickers_postgres.py          # 同步 ticker 主表
-│   ├── sync_ticker_details_postgres.py   # 同步 ticker 每日基本面
-│   ├── build_daily_universe.py           # 构建每日动态股票池（基于策略筛选条件）
-│   ├── download_backtest_data.py          # 下载回测数据（日线/分钟线）
-│   └── run_full_pipeline.py              # 完整数据流程脚本
-├── factors/           # 因子计算模块（待实现）
-├── strategy/           # 策略执行模块（待实现）
-├── backtest/           # 回测模块（待实现）
-└── config/             # 配置文件（待实现）
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+
+# 研究/回测/模型训练依赖（polars/lightgbm 等）
+python -m pip install -e ".[alpha]"
+
+# Paper Trading / 数据源 / 数据库（按需）
+python -m pip install alpaca-py polygon-api-client psycopg2-binary
 ```
 
-## 数据流程
+### 2) 配置：`vt_setting.json`（项目根目录）
 
-1. **数据同步**：从 Polygon API 拉取 ticker 和基本面数据到 Postgres
-2. **每日动态股票池**：基于 Flagship Alpha-Momentum 策略规则构建每日 universe（$U_t$）
-3. **回测数据下载**：基于筛选结果下载历史行情数据（日线/分钟线）
-4. **策略回测**：使用 vnpy.alpha 框架进行回测（待实现）
+该文件默认在 `.gitignore` 中，不会被提交。
 
-## 配置要求
-
-在项目根目录的 `vt_setting.json` 中配置：
+最小配置示例：
 
 ```json
 {
+  "datafeed.name": "polygon",
+  "datafeed.password": "YOUR_POLYGON_API_KEY",
+
+  "alpaca.api_key": "YOUR_ALPACA_KEY",
+  "alpaca.secret_key": "YOUR_ALPACA_SECRET",
+
   "database.name": "postgresql",
   "database.host": "localhost",
   "database.port": 5432,
   "database.database": "vnpy",
-  "database.user": "postgres",
-  "database.password": "your_password",
-  "datafeed.name": "polygon",
-  "datafeed.password": "your_polygon_api_key"
+  "database.user": "vnpy",
+  "database.password": "change_me",
+
+  "open-ai.api_key": "YOUR_OPENAI_API_KEY"
 }
 ```
 
-## 使用流程
+说明：
+- Polygon API Key：也可以用环境变量 `POLYGON_API_KEY` 覆盖（优先级更高）。
+- Postgres：`flagship/scripts/pg_ticker_db.py` 支持用 `DATABASE_*` 环境变量覆盖连接参数（Docker/EC2 场景）。
+- OpenAI：仅用于 `flagship/model/diagnose_factors.py` 的可选 LLM 总结（默认模型 `gpt-5.2`）。
 
-### 完整流程（推荐）
+## 目录结构（以仓库根目录为工作目录）
 
-使用 `run_full_pipeline.py` 一键执行所有步骤：
+- `flagship/`：策略项目代码
+  - `flagship/scripts/`：数据准备、增量更新、pipeline、EC2 部署脚本
+  - `flagship/model/`：训练/评估/因子诊断
+  - `flagship/backtest/`：回测入口（默认 minute + RTH-only）
+  - `flagship/paper_trading/`：Alpaca Paper 全自动日循环 + 盘中 runner
+  - `flagship/strategy/`：策略类实现（`FlagshipAlphaMomentumStrategy`）
+  - `flagship/docs/`：策略与部署文档（本地/服务器侧文件可能被 `.gitignore` 忽略）
+- `lab/flagship_alpha_momentum/`：AlphaLab 输出目录（数据/模型/信号/报告）
+  - `daily/`、`minute/`、`dataset/`、`model/`、`signal/`、`report/`、`logs/`
 
-```bash
-python flagship/scripts/run_full_pipeline.py \
-  --init-tables \
-  --details-start 2023-01-01 \
-  --details-end 2023-12-31 \
-  --universe-date 2023-11-20 \
-  --download-start 2023-01-01 \
-  --download-end 2023-12-31 \
-  --download-interval daily
-```
+## 常用入口（最常用 6 个命令）
 
-### 分步执行
-
-#### 1. 初始化数据库表并同步 ticker 主表
-
-```bash
-python flagship/scripts/sync_tickers_postgres.py --init-tables --ticker-type CS
-```
-
-#### 2. 同步 ticker 基本面数据（按需，可选）
-
-**注意**：策略筛选条件不包含市值，通常不需要预先同步所有 ticker 的市值。如果确实需要，建议：
+### 1) Regime 训练 +（可选）回测 Pipeline
 
 ```bash
-# 只同步特定股票列表（推荐）
-python flagship/scripts/sync_ticker_details_postgres.py \
-  --start 2023-01-01 \
-  --end 2023-12-31 \
-  --symbols AAPL MSFT GOOGL AMZN TSLA \
-  --init-tables
-
-# 或限制数量用于测试
-python flagship/scripts/sync_ticker_details_postgres.py \
-  --start 2023-01-01 \
-  --end 2023-12-31 \
-  --limit-symbols 100 \
-  --init-tables
+python flagship/scripts/run_lgb_pipeline.py --regime-id 1 --run-backtest
 ```
 
-#### 3. 构建每日股票池（基于策略筛选条件）
+### 2) 回测入口（分钟线 RTH-only 默认启用）
 
 ```bash
-python flagship/scripts/build_daily_universe.py \
-  --date 2023-11-20 \
-  --use-postgres \
-  --min-adv-usd 2.5e8 \
-  --min-price 20 \
-  --max-price 600
+python flagship/backtest/flagship_alpha_momentum_backtest.py \
+  --start 2024-01-02 \
+  --end 2024-04-12 \
+  --interval minute \
+  --rth-only
 ```
 
-#### 4. 下载回测数据（基于筛选结果）
+### 3) 因子诊断报告（相关性/重要性/可选 LLM 总结）
 
 ```bash
-python flagship/scripts/download_backtest_data.py \
-  --universe-file flagship/data/universe/universe_2023-11-20.json \
-  --start 2023-01-01 \
-  --end 2023-12-31 \
-  --interval daily
+python flagship/model/diagnose_factors.py \
+  --dataset-name flagship_alpha_mom_regime01_lgb \
+  --model-name flagship_alpha_mom_regime01_lgb \
+  --output-path lab/flagship_alpha_momentum/report/20240102_20240412_regime01/model_diagnostics.html \
+  --llm-summary --llm-model gpt-5.2
 ```
 
-或者下载整个目录下的所有股票池：
+### 4) Paper Trading：每日全自动（串行批处理 + 盘中守护）
 
 ```bash
-python flagship/scripts/download_backtest_data.py \
-  --universe-dir flagship/data/universe \
-  --start 2023-01-01 \
-  --end 2023-12-31 \
-  --interval daily
+bash flagship/paper_trading/run_full_daily_cycle.sh
 ```
+
+要点：
+- `run_full_daily_cycle.sh` 是 **盘前串行任务**（数据更新 → 选股 → 补数 → 训练 → 推理 → 开盘调仓）。
+- 同脚本会启动 **盘中常驻服务** `intraday_runner.py`（分钟级止盈/止损/跟踪止盈等 exit-only）。
+- 可用环境变量关闭盘中 runner：`ENABLE_INTRADAY_RUNNER=0`.
+
+### 5) 单独启动盘中 Runner（用于调试/守护）
+
+```bash
+python flagship/paper_trading/intraday_runner.py \
+  --mode exit-only \
+  --rth-only \
+  --poll-seconds 20
+```
+
+说明：
+- 默认使用 Polygon WebSocket（`AM.{ticker}` 分钟聚合）并 **自动重连**。
+- 配置 `--poll-seconds` 后，WS 连续失败超过阈值会切换为 polling 兜底。
+
+### 6) EC2 部署（增量同步/启动环境）
+
+```bash
+python flagship/scripts/ec2_deploy.py sync-code --host <EC2_IP> --identity-file <PEM_PATH>
+python flagship/scripts/ec2_deploy.py sync-data --host <EC2_IP> --identity-file <PEM_PATH>
+python flagship/scripts/ec2_deploy.py bootstrap --host <EC2_IP> --identity-file <PEM_PATH>
+python flagship/scripts/ec2_deploy.py build --host <EC2_IP> --identity-file <PEM_PATH>
+```
+
+## Docker（推荐：Paper/DB 一体化）
+
+仓库根目录提供 `docker-compose.yml`：
+
+```bash
+docker compose up -d db
+docker compose up -d app
+```
+
+说明：
+- `app` 容器内默认运行 cron（`America/New_York` 时区），定时执行 `flagship/paper_trading/run_full_daily_cycle.sh`
+- Postgres 连接优先读取 `DATABASE_*` 环境变量（见 `docker-compose.yml`）
 
