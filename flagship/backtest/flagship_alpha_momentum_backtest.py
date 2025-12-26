@@ -7,7 +7,7 @@ Flagship Alpha-Momentum 策略回测入口脚本。
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import date, datetime, time as dtime
 from pathlib import Path
 import sys
 from typing import Any
@@ -20,7 +20,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import json
-from datetime import date
 
 from vnpy.trader.constant import Interval
 from vnpy.trader.logger import logger
@@ -31,6 +30,139 @@ from flagship.config import VT_SETTING_PATH
 from flagship.scripts.pg_ticker_db import get_pg_connection
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+from flagship.backtest.backtest_session_alignment import (
+    RegularTradingHoursFilteredAlphaLab,
+    SignalAwareBacktestingEngine,
+    SignalResolver,
+    is_date_only_str,
+    is_in_regular_trading_hours,
+    parse_date_or_datetime,
+    signal_is_daily_snapshot,
+)
+
+
+def _compute_market_independence_metrics(
+    lab: AlphaLab,
+    daily_df: pl.DataFrame,
+    *,
+    benchmark_symbol: str = "SPY.NASDAQ",
+    start: datetime,
+    end: datetime,
+    annual_days: int,
+) -> dict[str, Any]:
+    """
+    计算策略相对基准（默认 SPY）市场独立性指标：
+    - Beta: cov(Rs, Rb) / var(Rb)
+    - Alpha: E[Rs] - Beta * E[Rb]（并给出年化）
+    - Correlation: corr(Rs, Rb)
+
+    注意：
+    - 使用 engine.daily_df 的 balance 计算策略日收益（pct_change）。
+    - 基准使用 lab 日线 close 计算日收益。
+    - start/end 可能是 minute+rth-only 的 09:30/16:00，因此这里内部会扩展到整天以包含 daily bar（00:00）。
+    """
+    if daily_df is None or daily_df.is_empty():
+        return {}
+
+    try:
+        import numpy as np  # type: ignore
+    except Exception as exc:
+        logger.warning(f"[market_independence] numpy 不可用，跳过 Beta/Alpha 计算: {exc}")
+        return {}
+
+    # 策略日收益（由 balance 推导）
+    try:
+        strategy_ret_df = (
+            daily_df
+            .select(
+                pl.col("date").cast(pl.Date).alias("date"),
+                pl.col("balance").cast(pl.Float64).alias("balance"),
+            )
+            .with_columns(
+                (pl.col("balance") / pl.col("balance").shift(1) - 1.0).alias("strategy_ret")
+            )
+            .drop_nulls(["strategy_ret"])
+        )
+    except Exception as exc:
+        logger.warning(f"[market_independence] 计算策略日收益失败，跳过: {exc}")
+        return {}
+
+    # 基准日收益（由 daily close 推导）
+    start_daily = datetime.combine(start.date(), dtime(0, 0))
+    end_daily = datetime.combine(end.date(), dtime(23, 59, 59))
+
+    bars = lab.load_bar_data(benchmark_symbol, Interval.DAILY, start_daily, end_daily)
+    if not bars:
+        logger.warning(f"[market_independence] 基准日线数据缺失: {benchmark_symbol}，跳过 Beta/Alpha 计算")
+        return {"benchmark_symbol": benchmark_symbol}
+
+    bench_df = pl.DataFrame(
+        {
+            "date": [bar.datetime.date() for bar in bars],
+            "close": [float(bar.close_price) for bar in bars],
+        }
+    ).with_columns(
+        pl.col("date").cast(pl.Date),
+        pl.col("close").cast(pl.Float64),
+    )
+
+    bench_ret_df = (
+        bench_df
+        .with_columns((pl.col("close") / pl.col("close").shift(1) - 1.0).alias("bench_ret"))
+        .drop_nulls(["bench_ret"])
+        .select(["date", "bench_ret"])
+    )
+
+    merged = (
+        strategy_ret_df
+        .select(["date", "strategy_ret"])
+        .join(bench_ret_df, on="date", how="inner")
+        .drop_nulls(["strategy_ret", "bench_ret"])
+        .sort("date")
+    )
+
+    if merged.is_empty() or merged.height < 3:
+        logger.warning(
+            f"[market_independence] 回归样本不足（n={merged.height}），跳过 Beta/Alpha 计算"
+        )
+        return {"benchmark_symbol": benchmark_symbol}
+
+    x = merged["bench_ret"].to_numpy()
+    y = merged["strategy_ret"].to_numpy()
+    x = x.astype(float)
+    y = y.astype(float)
+
+    # Filter NaN/Inf defensively
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    if x.size < 3:
+        logger.warning(
+            f"[market_independence] 有效样本不足（n={x.size}），跳过 Beta/Alpha 计算"
+        )
+        return {"benchmark_symbol": benchmark_symbol}
+
+    var_x = float(np.var(x, ddof=1))
+    if var_x <= 0:
+        logger.warning("[market_independence] 基准收益方差为 0，无法计算 Beta/Alpha")
+        return {"benchmark_symbol": benchmark_symbol}
+
+    cov_xy = float(np.cov(x, y, ddof=1)[0, 1])
+    beta = cov_xy / var_x
+    alpha_daily = float(np.mean(y) - beta * np.mean(x))
+    alpha_annual = alpha_daily * float(annual_days)
+    corr = float(np.corrcoef(x, y)[0, 1])
+
+    return {
+        "benchmark_symbol": benchmark_symbol,
+        "beta_vs_benchmark": float(beta),
+        "alpha_vs_benchmark_daily": float(alpha_daily),
+        "alpha_vs_benchmark_annual": float(alpha_annual),
+        "corr_vs_benchmark": float(corr),
+        "beta_observations": int(x.size),
+    }
 
 
 def save_backtest_report(
@@ -274,6 +406,7 @@ def run_backtest(
     min_score_threshold: float = 0.5,
     use_postgres_selection: bool = True,
     commission_rate: float | None = None,
+    rth_only: bool | None = None,
 ) -> dict[str, Any] | None:
     """
     运行 Flagship Alpha-Momentum 策略回测。
@@ -303,13 +436,23 @@ def run_backtest(
     logger.info(f"[run_backtest] 使用PostgreSQL选股: {use_postgres_selection}")
     logger.info(f"[run_backtest] 日志文件: {log_path}")
     logger.info("=" * 80)
+
+    # minute 回测默认启用 RTH-only（除非显式关闭）
+    if rth_only is None:
+        rth_only = interval == Interval.MINUTE
+    logger.info(f"[run_backtest] rth_only={rth_only} (interval={interval})")
     
     lab = AlphaLab(str(lab_path))
     logger.debug(f"[run_backtest] AlphaLab 初始化完成")
+    lab_for_engine = lab
+    if interval == Interval.MINUTE and rth_only:
+        lab_for_engine = RegularTradingHoursFilteredAlphaLab(lab, rth_only=True)
+        logger.info("[run_backtest] 已启用 RTH-only：minute bars 仅保留 09:30–16:00 (ET)")
 
     vt_symbols_list: list[str] = []
     signal_df: pl.DataFrame | None = None
     daily_selections: dict[date, list[str]] | None = None
+    signal_snapshot: bool = False
     
     # 如果使用PostgreSQL选股，加载每日选股结果
     if use_postgres_selection:
@@ -350,6 +493,10 @@ def run_backtest(
         signal_df = generate_naive_signal(lab, inferred_symbols, interval, start, end)
         logger.warning(f"[run_backtest] 使用占位信号，建议先构建正式信号")
 
+    if signal_df is not None and not signal_df.is_empty():
+        signal_snapshot = signal_is_daily_snapshot(signal_df)
+        logger.info(f"[run_backtest] signal_is_snapshot={signal_snapshot}")
+
     # 如果指定了 vt_symbols，使用指定的；否则从信号或 lab 推断
     if vt_symbols is not None and len(vt_symbols) > 0:
         # 使用指定的 vt_symbols
@@ -364,9 +511,16 @@ def run_backtest(
             logger.debug(f"[run_backtest] 回测日期范围: {start} 到 {end}")
             
             # 先尝试过滤到回测日期范围
-            filtered_df = signal_df.filter(
-                (pl.col("datetime") >= start) & (pl.col("datetime") <= end)
-            )
+            if interval == Interval.MINUTE and signal_snapshot:
+                start_d = start.date()
+                end_d = end.date()
+                filtered_df = signal_df.filter(
+                    (pl.col("datetime").dt.date() >= start_d) & (pl.col("datetime").dt.date() <= end_d)
+                )
+            else:
+                filtered_df = signal_df.filter(
+                    (pl.col("datetime") >= start) & (pl.col("datetime") <= end)
+                )
             after_filter = len(filtered_df)
             logger.info(f"[run_backtest] 日期过滤: {before_filter} -> {after_filter} 行")
             
@@ -374,13 +528,22 @@ def run_backtest(
             if after_filter == 0:
                 logger.warning(f"[run_backtest] 信号数据在回测日期范围内为空，使用最近的信号数据")
                 # 获取最近的日期（<= end）
-                latest_date = signal_df.filter(pl.col("datetime") <= end)["datetime"].max()
-                if latest_date is not None:
-                    filtered_df = signal_df.filter(pl.col("datetime") == latest_date)
-                    logger.info(f"[run_backtest] 使用最近信号日期: {latest_date}, 行数: {len(filtered_df)}")
+                if interval == Interval.MINUTE and signal_snapshot:
+                    latest_dt = signal_df.filter(pl.col("datetime").dt.date() <= end.date())["datetime"].max()
+                    if latest_dt is not None:
+                        filtered_df = signal_df.filter(pl.col("datetime").dt.date() == latest_dt.date())
+                        logger.info(f"[run_backtest] 使用最近信号日期: {latest_dt.date()}, 行数: {len(filtered_df)}")
+                    else:
+                        logger.error(f"[run_backtest] 无法找到 <= {end.date()} 的信号数据")
+                        filtered_df = signal_df
                 else:
-                    logger.error(f"[run_backtest] 无法找到 <= {end} 的信号数据")
-                    filtered_df = signal_df
+                    latest_dt = signal_df.filter(pl.col("datetime") <= end)["datetime"].max()
+                    if latest_dt is not None:
+                        filtered_df = signal_df.filter(pl.col("datetime") == latest_dt)
+                        logger.info(f"[run_backtest] 使用最近信号日期: {latest_dt}, 行数: {len(filtered_df)}")
+                    else:
+                        logger.error(f"[run_backtest] 无法找到 <= {end} 的信号数据")
+                        filtered_df = signal_df
             
             signal_df = filtered_df
 
@@ -538,7 +701,21 @@ def run_backtest(
     else:
         logger.info(f"[run_backtest] 合约配置已完整（共 {len(vt_symbols_list)}）")
     
-    engine = BacktestingEngine(lab)
+    # 分钟回测：signal 解析器（精确匹配优先，按交易日回退）
+    signal_resolver: SignalResolver | None = None
+    if interval == Interval.MINUTE and signal_df is not None and not signal_df.is_empty():
+        try:
+            signal_resolver = SignalResolver.from_signal_df(signal_df)
+            logger.info(
+                f"[run_backtest] SignalResolver ready: "
+                f"snapshot={signal_resolver.is_daily_snapshot}, "
+                f"days={len(signal_resolver.by_trade_date)}"
+            )
+        except Exception as exc:
+            logger.warning(f"[run_backtest] SignalResolver 初始化失败，将回退到原始 get_signal: {exc}")
+            signal_resolver = None
+
+    engine = SignalAwareBacktestingEngine(lab_for_engine, signal_resolver=signal_resolver)
     engine.set_parameters(
         vt_symbols=vt_symbols_list,
         interval=interval,
@@ -558,9 +735,32 @@ def run_backtest(
     engine.load_data()
     logger.info(f"[run_backtest] 历史数据加载完成")
 
+    # 自动验证：RTH-only 时间轴检查
+    if interval == Interval.MINUTE and rth_only:
+        if getattr(engine, "dts", None):
+            dts = list(engine.dts)  # type: ignore[attr-defined]
+            dts.sort()
+            first_dt = dts[0]
+            last_dt = dts[-1]
+            outside_rth_count = sum(1 for dt in dts if not is_in_regular_trading_hours(dt))
+            logger.info(
+                f"[run_backtest] RTH-only timeline: first_dt={first_dt}, last_dt={last_dt}, "
+                f"outside_rth_count={outside_rth_count}"
+            )
+        else:
+            logger.warning("[run_backtest] engine.dts 为空，无法验证 RTH-only 时间轴")
+
     logger.info(f"[run_backtest] 开始运行回测...")
     engine.run_backtesting()
     logger.info(f"[run_backtest] 回测执行完成")
+
+    # 自动验证：第一笔成交时间（应 >= 09:30，且通常为 09:31）
+    trade_dts = [t.datetime for t in engine.trades.values() if t.datetime]  # type: ignore[attr-defined]
+    if trade_dts:
+        first_trade_time = min(trade_dts)
+        logger.info(f"[run_backtest] first_trade_time={first_trade_time}")
+    else:
+        logger.info("[run_backtest] first_trade_time=N/A（无成交）")
 
     logger.info(f"[run_backtest] 计算回测结果...")
     daily_df = engine.calculate_result()
@@ -573,6 +773,29 @@ def run_backtest(
     logger.info(f"[run_backtest] 计算统计指标...")
     stats = engine.calculate_statistics()
     logger.info(f"[run_backtest] 统计指标计算完成")
+
+    # 市场独立性（Alpha/Beta vs Benchmark）
+    try:
+        market_metrics = _compute_market_independence_metrics(
+            lab=lab,
+            daily_df=engine.daily_df,
+            benchmark_symbol="SPY.NASDAQ",
+            start=start,
+            end=end,
+            annual_days=annual_days,
+        )
+        if market_metrics:
+            stats.update(market_metrics)
+            logger.info(
+                "[run_backtest] market_independence: "
+                f"benchmark={market_metrics.get('benchmark_symbol')}, "
+                f"beta={market_metrics.get('beta_vs_benchmark')}, "
+                f"alpha_annual={market_metrics.get('alpha_vs_benchmark_annual')}, "
+                f"corr={market_metrics.get('corr_vs_benchmark')}, "
+                f"n={market_metrics.get('beta_observations')}"
+            )
+    except Exception as exc:
+        logger.warning(f"[run_backtest] market_independence 计算失败，跳过: {exc}")
 
     # 确定报告文件夹名称（FROM_TO_Scenario格式）并获取regime信息
     from flagship.backtest.index_regime_windows import REGIME_WINDOWS
@@ -653,7 +876,6 @@ def run_backtest(
                 dataset_name = "flagship_alpha_momentum_v5"
         
         # 保存统计结果到临时文件（用于生成报告）
-        import json
         stats_path = report_dir / "statistics.json"
         with open(stats_path, 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2, ensure_ascii=False, default=str)
@@ -1087,6 +1309,35 @@ def generate_html_report_with_charts(
     backtest_stats_html += f"<p><strong>平均股权回撤持续时间</strong>: {float(stats.get('avg_equity_drawdown_duration', 0)):.1f} 天</p>\n"
     backtest_stats_html += f"<p><strong>Sharpe Ratio</strong>: {float(stats.get('sharpe_ratio', 0)):.4f}</p>\n"
     backtest_stats_html += f"<p><strong>收益回撤比</strong>: {float(stats.get('return_drawdown_ratio', 0)):.4f}</p>\n"
+
+    # 市场独立性（vs Benchmark）
+    benchmark_symbol = stats.get("benchmark_symbol", None)
+    if benchmark_symbol:
+        backtest_stats_html += "<h3>市场独立性（vs Benchmark）</h3>\n"
+        backtest_stats_html += f"<p><strong>Benchmark</strong>: {benchmark_symbol}</p>\n"
+
+        beta = stats.get("beta_vs_benchmark", None)
+        alpha_annual = stats.get("alpha_vs_benchmark_annual", None)
+        corr = stats.get("corr_vs_benchmark", None)
+        n_obs = stats.get("beta_observations", None)
+
+        if isinstance(beta, (int, float)):
+            backtest_stats_html += f"<p><strong>Beta</strong>: {float(beta):.4f}</p>\n"
+        else:
+            backtest_stats_html += "<p><strong>Beta</strong>: N/A</p>\n"
+
+        if isinstance(alpha_annual, (int, float)):
+            backtest_stats_html += f"<p><strong>Alpha (annualized)</strong>: {float(alpha_annual) * 100:.2f}%</p>\n"
+        else:
+            backtest_stats_html += "<p><strong>Alpha (annualized)</strong>: N/A</p>\n"
+
+        if isinstance(corr, (int, float)):
+            backtest_stats_html += f"<p><strong>Correlation</strong>: {float(corr):.4f}</p>\n"
+        else:
+            backtest_stats_html += "<p><strong>Correlation</strong>: N/A</p>\n"
+
+        if isinstance(n_obs, int):
+            backtest_stats_html += f"<p><strong>Observations</strong>: {n_obs}</p>\n"
     
     # 交易表现摘要HTML
     performance_html = ""
@@ -1222,6 +1473,19 @@ def main() -> None:
         help="K线周期（默认 minute，分钟线回测）",
     )
     parser.add_argument(
+        "--rth-only",
+        dest="rth_only",
+        action="store_true",
+        default=None,
+        help="仅在 RTH（09:30-16:00 ET）回放并交易（minute 默认启用）",
+    )
+    parser.add_argument(
+        "--no-rth-only",
+        dest="rth_only",
+        action="store_false",
+        help="关闭 RTH-only（允许盘前/盘后分钟进入回测）",
+    )
+    parser.add_argument(
         "--signal-name",
         type=str,
         default="flagship_alpha_momentum",
@@ -1258,9 +1522,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    start = datetime.fromisoformat(args.start)
-    end = datetime.fromisoformat(args.end)
     interval = Interval.DAILY if args.interval == "daily" else Interval.MINUTE
+
+    # 解析日期/时间
+    start_in = parse_date_or_datetime(args.start)
+    end_in = parse_date_or_datetime(args.end)
+
+    # rth_only 默认行为：minute 启用，daily 关闭
+    rth_only = args.rth_only
+    if rth_only is None:
+        rth_only = interval == Interval.MINUTE
+
+    # minute+rth-only：若输入为 YYYY-MM-DD，自动扩展到 09:30–16:00
+    if interval == Interval.MINUTE and rth_only and is_date_only_str(args.start):
+        start = datetime.combine(start_in.date(), dtime(9, 30))
+    else:
+        start = start_in
+
+    if interval == Interval.MINUTE and rth_only and is_date_only_str(args.end):
+        end = datetime.combine(end_in.date(), dtime(16, 0))
+    else:
+        end = end_in
 
     run_backtest(
         lab_path=args.lab_path,
@@ -1272,6 +1554,7 @@ def main() -> None:
         min_score_threshold=args.min_score_threshold,
         use_postgres_selection=args.use_postgres_selection,
         commission_rate=args.commission_rate,
+        rth_only=rth_only,
     )
 
 

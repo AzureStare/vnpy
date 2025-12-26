@@ -90,6 +90,9 @@ def main():
     dataset_name = f"flagship_alpha_mom_regime{args.regime_id:02d}_lgb"
     model_name = f"flagship_alpha_mom_regime{args.regime_id:02d}_lgb"
     signal_name = f"flagship_alpha_mom_regime{args.regime_id:02d}_lgb_signal"
+
+    # 统一报告目录命名（与 backtest 一致）
+    report_folder_name = f"{regime.start.strftime('%Y%m%d')}_{regime.end.strftime('%Y%m%d')}_regime{args.regime_id:02d}"
     
     # Step 1: 准备数据集
     if not args.skip_prepare:
@@ -127,6 +130,25 @@ def main():
             return
     else:
         logger.info("[run_lgb_pipeline] 跳过训练步骤")
+
+    # Step 2.5: 因子诊断（相关性/重要性）
+    # 目的：验证特征共线性（独立性）以及模型依赖的特征重要性
+    cmd = [
+        sys.executable,
+        "flagship/model/diagnose_factors.py",
+        "--lab-path", args.lab_path,
+        "--dataset-name", dataset_name,
+        "--model-name", model_name,
+        "--segment", "train",
+        "--corr-mode", "cross_sectional_mean",
+        "--output-path", str(Path(args.lab_path) / "report" / report_folder_name / "model_diagnostics.html"),
+        "--llm-summary",
+        "--llm-model", "gpt-5.2",
+        "--llm-max-completion-tokens", "2000",
+    ]
+    if not run_command(cmd, "生成因子诊断报告"):
+        logger.error("[run_lgb_pipeline] 因子诊断失败，终止流程")
+        return
     
     # Step 3: 可选回测
     if args.run_backtest:

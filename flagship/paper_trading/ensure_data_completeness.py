@@ -2,10 +2,11 @@
 Script to ensure data completeness for selected stocks.
 Checks if required history exists in AlphaLab, and downloads missing data if needed.
 """
-import sys
 import argparse
 from datetime import date, datetime, timedelta
 from pathlib import Path
+import sys
+
 import polars as pl
 
 # Add project root to path
@@ -17,8 +18,9 @@ from vnpy.trader.logger import logger
 from vnpy.trader.constant import Interval
 from vnpy.alpha import AlphaLab
 from flagship.paper_trading.config import LAB_PATH
-from flagship.scripts.download_backtest_data import download_bars_for_symbols
 from flagship.scripts.pg_ticker_db import get_pg_connection
+from flagship.config import create_polygon_client
+from flagship.scripts.update_lab_data_incremental import _download_symbol_bars
 
 def get_daily_selection_from_postgres(trade_date: date) -> list[str]:
     """Fetch symbols selected for a specific date from Postgres"""
@@ -52,79 +54,80 @@ def check_and_backfill_data(
     logger.info(f"[ensure_data_completeness] Checking data for {target_date}")
     
     # 1. Get Universe
-    symbols = get_daily_selection_from_postgres(target_date)
-    if not symbols:
+    vt_symbols = get_daily_selection_from_postgres(target_date)
+    if not vt_symbols:
         logger.warning(f"[ensure_data_completeness] No selection found in Postgres for {target_date}")
         return
 
-    logger.info(f"[ensure_data_completeness] Checking {len(symbols)} symbols...")
+    logger.info(f"[ensure_data_completeness] Checking {len(vt_symbols)} symbols...")
     
     # 2. Check Lab Data
     lab = AlphaLab(str(lab_path))
-    missing_symbols = []
+    required_start_date = target_date - timedelta(days=lookback_days)
+
+    missing_or_stale: list[str] = []
     
-    start_check_date = target_date - timedelta(days=lookback_days)
-    
-    for symbol in symbols:
-        # Check if file exists
-        # AlphaLab usually stores as {symbol}.parquet in daily_path
-        # Note: symbol in postgres might differ slightly from file name? 
-        # Usually vnpy uses vt_symbol (Symbol.Exchange). 
-        # Lab files are usually just Symbol.parquet if from Polygon download script?
-        # Let's check the file pattern.
-        # download_backtest_data saves as BarData list, lab.save_bar_data saves to parquet.
-        # AlphaLab.save_bar_data uses vt_symbol as filename usually? 
-        # Actually standard AlphaLab saves by daily/minute folders or single file per symbol?
-        # Standard AlphaLab typically: data/daily/AAPL.NASDAQ.parquet
-        
-        # We need to handle potential naming mismatches. 
-        # Postgres stores 'vt_symbol'. File usually matches.
-        file_path = lab.daily_path / f"{symbol}.parquet"
-        
+    for vt_symbol in vt_symbols:
+        file_path = lab.daily_path / f"{vt_symbol}.parquet"
+
         if not file_path.exists():
-            missing_symbols.append(symbol)
+            missing_or_stale.append(vt_symbol)
             continue
             
-        # Optional: Check if file covers the required range
-        # This is expensive (reading every parquet). 
-        # Optimization: Only check modification time or rely on 'download' if we suspect gaps.
-        # For robustness, let's read the last date.
         try:
-            # Only read the last row to check freshness
-            # Polars scan_parquet is lazy
             lf = pl.scan_parquet(file_path)
-            last_dt = lf.select(pl.col("datetime").max()).collect().item()
-            
-            if last_dt is None:
-                missing_symbols.append(symbol)
+            min_dt = lf.select(pl.col("datetime").min()).collect().item()
+            max_dt = lf.select(pl.col("datetime").max()).collect().item()
+
+            if min_dt is None or max_dt is None:
+                missing_or_stale.append(vt_symbol)
                 continue
                 
-            last_date = last_dt.date()
-            if last_date < target_date:
-                # Data is stale
-                missing_symbols.append(symbol)
-        except Exception:
-            missing_symbols.append(symbol)
+            if max_dt.date() < target_date:
+                # 最新数据不足（缺失/停更）
+                missing_or_stale.append(vt_symbol)
+                continue
 
-    if missing_symbols:
-        logger.warning(f"[ensure_data_completeness] Found {len(missing_symbols)} symbols with missing/stale data.")
-        logger.info(f"[ensure_data_completeness] Triggering download for missing symbols...")
-        
-        # Remove exchange suffix for download script (it expects pure symbol usually?)
-        # download_bars_for_symbols takes list[str]. 
-        # Inside it calls get_exchange_for_symbol.
-        # If we pass "AAPL.NASDAQ", get_exchange might fail if it expects "AAPL".
-        # Let's strip suffix just in case.
-        clean_symbols = [s.split('.')[0] for s in missing_symbols]
-        
-        download_bars_for_symbols(
-            symbols=clean_symbols,
-            start_date=start_check_date,
-            end_date=target_date,
-            interval=Interval.DAILY,
-            lab_dir=lab_path
+            if min_dt.date() > required_start_date:
+                # 历史长度不足（用于因子/ATR/EMA等）
+                missing_or_stale.append(vt_symbol)
+                continue
+
+        except Exception as exc:
+            logger.warning(f"[ensure_data_completeness] Failed to inspect {vt_symbol}: {exc}")
+            missing_or_stale.append(vt_symbol)
+
+    if missing_or_stale:
+        logger.warning(
+            f"[ensure_data_completeness] Found {len(missing_or_stale)} symbols with missing/stale/short-history data. "
+            f"Backfilling {required_start_date} -> {target_date} using incremental downloader..."
         )
-        logger.info("[ensure_data_completeness] Backfill complete.")
+
+        client = create_polygon_client()
+        backfilled = 0
+        failed = 0
+        for idx, vt_symbol in enumerate(missing_or_stale, start=1):
+            try:
+                bars = _download_symbol_bars(client, vt_symbol, Interval.DAILY, required_start_date, target_date)
+            except Exception as exc:
+                logger.warning(f"[ensure_data_completeness] Download failed {vt_symbol}: {exc}")
+                failed += 1
+                continue
+
+            if bars:
+                lab.save_bar_data(bars)
+                backfilled += 1
+            else:
+                # Polygon 返回空，可能停牌/退市/不可用
+                failed += 1
+
+            if idx % 25 == 0:
+                logger.info(
+                    f"[ensure_data_completeness] Backfill progress {idx}/{len(missing_or_stale)}: "
+                    f"ok={backfilled}, failed={failed}"
+                )
+
+        logger.info(f"[ensure_data_completeness] Backfill complete: ok={backfilled}, failed={failed}")
     else:
         logger.info("[ensure_data_completeness] All data is present and up-to-date.")
 

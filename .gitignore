@@ -81,3 +81,9 @@ ta-lib-0.6.4-src.tar.gz
 
 # Backtest reports
 backtest_report/
+
+# .cursor
+.cursor/
+.cursor_project_rules/
+NEW_ARCHITECTURE.md
+.gitignore

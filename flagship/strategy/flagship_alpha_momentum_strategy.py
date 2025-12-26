@@ -320,9 +320,13 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
                 max_score = max(valid_signals)
                 min_score = min(valid_signals)
                 mean_score = sum(valid_signals) / len(valid_signals)
-            logger.debug(f"[FlagshipAlphaMomentumStrategy.on_bars] Score 分布: max={max_score:.3f}, min={min_score:.3f}, mean={mean_score:.3f}")
             else:
                 logger.debug(f"[FlagshipAlphaMomentumStrategy.on_bars] Score 分布: 无有效信号值")
+            if valid_signals:
+                logger.debug(
+                    f"[FlagshipAlphaMomentumStrategy.on_bars] Score 分布: "
+                    f"max={max_score:.3f}, min={min_score:.3f}, mean={mean_score:.3f}"
+                )
 
         # 更新持仓天数（已在交易日开始时更新）
         pos_symbols: list[str] = [vt_symbol for vt_symbol, pos in self.pos_data.items() if pos > 0]
@@ -370,10 +374,12 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             atr = self._get_atr(vt_symbol, window=14)
             if atr is None or atr <= 0:
                 # 如果ATR不可用，使用简化的百分比止损作为后备
-                    price_drop = (entry_price - bar.close_price) / entry_price
-                    if price_drop > 0.05:  # 5% 止损（后备方案）
-                        sell_for_stop_loss.add(vt_symbol)
-                        self.write_log(f"{vt_symbol} 触发止损（后备），入场价 {entry_price:.2f}，当前价 {bar.close_price:.2f}")
+                price_drop = (entry_price - bar.close_price) / entry_price
+                if price_drop > 0.05:  # 5% 止损（后备方案）
+                    sell_for_stop_loss.add(vt_symbol)
+                    self.write_log(
+                        f"{vt_symbol} 触发止损（后备），入场价 {entry_price:.2f}，当前价 {bar.close_price:.2f}"
+                    )
                 continue
             
             # 优先级1：固定止盈检查

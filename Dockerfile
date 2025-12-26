@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy code (exclude large data via .dockerignore).
 COPY pyproject.toml /app/pyproject.toml
+COPY README.md /app/README.md
 COPY vnpy /app/vnpy
 COPY flagship /app/flagship
 
@@ -41,8 +42,7 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 # Runtime scripts
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh \
-    && chmod +x /app/flagship/paper_trading/run_full_daily_cycle.sh \
-    && chmod +x /app/flagship/paper_trading/run_daily_cycle.sh
+    && chmod +x /app/flagship/paper_trading/run_full_daily_cycle.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
 

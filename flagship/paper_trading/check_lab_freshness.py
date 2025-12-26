@@ -211,7 +211,11 @@ def check_lab_freshness(
     train_start = valid_end - timedelta(days=train_lookback_days)
     u_train = get_selected_symbols_in_range(start_date=train_start, end_date=valid_end)
 
-    symbols_to_check = sorted(set(ut) | set(u_train))
+    # NOTE:
+    # - 对“日常交易流程”而言，最关键的是 U_t（当日选股池）对应的 bars/signal/model 对齐 expected_date。
+    # - U_train 是训练窗口的静态 universe，里面可能包含停牌/退市/无成交的标的，导致 max(date) < expected_date；
+    #   这种情况不应阻塞当天交易（只会减少训练样本），因此我们对 U_train 的 stale 只做 warning，不作为失败条件。
+    symbols_to_check = sorted(set(ut))
 
     # 如果没有任何 symbol，说明上游选股/数据完全断了
     if not symbols_to_check:
@@ -219,7 +223,15 @@ def check_lab_freshness(
             logger.error("[check_lab_freshness] 无法获得任何需要检查的 vt_symbol（U_t 与 U_train 均为空）")
         raise RuntimeError("No vt_symbols to check (U_t and U_train are empty).")
 
+    # U_t bars（强制要求对齐）
     total, missing, stale = _check_daily_bars(lab, symbols_to_check, expected_date)
+
+    # U_train bars（仅提示，不阻塞）
+    train_total = 0
+    train_missing = 0
+    train_stale = 0
+    if u_train:
+        train_total, train_missing, train_stale = _check_daily_bars(lab, u_train, expected_date)
 
     # 3) bars 自动修复：用 ensure_data_completeness 对 U_t 做补齐（最关键）
     if fix and (missing > 0 or stale > 0):
@@ -229,6 +241,13 @@ def check_lab_freshness(
         # ensure_data_completeness 依赖 U_t（daily_selection）
         check_and_backfill_data(target_date=expected_date, lab_path=lab_path, lookback_days=train_lookback_days)
         total, missing, stale = _check_daily_bars(lab, symbols_to_check, expected_date)
+
+    if train_total > 0 and (train_missing > 0 or train_stale > 0):
+        logger.warning(
+            f"[check_lab_freshness] U_train bars 存在缺失/滞后："
+            f"train_total={train_total}, train_missing={train_missing}, train_stale={train_stale} "
+            f"(不会阻塞当天交易，但可能降低训练样本数)"
+        )
 
     # 4) model/signal/dataset 检查与修复
     model_ok = _check_live_model_file(lab_path, expected_date)
@@ -267,14 +286,10 @@ def check_lab_freshness(
     )
 
     logger.info(
-        "[check_lab_freshness] selection=%s, bars(total=%s, missing=%s, stale=%s), model_ok=%s, signal_ok=%s, dataset_ok=%s",
-        result.selection_count,
-        result.bars_total,
-        result.bars_missing,
-        result.bars_stale,
-        result.model_ok,
-        result.signal_ok,
-        result.dataset_ok,
+        f"[check_lab_freshness] selection={result.selection_count}, "
+        f"bars(selection_total={result.bars_total}, missing={result.bars_missing}, stale={result.bars_stale}), "
+        f"train_universe={len(u_train)}, train_bars(missing={train_missing}, stale={train_stale}), "
+        f"model_ok={result.model_ok}, signal_ok={result.signal_ok}, dataset_ok={result.dataset_ok}"
     )
 
     return result

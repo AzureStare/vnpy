@@ -174,17 +174,36 @@ def download_bars_for_symbols(
                 bar_datetime = utc_datetime.astimezone(eastern_tz).replace(tzinfo=None)
                 # 保存所有数据（包括历史数据），用于后续因子计算
                 
+                raw_open = getattr(agg, "open", None)
+                raw_high = getattr(agg, "high", None)
+                raw_low = getattr(agg, "low", None)
+                raw_close = getattr(agg, "close", None)
+                open_val = float(raw_open) if raw_open is not None else 0.0
+                high_val = float(raw_high) if raw_high is not None else 0.0
+                low_val = float(raw_low) if raw_low is not None else 0.0
+                close_val = float(raw_close) if raw_close is not None else 0.0
+
+                raw_volume = getattr(agg, "volume", 0) or 0
+                try:
+                    volume_int = int(raw_volume)
+                except Exception:
+                    # 极端情况下 Polygon 返回异常类型，退化为 0
+                    volume_int = 0
+
                 bar = BarData(
                     symbol=symbol,
                     exchange=exchange,
                     datetime=bar_datetime,
                     interval=interval,
-                    open_price=agg.open,
-                    high_price=agg.high,
-                    low_price=agg.low,
-                    close_price=agg.close,
-                    volume=agg.volume,
-                    turnover=agg.volume * agg.close if hasattr(agg, 'close') else 0.0,
+                    open_price=open_val,
+                    high_price=high_val,
+                    low_price=low_val,
+                    close_price=close_val,
+                    # NOTE:
+                    # - parquet 里历史 volume 通常为 Int64（整型成交量）
+                    # - Polygon SDK 有时会返回 float（例如 12345.0），直接拼接会触发 dtype 不匹配
+                    volume=volume_int,
+                    turnover=float(volume_int) * close_val,
                     open_interest=0,
                     gateway_name="POLYGON"
                 )
