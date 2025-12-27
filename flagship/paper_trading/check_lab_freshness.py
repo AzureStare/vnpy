@@ -189,6 +189,7 @@ def check_lab_freshness(
     expected_date: date | None = None,
     train_lookback_days: int = 180,
     fix: bool = True,
+    check_model: bool = True,
     check_signals: bool = True,
     check_datasets: bool = True,
 ) -> FreshnessResult:
@@ -250,12 +251,18 @@ def check_lab_freshness(
         )
 
     # 4) model/signal/dataset 检查与修复
-    model_ok = _check_live_model_file(lab_path, expected_date)
-    if fix and not model_ok:
-        logger.warning("[check_lab_freshness] live model 缺失/过旧，尝试训练")
-        # 传入 expected_date+1，保证 valid_end 覆盖到 expected_date（周末也能工作）
-        train_daily_model(target_date=expected_date + timedelta(days=1), lab_path=lab_path, output_model_path=lab_path / "model" / "flagship_alpha_mom_live_lgb.pkl")
+    model_ok = True
+    if check_model:
         model_ok = _check_live_model_file(lab_path, expected_date)
+        if fix and not model_ok:
+            logger.warning("[check_lab_freshness] live model 缺失/过旧，尝试训练")
+            # 传入 expected_date+1，保证 valid_end 覆盖到 expected_date（周末也能工作）
+            train_daily_model(
+                target_date=expected_date + timedelta(days=1),
+                lab_path=lab_path,
+                output_model_path=lab_path / "model" / "flagship_alpha_mom_live_lgb.pkl",
+            )
+            model_ok = _check_live_model_file(lab_path, expected_date)
 
     signal_ok = True
     if check_signals:
@@ -301,6 +308,7 @@ def main() -> None:
     parser.add_argument("--expected-date", type=str, help="YYYY-MM-DD")
     parser.add_argument("--train-lookback-days", type=int, default=180)
     parser.add_argument("--check-only", action="store_true", help="Only check, do not auto-fix")
+    parser.add_argument("--no-check-model", action="store_true", help="Skip live model freshness check (bars-only mode).")
     parser.add_argument("--no-check-signals", action="store_true")
     parser.add_argument("--no-check-datasets", action="store_true")
     args = parser.parse_args()
@@ -317,6 +325,7 @@ def main() -> None:
         expected_date=expected_date,
         train_lookback_days=args.train_lookback_days,
         fix=fix,
+        check_model=not args.no_check_model,
         check_signals=not args.no_check_signals,
         check_datasets=not args.no_check_datasets,
     )

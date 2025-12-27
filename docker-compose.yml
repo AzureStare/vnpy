@@ -37,6 +37,8 @@ services:
       # Cron schedule inside container (default: 09:00 ET, Mon-Fri)
       FLAGSHIP_CRON_SCHEDULE: "0 9 * * 1-5"
       FLAGSHIP_CRON_COMMAND: "/app/flagship/paper_trading/run_full_daily_cycle.sh"
+      # Prometheus node_exporter textfile collector output (host-mounted via ./logs)
+      FLAGSHIP_TEXTFILE_DIR: "/app/logs/metrics"
     volumes:
       # Persist AlphaLab data and logs
       - ./lab:/app/lab
@@ -45,7 +47,115 @@ services:
       - ./vt_setting.json:/app/vt_setting.json:ro
     restart: unless-stopped
 
+  # --- Monitoring stack (Prometheus + Grafana) ---
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: vnpy_prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    volumes:
+      - ./flagship/ops/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - node_exporter
+      - cadvisor
+      - postgres_exporter
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:11.2.0
+    container_name: vnpy_grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: "admin"
+      # Change this in your server .env (recommended)
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-change_me}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./flagship/ops/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  node_exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: vnpy_node_exporter
+    command:
+      - "--path.rootfs=/host"
+      - "--collector.textfile.directory=/textfile"
+    volumes:
+      - /:/host:ro,rslave
+      # textfile collector: our scripts write *.prom into ./logs/metrics (host)
+      - ./logs/metrics:/textfile
+    restart: unless-stopped
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: vnpy_cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    restart: unless-stopped
+
+  postgres_exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: vnpy_postgres_exporter
+    environment:
+      # IMPORTANT: keep in sync with db service env
+      DATA_SOURCE_NAME: "postgresql://vnpy:change_me@db:5432/vnpy?sslmode=disable"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Web DB Admin (pgAdmin) ---
+  pgadmin:
+    image: dpage/pgadmin4:8.12
+    container_name: vnpy_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: "${PGADMIN_DEFAULT_EMAIL:-admin@flagship-strategy.com}"
+      PGADMIN_DEFAULT_PASSWORD: "${PGADMIN_DEFAULT_PASSWORD:-change_me}"
+      PGADMIN_LISTEN_PORT: "80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Reverse proxy (Caddy) for subdomains + HTTPS ---
+  caddy:
+    image: caddy:2.8.4
+    container_name: vnpy_caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Used by Caddy for ACME registration (optional but recommended)
+      CADDY_EMAIL: "admin@flagship-strategy.com"
+      # Basic auth for sensitive endpoints (metrics/db). Use server .env to override.
+      FLAGSHIP_BASIC_AUTH_USER: "${FLAGSHIP_BASIC_AUTH_USER:-admin}"
+      FLAGSHIP_BASIC_AUTH_HASH: "${FLAGSHIP_BASIC_AUTH_HASH:-}"
+    volumes:
+      - ./flagship/ops/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - grafana
+      - prometheus
+      - pgadmin
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  prometheus_data:
+  grafana_data:
+  caddy_data:
+  caddy_config:
+  pgadmin_data:
 
 

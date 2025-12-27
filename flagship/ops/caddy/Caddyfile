@@ -1,0 +1,24 @@
+{
+	# Optional: set your email for ACME registration (docker-compose sets CADDY_EMAIL)
+	email {$CADDY_EMAIL}
+}
+
+monitor.flagship-strategy.com {
+	reverse_proxy grafana:3000
+}
+
+metrics.flagship-strategy.com {
+	basic_auth {
+		{$FLAGSHIP_BASIC_AUTH_USER} {$FLAGSHIP_BASIC_AUTH_HASH}
+	}
+	reverse_proxy prometheus:9090
+}
+
+db.flagship-strategy.com {
+	basic_auth {
+		{$FLAGSHIP_BASIC_AUTH_USER} {$FLAGSHIP_BASIC_AUTH_HASH}
+	}
+	reverse_proxy pgadmin:80
+}
+
+

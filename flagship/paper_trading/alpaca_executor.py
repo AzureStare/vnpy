@@ -29,6 +29,7 @@ from vnpy.alpha.lab import AlphaLab
 from flagship.paper_trading.config import DAILY_SIGNAL_FILE, TOP_N, LAB_PATH
 from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
 from flagship.config.polygon_config import get_polygon_api_key
+from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
 from flagship.paper_trading.broker_alpaca import AlpacaAdapter
 from flagship.paper_trading.polygon_ws import (
     Market,
@@ -311,6 +312,11 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]):
     """
     Compare targets with actual positions and execute orders.
     """
+    metrics_writer = TextfileMetricsWriter("flagship_executor.prom")
+    sell_orders_submitted = 0
+    buy_orders_submitted = 0
+    buy_scale_ratio = 1.0
+
     current_positions = adapter.get_positions()
     # Use current buying power as budget guardrail
     buying_power = adapter.get_buying_power()
@@ -327,6 +333,7 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]):
             if sell_qty > 0:
                 logger.info(f"Selling {sell_qty} of {symbol}")
                 adapter.place_order(symbol, sell_qty, OrderSide.SELL)
+                sell_orders_submitted += 1
                 
     # Check for full liquidations (targets that are 0 but held)
     for symbol, current_qty in current_positions.items():
@@ -340,6 +347,7 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]):
         if not found and current_qty > 0:
              logger.info(f"Liquidating {current_qty} of {symbol} (No longer in target)")
              adapter.place_order(symbol, int(current_qty), OrderSide.SELL)
+             sell_orders_submitted += 1
 
     # Wait for sells to process
     time.sleep(2.0)
@@ -372,6 +380,7 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]):
     # 3. Risk Control & Scaling
     if total_estimated_cost > budget:
         ratio = budget / total_estimated_cost
+        buy_scale_ratio = float(ratio)
         logger.warning(f"Total cost {total_estimated_cost:.2f} > Budget {budget:.2f}. Scaling buys by {ratio:.4f}")
         for order in buy_orders:
             order["qty"] = int(order["qty"] * ratio)
@@ -387,6 +396,38 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]):
         if qty > 0:
             logger.info(f"Buying {qty} of {symbol} @ ~{order['price']:.2f} (Est Cost: {order['cost']:.2f})")
             adapter.place_order(symbol, qty, OrderSide.BUY)
+            buy_orders_submitted += 1
+
+    # Emit last-run metrics (textfile collector)
+    metrics_writer.write(
+        samples=[
+            Sample("flagship_executor_last_rebalance_timestamp_seconds", float(time.time())),
+            Sample("flagship_executor_sell_orders_submitted", float(sell_orders_submitted)),
+            Sample("flagship_executor_buy_orders_submitted", float(buy_orders_submitted)),
+            Sample("flagship_executor_buy_scale_ratio", float(buy_scale_ratio)),
+            Sample("flagship_executor_buying_power", float(buying_power)),
+            Sample("flagship_executor_budget", float(budget)),
+            Sample("flagship_executor_total_estimated_buy_cost", float(total_estimated_cost)),
+        ],
+        help_map={
+            "flagship_executor_last_rebalance_timestamp_seconds": "Last rebalance timestamp (epoch seconds).",
+            "flagship_executor_sell_orders_submitted": "Number of sell orders submitted in last rebalance run.",
+            "flagship_executor_buy_orders_submitted": "Number of buy orders submitted in last rebalance run.",
+            "flagship_executor_buy_scale_ratio": "Buy scaling ratio applied due to buying power constraint (1.0=no scale).",
+            "flagship_executor_buying_power": "Buying power observed at the start of buy planning.",
+            "flagship_executor_budget": "Budget used for buy planning (buying_power * buffer).",
+            "flagship_executor_total_estimated_buy_cost": "Estimated total buy cost before scaling.",
+        },
+        type_map={
+            "flagship_executor_last_rebalance_timestamp_seconds": "gauge",
+            "flagship_executor_sell_orders_submitted": "gauge",
+            "flagship_executor_buy_orders_submitted": "gauge",
+            "flagship_executor_buy_scale_ratio": "gauge",
+            "flagship_executor_buying_power": "gauge",
+            "flagship_executor_budget": "gauge",
+            "flagship_executor_total_estimated_buy_cost": "gauge",
+        },
+    )
 
 
 def main():

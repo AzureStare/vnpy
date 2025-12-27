@@ -10,6 +10,8 @@ Default is **exit-only** (no new entries intraday) and **RTH-only** (09:30-16:00
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import sys
 import time
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ from vnpy.trader.logger import logger
 from vnpy.trader.object import BarData
 
 from flagship.config.polygon_config import get_polygon_api_key
+from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
 from flagship.paper_trading.broker_alpaca import AlpacaAdapter
 from flagship.paper_trading.config import DAILY_SIGNAL_FILE, LAB_PATH
 from flagship.paper_trading.polygon_ws import (
@@ -39,6 +42,7 @@ from flagship.paper_trading.polygon_ws import (
     WebSocketClient,
     polygon_ws_import_error,
 )
+from flagship.paper_trading.trading_calendar import get_holiday_info, is_market_closed_day
 from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
 
 try:
@@ -49,6 +53,8 @@ except Exception:  # pragma: no cover
 
 
 EASTERN = ZoneInfo("America/New_York")
+RTH_OPEN = dtime(9, 30)
+RTH_CLOSE = dtime(16, 0)
 
 
 class SymbolsSource(str):
@@ -64,10 +70,10 @@ class WatchedSymbol:
     exchange: Exchange
 
 
-def _is_rth(dt_eastern_naive: datetime) -> bool:
-    """RTH window in America/New_York."""
+def _is_rth(dt_eastern_naive: datetime, *, close_time: dtime = RTH_CLOSE) -> bool:
+    """RTH window in America/New_York (close_time supports early close)."""
     t = dt_eastern_naive.time()
-    return dtime(9, 30) <= t <= dtime(16, 0)
+    return RTH_OPEN <= t <= close_time
 
 
 def _utc_ms_to_eastern_naive(ms: int) -> datetime:
@@ -390,6 +396,18 @@ def main() -> None:
         help="If >0, poll every N seconds as fallback (Alpaca latest trade price).",
     )
     parser.add_argument(
+        "--stop-after-close",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exit after market close/early-close to avoid hanging overnight (default: true).",
+    )
+    parser.add_argument(
+        "--close-grace-seconds",
+        type=int,
+        default=300,
+        help="Grace period after close before exiting (default: 300).",
+    )
+    parser.add_argument(
         "--ws-reconnect",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -459,6 +477,83 @@ def main() -> None:
     strategy.on_init()
 
     today_et = datetime.now(EASTERN).date()
+    if args.rth_only and is_market_closed_day(today_et):
+        logger.warning(f"[IntradayRunner] Market closed today ({today_et}), exit.")
+        return
+
+    # Simple heartbeat marker (updated on every processed minute)
+    heartbeat_path = Path("logs") / f"intraday_runner_heartbeat_{today_et.strftime('%Y%m%d')}.txt"
+    metrics_writer = TextfileMetricsWriter("flagship_intraday_runner.prom")
+    ws_errors_total: int = 0
+    ws_consecutive_errors: int = 0
+
+    def _emit_metrics(*, heartbeat_dt: datetime | None = None) -> None:
+        ts = time.time()
+        samples = [
+            Sample(
+                name="flagship_intraday_runner_heartbeat_timestamp_seconds",
+                value=float(ts),
+                labels={"date": today_et.isoformat()},
+            ),
+            Sample(
+                name="flagship_intraday_runner_session_close_timestamp_seconds",
+                value=float(session_close_at.timestamp()),
+                labels={"date": today_et.isoformat()},
+            ),
+            Sample(
+                name="flagship_intraday_runner_watchlist_size",
+                value=float(len(watched)),
+            ),
+            Sample(
+                name="flagship_intraday_runner_ws_errors_total",
+                value=float(ws_errors_total),
+            ),
+            Sample(
+                name="flagship_intraday_runner_ws_consecutive_errors",
+                value=float(ws_consecutive_errors),
+            ),
+        ]
+        if heartbeat_dt is not None:
+            samples.append(
+                Sample(
+                    name="flagship_intraday_runner_last_processed_minute",
+                    value=float(heartbeat_dt.replace(tzinfo=EASTERN).timestamp()),
+                )
+            )
+
+        metrics_writer.write(
+            samples,
+            help_map={
+                "flagship_intraday_runner_heartbeat_timestamp_seconds": "Intraday runner heartbeat (wall clock).",
+                "flagship_intraday_runner_session_close_timestamp_seconds": "Session close timestamp (ET) + grace.",
+                "flagship_intraday_runner_watchlist_size": "Number of symbols tracked by intraday runner.",
+                "flagship_intraday_runner_ws_errors_total": "Total WS errors observed in current process.",
+                "flagship_intraday_runner_ws_consecutive_errors": "Consecutive WS errors (for fallback/backoff).",
+                "flagship_intraday_runner_last_processed_minute": "Last processed minute timestamp (ET).",
+            },
+            type_map={
+                "flagship_intraday_runner_heartbeat_timestamp_seconds": "gauge",
+                "flagship_intraday_runner_session_close_timestamp_seconds": "gauge",
+                "flagship_intraday_runner_watchlist_size": "gauge",
+                "flagship_intraday_runner_ws_errors_total": "gauge",
+                "flagship_intraday_runner_ws_consecutive_errors": "gauge",
+                "flagship_intraday_runner_last_processed_minute": "gauge",
+            },
+        )
+
+    # Determine session close time (Polygon holiday early close overrides default 16:00 ET)
+    session_close_time: dtime = RTH_CLOSE
+    holiday_info = get_holiday_info(today_et)
+    if holiday_info and holiday_info.is_early_close and holiday_info.close_time:
+        session_close_time = holiday_info.close_time
+        logger.info(
+            f"[IntradayRunner] early_close detected: date={today_et}, close={session_close_time.strftime('%H:%M')}"
+        )
+
+    session_close_at = (
+        datetime.combine(today_et, session_close_time, tzinfo=EASTERN)
+        + timedelta(seconds=max(0, int(args.close_grace_seconds)))
+    )
     _init_strategy_state_from_alpaca(strategy, adapter, watched, last_prices, today=today_et)
 
     # Load last daily VIX/VIX3M close to adjust stop-loss multiplier (optional)
@@ -471,8 +566,13 @@ def main() -> None:
     last_close_by_root: dict[str, float] = dict(last_prices)
 
     def _process_minute(dt_minute: datetime, pending_aggs: dict[str, Any]) -> None:
-        if args.rth_only and not _is_rth(dt_minute):
+        if args.rth_only and not _is_rth(dt_minute, close_time=session_close_time):
             return
+        try:
+            heartbeat_path.write_text(dt_minute.isoformat(), encoding="utf-8")
+        except Exception:
+            pass
+        _emit_metrics(heartbeat_dt=dt_minute)
 
         bars: dict[str, BarData] = {}
         # Build full bars set for strategy (all same datetime)
@@ -517,6 +617,9 @@ def main() -> None:
         last_processed: datetime | None = None
         try:
             while True:
+                if args.stop_after_close and datetime.now(EASTERN) >= session_close_at:
+                    logger.info(f"[IntradayRunner] stop-after-close reached ({session_close_at}), exit poll loop.")
+                    return
                 now_et = datetime.now(EASTERN).replace(tzinfo=None)
                 dt_minute = now_et.replace(second=0, microsecond=0)
                 if last_processed != dt_minute:
@@ -577,29 +680,62 @@ def main() -> None:
         - reconnect on transient errors/disconnects
         - optional fallback to polling after repeated WS errors (if --poll-seconds>0)
         """
+        async def _connect_until_close(ws: Any) -> None:
+            """
+            Run websocket connect and ensure we exit after close by scheduling an async close.
+            """
+            async def _handle_msg_async(msgs: list[Any]) -> None:
+                _handle_msg(msgs)
+
+            async def _close_when_due() -> None:
+                while True:
+                    if datetime.now(EASTERN) >= session_close_at:
+                        # Closing the websocket will cause connect() to return (ConnectionClosedOK).
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        return
+                    await asyncio.sleep(1)
+
+            close_task = asyncio.create_task(_close_when_due())
+            try:
+                await ws.connect(_handle_msg_async, close_timeout=1)
+            finally:
+                close_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await close_task
+
         backoff = 1
         consecutive_errors = 0
         while True:
+            if args.stop_after_close and datetime.now(EASTERN) >= session_close_at:
+                logger.info(f"[IntradayRunner] stop-after-close reached ({session_close_at}), exit WS loop.")
+                return
             ws = WebSocketClient(api_key=get_polygon_api_key(), market=Market.Stocks, subscriptions=[])
             ws.subscribe(*subs)
             logger.info(f"[IntradayRunner] Subscribed {len(subs)} tickers (minute aggs).")
             try:
-                ws.run(_handle_msg)
-                # ws.run() returning usually means disconnected
-                raise RuntimeError("Polygon WS stopped (run() returned)")
+                if args.stop_after_close:
+                    asyncio.run(_connect_until_close(ws))
+                    # If we got here and time is past close, treat as normal stop.
+                    if datetime.now(EASTERN) >= session_close_at:
+                        logger.info(f"[IntradayRunner] Session ended ({session_close_at}), exit.")
+                        return
+                    raise RuntimeError("Polygon WS stopped (connect returned early)")
+                else:
+                    ws.run(_handle_msg)
+                    # ws.run() returning usually means disconnected
+                    raise RuntimeError("Polygon WS stopped (run() returned)")
             except KeyboardInterrupt:
                 logger.info("[IntradayRunner] stopped by user")
                 return
             except Exception as exc:
                 consecutive_errors += 1
+                ws_errors_total = int(ws_errors_total) + 1
+                ws_consecutive_errors = int(consecutive_errors)
+                _emit_metrics()
                 logger.warning(f"[IntradayRunner] Polygon WS error: {exc} (errors={consecutive_errors})")
-            finally:
-                try:
-                    c = getattr(ws, "close", None)
-                    if c:
-                        c()
-                except Exception:
-                    pass
 
             if args.poll_seconds > 0 and consecutive_errors >= max(1, int(args.ws_max_errors_before_poll)):
                 logger.warning(
