@@ -4,7 +4,7 @@ services:
     container_name: vnpy_flagship_db
     environment:
       POSTGRES_USER: vnpy
-      POSTGRES_PASSWORD: change_me
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-change_me}"
       POSTGRES_DB: vnpy
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -32,11 +32,15 @@ services:
       DATABASE_PORT: "5432"
       DATABASE_DATABASE: vnpy
       DATABASE_USER: vnpy
-      DATABASE_PASSWORD: change_me
+      DATABASE_PASSWORD: "${POSTGRES_PASSWORD:-change_me}"
 
       # Cron schedule inside container (default: 09:00 ET, Mon-Fri)
-      FLAGSHIP_CRON_SCHEDULE: "0 9 * * 1-5"
+      # Run after market close: 16:15 ET, Mon-Fri (15 minutes after 16:00 close)
+      FLAGSHIP_CRON_SCHEDULE: "15 16 * * 1-5"
       FLAGSHIP_CRON_COMMAND: "/app/flagship/paper_trading/run_full_daily_cycle.sh"
+      # Portfolio heartbeat during RTH (every 5 minutes) - update portfolio + orders
+      FLAGSHIP_CRON_SCHEDULE_PORTFOLIO: "*/5 9-16 * * 1-5"
+      FLAGSHIP_CRON_COMMAND_PORTFOLIO: "python /app/flagship/monitoring/app_console_snapshot.py portfolio orders"
       # Prometheus node_exporter textfile collector output (host-mounted via ./logs)
       FLAGSHIP_TEXTFILE_DIR: "/app/logs/metrics"
     volumes:
@@ -106,7 +110,7 @@ services:
     container_name: vnpy_postgres_exporter
     environment:
       # IMPORTANT: keep in sync with db service env
-      DATA_SOURCE_NAME: "postgresql://vnpy:change_me@db:5432/vnpy?sslmode=disable"
+      DATA_SOURCE_NAME: "postgresql://vnpy:${POSTGRES_PASSWORD:-change_me}@db:5432/vnpy?sslmode=disable"
     depends_on:
       db:
         condition: service_healthy
@@ -144,6 +148,8 @@ services:
       - ./flagship/ops/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      - ./flagship/app_console/site:/srv/app:ro
+      - ./logs/app:/srv/app_data:ro
     depends_on:
       - grafana
       - prometheus

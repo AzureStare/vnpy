@@ -250,6 +250,22 @@ else
   echo "[8/8] Intraday Runner disabled (ENABLE_INTRADAY_RUNNER=$ENABLE_INTRADAY_RUNNER)" | tee -a "$LOG_FILE"
 fi
 
+# 8.5 Refresh Ops Console snapshots (all) + generate report
+echo "[8.5/9] Refreshing Ops Console snapshots..." | tee -a "$LOG_FILE"
+STEP_START_TS="$(date +%s)"
+if ! $PYTHON_BIN flagship/monitoring/app_console_snapshot.py all >> "$LOG_FILE" 2>&1; then
+  echo "[warn] Ops Console snapshot failed (non-blocking)." | tee -a "$LOG_FILE"
+fi
+CYCLE_LAST_STEP="8_5_refresh_ops_console"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
+
+# 8.6 Generate Ops Console report (with GPT summary)
+echo "[8.6/9] Generating Ops Console report..." | tee -a "$LOG_FILE"
+STEP_START_TS="$(date +%s)"
+if ! $PYTHON_BIN flagship/monitoring/app_console_report.py >> "$LOG_FILE" 2>&1; then
+  echo "[warn] Ops Console report generation failed (non-blocking)." | tee -a "$LOG_FILE"
+fi
+CYCLE_LAST_STEP="8_6_generate_ops_report"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
+
 echo "=== Cycle Complete: $(date) ===" | tee -a "$LOG_FILE"
 CYCLE_RUNNING=0
 CYCLE_SUCCESS=1

@@ -21,4 +21,13 @@ db.flagship-strategy.com {
 	reverse_proxy pgadmin:80
 }
 
+app.flagship-strategy.com {
+	handle_path /data/* {
+		root * /srv/app_data
+		file_server
+	}
+	root * /srv/app
+	file_server
+}
+
 
