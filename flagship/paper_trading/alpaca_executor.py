@@ -119,12 +119,11 @@ class MockEngine:
         return self.signal_df
 
     def get_cash_available(self) -> float:
-        # Use min(cash, buying_power) to avoid rejection while not unintentionally using leverage.
+        """Return actual cash available in the account."""
         try:
-            info = self.adapter.get_account_info()
-            return min(info.cash, info.buying_power)
-        except Exception:
             return self.adapter.get_cash()
+        except Exception:
+            return 0.0
 
     def get_holding_value(self) -> float:
         """
@@ -194,7 +193,7 @@ class StrategyRunner:
         settings = {"top_n": TOP_N} 
         self.strategy = FlagshipAlphaMomentumStrategy(
             strategy_engine=self.engine,
-            strategy_name="Live_Flagship_V5",
+            strategy_name="Live_Flagship_V7_Aggressive",
             vt_symbols=[], # Will be populated dynamically or ignored
             setting=settings
         )

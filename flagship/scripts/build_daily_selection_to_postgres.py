@@ -108,28 +108,23 @@ def get_valid_common_stocks() -> set[str]:
 def filter_universe_from_lab(
     lab: AlphaLab,
     trade_date: date,
-    min_adv_usd: float = 2.5e8,
-    min_price: float = 20.0,
-    max_price: float = 600.0,
+    min_adv_usd: float = 4.0e7,
+    min_price: float = 10.0,
+    max_price: float = 1000000.0,
+    min_market_cap: float = 2.0e9,
+    max_market_cap: float = 100.0e9,
 ) -> list[dict[str, Any]]:
     """
     从 AlphaLab 日线数据筛选指定日期的股票池。
     
-    根据策略文档要求：
-    - ADV >= $2.5亿（成交量中位数 × 收盘价）
-    - 价格范围：$20 - $600
+    根据策略文档 V7.0 要求：
+    - ADV >= $4000万（成交量中位数 × 收盘价）
+    - 价格范围：>= $10
+    - 市值范围：$2B - $100B
+    - 基础趋势：Price > MA50
     - 排除 OTC、ETPs（ETF/ETN）、ADRs
-    
-    Returns:
-        通过筛选的股票列表，每个元素包含：
-        {
-            "vt_symbol": str,
-            "close_price": float,
-            "adv_usd": float,
-            "med_volume": float
-        }
     """
-    logger.info(f"[{trade_date}] 开始从 lab 筛选股票池...")
+    logger.info(f"[{trade_date}] 开始从 lab 筛选股票池 (V7.0 Aggressive)...")
     
     # 先从PostgreSQL获取所有有效的Common Stock列表
     valid_common_stocks = get_valid_common_stocks()
@@ -141,11 +136,27 @@ def filter_universe_from_lab(
     daily_files = sorted(lab.daily_path.glob("*.parquet"))
     logger.info(f"[{trade_date}] 发现 {len(daily_files)} 个日线文件")
     
-    # 计算需要的历史数据范围（需要过去30天计算中位数）
-    lookback_start = trade_date - timedelta(days=60)
+    # 批量获取市值数据
+    from flagship.scripts.pg_ticker_db import get_pg_connection
+    raw_symbols = [s.split(".")[0] for s in valid_common_stocks]
+    market_caps = {}
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            # 获取每个 symbol 在 trade_date 或之前的最新市值
+            # 注意：这在数万只股票上可能较慢，但 valid_common_stocks 只有 5000 只，可以接受
+            cur.execute("""
+                SELECT DISTINCT ON (symbol) symbol, market_cap
+                FROM ticker_daily_fundamentals
+                WHERE symbol = ANY(%s) AND as_of_date <= %s
+                ORDER BY symbol, as_of_date DESC;
+            """, (raw_symbols, trade_date))
+            market_caps = {row[0]: row[1] for row in cur.fetchall() if row[1] is not None}
+    
+    # 计算需要的历史数据范围（需要过去50天计算MA50）
+    lookback_start = trade_date - timedelta(days=90)
     
     passed_symbols: list[dict[str, Any]] = []
-    metric_fail = liquidity_fail = price_fail = not_cs_fail = ema_fail = 0
+    metric_fail = liquidity_fail = price_fail = market_cap_fail = not_cs_fail = trend_fail = 0
     
     for idx, file_path in enumerate(daily_files, start=1):
         vt_symbol = file_path.stem
@@ -155,6 +166,13 @@ def filter_universe_from_lab(
             not_cs_fail += 1
             continue
         
+        # 市值筛选
+        raw_symbol = vt_symbol.split(".")[0]
+        mkt_cap = market_caps.get(raw_symbol)
+        if mkt_cap is None or not (min_market_cap <= mkt_cap <= max_market_cap):
+            market_cap_fail += 1
+            continue
+
         try:
             # 读取日线数据
             df = pl.read_parquet(file_path)
@@ -177,8 +195,8 @@ def filter_universe_from_lab(
                 metric_fail += 1
                 continue
             
-            # 至少需要1天的数据
-            if df.height < 1:
+            # 至少需要50天的数据计算MA50
+            if df.height < 50:
                 metric_fail += 1
                 continue
             
@@ -186,27 +204,13 @@ def filter_universe_from_lab(
             closes = df["close"].to_list()
             volumes = df["volume"].to_list()
             
-            if len(closes) < 1 or len(volumes) < 1:
-                metric_fail += 1
-                continue
-            
             # 计算指标（使用 trade_date 当天的收盘价）
             last_close = closes[-1]
             
-            # 取过去30天的成交量中位数（如果不足30天，使用所有可用数据）
-            if len(volumes) >= 30:
-                recent_volumes = volumes[-30:]
-            elif len(volumes) >= 10:
-                recent_volumes = volumes[-10:]
-            else:
-                recent_volumes = volumes
-            
-            if len(recent_volumes) == 0:
-                metric_fail += 1
-                continue
-                
+            # 取过去30天的成交量中位数
+            recent_volumes = volumes[-30:]
             med_vol = statistics.median(recent_volumes)
-            adv_usd = med_vol * last_close  # 日均成交额 = 成交量中位数 × 收盘价
+            adv_usd = med_vol * last_close
             
             # 流动性筛选
             if adv_usd < min_adv_usd:
@@ -218,35 +222,10 @@ def filter_universe_from_lab(
                 price_fail += 1
                 continue
             
-            # EMA趋势过滤（v5.0新增）
-            # 需要至少20天的数据来计算EMA20
-            if len(closes) < 20:
-                metric_fail += 1
-                continue
-            
-            # 计算EMA5和EMA20（使用指数移动平均）
-            # EMA计算公式：EMA_today = (Price_today * α) + (EMA_yesterday * (1 - α))
-            # 其中 α = 2 / (period + 1)
-            def calculate_ema(prices: list[float], period: int) -> float:
-                """计算指数移动平均"""
-                if len(prices) < period:
-                    return None
-                alpha = 2.0 / (period + 1)
-                ema = prices[0]  # 初始值使用第一个价格
-                for price in prices[1:]:
-                    ema = (price * alpha) + (ema * (1 - alpha))
-                return ema
-            
-            ema5 = calculate_ema(closes, 5)
-            ema20 = calculate_ema(closes, 20)
-            
-            if ema5 is None or ema20 is None:
-                metric_fail += 1
-                continue
-            
-            # EMA过滤条件：close > ema5 且 ema5 > ema20
-            if not (last_close > ema5 and ema5 > ema20):
-                ema_fail += 1
+            # 基础趋势过滤：Price > MA50
+            ma50 = sum(closes[-50:]) / 50.0
+            if last_close <= ma50:
+                trend_fail += 1
                 continue
             
             passed_symbols.append({
@@ -256,8 +235,7 @@ def filter_universe_from_lab(
                 "med_volume": int(med_vol),
             })
         
-        except Exception as exc:
-            logger.debug(f"[{trade_date}] {vt_symbol} 处理失败: {exc}")
+        except Exception:
             metric_fail += 1
             continue
         
@@ -265,12 +243,12 @@ def filter_universe_from_lab(
             logger.info(
                 f"[{trade_date}] Progress {idx}/{len(daily_files)}: "
                 f"passed={len(passed_symbols)}, "
-                f"fail:metric={metric_fail},liquidity={liquidity_fail},price={price_fail},ema={ema_fail},not_cs={not_cs_fail}"
+                f"fail:metric={metric_fail},liquidity={liquidity_fail},price={price_fail},cap={market_cap_fail},trend={trend_fail}"
             )
     
     logger.info(
         f"[{trade_date}] 筛选完成: passed={len(passed_symbols)}, "
-        f"metric_fail={metric_fail}, liquidity_fail={liquidity_fail}, price_fail={price_fail}, ema_fail={ema_fail}, not_cs_fail={not_cs_fail}"
+        f"metric_fail={metric_fail}, liquidity_fail={liquidity_fail}, price_fail={price_fail}, market_cap_fail={market_cap_fail}, trend_fail={trend_fail}"
     )
     
     return passed_symbols
@@ -327,17 +305,20 @@ def build_selection_for_date_range(
     start_date: date,
     end_date: date,
     lab_dir: Path,
-    min_adv_usd: float = 2.5e8,
-    min_price: float = 20.0,
-    max_price: float = 600.0,
+    min_adv_usd: float = 4.0e7,
+    min_price: float = 10.0,
+    max_price: float = 1000000.0,
+    min_market_cap: float = 2.0e9,
+    max_market_cap: float = 100.0e9,
 ) -> None:
     """
     为日期范围内的每个交易日生成选股结果并保存到PostgreSQL。
     """
     logger.info("=" * 80)
-    logger.info(f"批量生成日度选股结果并保存到PostgreSQL")
+    logger.info(f"批量生成日度选股结果并保存到PostgreSQL (V7.0 Aggressive)")
     logger.info(f"日期范围: {start_date} 到 {end_date}")
     logger.info(f"Lab 目录: {lab_dir}")
+    logger.info(f"筛选参数: ADV >= {min_adv_usd}, Price >= {min_price}, Cap: {min_market_cap}-{max_market_cap}")
     logger.info("=" * 80)
     
     # 创建表（如果不存在）
@@ -368,6 +349,8 @@ def build_selection_for_date_range(
                 min_adv_usd=min_adv_usd,
                 min_price=min_price,
                 max_price=max_price,
+                min_market_cap=min_market_cap,
+                max_market_cap=max_market_cap,
             )
             
             if selections:
@@ -404,7 +387,7 @@ def main() -> None:
             logger.warning(f"Failed to reload vt_setting.json: {exc}")
     
     parser = argparse.ArgumentParser(
-        description="从 AlphaLab 批量生成日度选股结果并保存到PostgreSQL."
+        description="从 AlphaLab 批量生成日度选股结果并保存到PostgreSQL (V7.0 Aggressive)."
     )
     parser.add_argument(
         "--start",
@@ -427,20 +410,32 @@ def main() -> None:
     parser.add_argument(
         "--min-adv-usd",
         type=float,
-        default=2.5e8,
-        help="最小日均成交额（美元，默认 2.5×10^8）",
+        default=4.0e7,
+        help="最小日均成交额（美元，默认 4.0×10^7）",
     )
     parser.add_argument(
         "--min-price",
         type=float,
-        default=20.0,
-        help="最低股价（默认 20 USD）",
+        default=10.0,
+        help="最低股价（默认 10 USD）",
     )
     parser.add_argument(
         "--max-price",
         type=float,
-        default=600.0,
-        help="最高股价（默认 600 USD）",
+        default=1000000.0,
+        help="最高股价（默认 1,000,000 USD）",
+    )
+    parser.add_argument(
+        "--min-market-cap",
+        type=float,
+        default=2.0e9,
+        help="最小市值（默认 2.0e9）",
+    )
+    parser.add_argument(
+        "--max-market-cap",
+        type=float,
+        default=100.0e9,
+        help="最大市值（默认 100.0e9）",
     )
     
     args = parser.parse_args()
@@ -455,6 +450,8 @@ def main() -> None:
         min_adv_usd=args.min_adv_usd,
         min_price=args.min_price,
         max_price=args.max_price,
+        min_market_cap=args.min_market_cap,
+        max_market_cap=args.max_market_cap,
     )
 
 

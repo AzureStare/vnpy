@@ -21,7 +21,7 @@ from vnpy.alpha.dataset import Segment
 from flagship.paper_trading.config import (
     LAB_PATH, LIVE_MODEL_PATH, CURRENT_REGIME_ID
 )
-from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
+from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
 from flagship.scripts.pg_ticker_db import get_selected_symbols_in_range
 from flagship.model.train_flagship_lgb import build_lgb_dataset, log_feature_importance
 
@@ -45,13 +45,13 @@ def train_daily_model(
     if target_date is None:
         target_date = date.today()
         
-    logger.info(f"[train_daily_model] Starting daily model retraining for {target_date}")
+    logger.info(f"[train_daily_model] Starting daily model retraining for {target_date} (V7.0 Aggressive)")
     
     # 1. Define Data Segments
     # Dynamic split:
     # Test: The future (not used for training, but dataset needs it defined) -> T to T+5
     # Valid: Recent history (e.g., last 2 months) -> T-60 to T-1
-    # Train: History before valid (e.g., 6 months before valid) -> T-240 to T-61
+    # Train: History before valid with Embargo (Gap) -> T-(60+Gap+Window) to T-(60+Gap)
     
     test_start = target_date
     test_end = target_date + timedelta(days=5) # Dummy future
@@ -59,8 +59,11 @@ def train_daily_model(
     valid_end = target_date - timedelta(days=1)
     valid_start = valid_end - timedelta(days=60)
     
-    train_end = valid_start - timedelta(days=1)
-    train_start = train_end - timedelta(days=180) # 6 months training window
+    # Embargo/Purging: label is rank_5d (uses T to T+5 return).
+    # To prevent leakage where Train label overlaps with Valid features/label,
+    # we need a gap of at least 5 days. We use 7 days for safety.
+    train_end = valid_start - timedelta(days=7)
+    train_start = train_end - timedelta(days=730) # 2 years training window
     
     # Check if we have enough history
     # Simple check: train_start should be reasonable
@@ -82,13 +85,20 @@ def train_daily_model(
             f"[train_daily_model] daily_selection 在 {train_start}~{valid_end} 没有任何选股记录，"
             f"无法构建静态 universe 进行训练。请先补齐该区间的 daily_selection。"
         )
+    
+    # 确保包含 SPY 用于计算 RS/Beta
+    if "SPY.NASDAQ" not in vt_symbols:
+        vt_symbols.append("SPY.NASDAQ")
+        
     logger.info(f"[train_daily_model] Training universe symbols: {len(vt_symbols)}")
         
     logger.info("[train_daily_model] Loading raw data...")
+    # 我们需要加载足够久的数据来计算 60d RS/Beta，即便在 train_start 的第一天也需要
+    data_load_start = train_start - timedelta(days=120) 
     raw_df = lab.load_bar_df(
         vt_symbols=vt_symbols,
         interval=Interval.DAILY,
-        start=train_start.isoformat(),
+        start=data_load_start.isoformat(),
         end=valid_end.isoformat(), # Load up to validation end
         extended_days=0
     )
@@ -97,8 +107,8 @@ def train_daily_model(
         raise RuntimeError("Failed to load bar data for training.")
 
     # 3. Compute Factors
-    logger.info("[train_daily_model] Computing factors...")
-    dataset = FlagshipAlphaMomentumV5Dataset(
+    logger.info("[train_daily_model] Computing factors (V7)...")
+    dataset = FlagshipAlphaMomentumV7Dataset(
         df=raw_df,
         train_period=train_period,
         valid_period=valid_period,
@@ -116,18 +126,20 @@ def train_daily_model(
     if sample_train.is_empty():
         raise RuntimeError("[train_daily_model] TRAIN segment is empty, cannot train.")
 
-    # 训练标签：优先使用 rank_5d（若未来补齐该列），否则使用 v5 Dataset 自带的 label（前瞻收益率）
+    # 训练标签：优先使用 rank_5d
     label_candidates = ["rank_5d", "label"]
     label_col = None
     for c in label_candidates:
         if c in sample_train.columns:
             label_col = c
             break
-    if label_col is None:
-        raise RuntimeError(
-            f"[train_daily_model] No label column found. Tried: {label_candidates}. "
-            f"Columns sample: {sample_train.columns[:20]}"
-        )
+    
+    # V7 核心特征
+    feature_cols = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta", "atr_percent"]
+    missing_feats = [c for c in feature_cols if c not in sample_train.columns]
+    if missing_feats:
+        logger.warning(f"[train_daily_model] Missing some V7 features: {missing_feats}. Using available columns.")
+        feature_cols = [c for c in sample_train.columns if c in feature_cols]
 
     train_df = sample_train.sort(["datetime", "vt_symbol"])
     valid_df = dataset.fetch_learn(Segment.VALID).sort(["datetime", "vt_symbol"])
@@ -135,7 +147,6 @@ def train_daily_model(
         logger.warning("[train_daily_model] VALID segment is empty, using TRAIN as VALID for early stopping.")
         valid_df = train_df
 
-    feature_cols = [c for c in train_df.columns if c not in ("datetime", "vt_symbol", label_col, "label")]
     train_set = build_lgb_dataset(train_df, label_col, feature_cols)
     valid_set = build_lgb_dataset(valid_df, label_col, feature_cols)
 
@@ -148,7 +159,7 @@ def train_daily_model(
         "seed": 2024,
     }
 
-    logger.info(f"[train_daily_model] Training LightGBM LambdaRank, label={label_col}")
+    logger.info(f"[train_daily_model] Training LightGBM LambdaRank (V7), label={label_col}, features={len(feature_cols)}")
     booster = lgb.train(
         params=params,
         train_set=train_set,

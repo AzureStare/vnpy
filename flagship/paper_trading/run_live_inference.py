@@ -21,7 +21,7 @@ from flagship.paper_trading.config import (
     LAB_PATH, LIVE_MODEL_PATH, DAILY_SIGNAL_FILE, CURRENT_REGIME_ID
 )
 from flagship.paper_trading.ensure_data_completeness import get_daily_selection_from_postgres
-from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
+from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
 from flagship.backtest.index_regime_windows import get_regime_window
 
 def run_live_inference(
@@ -45,7 +45,7 @@ def run_live_inference(
     if target_date is None:
         target_date = date.today() - timedelta(days=1)
     
-    logger.info(f"[run_live_inference] Generating signals for target date: {target_date}")
+    logger.info(f"[run_live_inference] Generating signals for target date: {target_date} (V7.0 Aggressive)")
     logger.info(f"[run_live_inference] Using model: {model_path}")
     logger.info(f"[run_live_inference] Regime ID: {regime_id}")
 
@@ -78,6 +78,10 @@ def run_live_inference(
         daily_files = sorted(lab.daily_path.glob("*.parquet"))
         vt_symbols = [p.stem for p in daily_files]
     
+    # 确保包含 SPY 用于计算 RS/Beta
+    if "SPY.NASDAQ" not in vt_symbols:
+        vt_symbols.append("SPY.NASDAQ")
+
     raw_df = lab.load_bar_df(
         vt_symbols=vt_symbols,
         interval=Interval.DAILY,
@@ -92,7 +96,8 @@ def run_live_inference(
     logger.info(f"[run_live_inference] Loaded {len(raw_df)} rows of bar data.")
 
     # 3. Compute Factors
-    dataset = FlagshipAlphaMomentumV5Dataset(
+    logger.info("[run_live_inference] Calculating factors (V7)...")
+    dataset = FlagshipAlphaMomentumV7Dataset(
         df=raw_df,
         train_period=train_period,
         valid_period=valid_period,
@@ -100,7 +105,7 @@ def run_live_inference(
     )
     
     logger.info("[run_live_inference] Calculating factors (prepare_data)...")
-    dataset.prepare_data(filters=None) # We can apply filters if we have a live daily selection source
+    dataset.prepare_data(filters=None) 
     
     logger.info("[run_live_inference] Processing data (process_data)...")
     dataset.process_data()
@@ -110,12 +115,11 @@ def run_live_inference(
     infer_df = dataset.fetch_infer(Segment.TEST)
     
     # Filter for the specific target date
-    # Note: 'datetime' col in polars is usually datetime, so we compare dates
     target_df = infer_df.filter(pl.col("datetime").dt.date() == target_date)
     
     if target_df.is_empty():
         logger.warning(f"[run_live_inference] No data found for date {target_date}. Market might be closed or data missing.")
-        # Try finding the latest available date if target date is missing (e.g. if run on weekend)
+        # Try finding the latest available date if target date is missing
         last_date = infer_df.select(pl.col("datetime").max()).item()
         if last_date:
             logger.warning(f"[run_live_inference] Falling back to latest available date: {last_date}")
@@ -123,7 +127,7 @@ def run_live_inference(
         else:
              raise RuntimeError("No inference data available.")
 
-    # Feature columns expected by the model (use the trained model feature list)
+    # Feature columns expected by the model
     feature_cols = booster.feature_name()
     missing_features = [c for c in feature_cols if c not in target_df.columns]
     if missing_features:
@@ -136,34 +140,22 @@ def run_live_inference(
     
     # 5. Export Signal
     # We need to include 'atr_14' and other cols for the strategy
-    select_cols = ["datetime", "vt_symbol", "atr_14", "close_price"] 
+    select_cols = ["datetime", "vt_symbol", "atr_14", "close_price", "ema5", "ema10", "ema20", "ema50", "atr_percent"] 
     # Add other potentially useful columns if they exist
-    for col in ["z_mom", "z_vwap_residual", "z_trend", "weight_mom", "weight_vwap", "weight_trend"]:
+    for col in ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta"]:
         if col in target_df.columns:
             select_cols.append(col)
             
     signal_df = (
         target_df.select(select_cols)
-        .with_columns(pl.Series(name="signal", values=scores)) # 'signal' is the score
-        .rename({"signal": "score"}) # Rename to score to match some conventions, or keep as signal. 
-                                     # The strategy uses 'signal' column as score usually.
-                                     # Let's keep it as 'signal' to match training output
-        .rename({"score": "signal"}) 
+        .with_columns(pl.Series(name="signal", values=scores)) 
     )
     
-    # Ensure 'atr_14' is present
-    if "atr_14" not in signal_df.columns:
-        logger.error("[run_live_inference] atr_14 missing from signal dataframe!")
-        # Attempt to recover or fail?
-        # It should be there if factor calculation worked.
-    
-    logger.info(f"[run_live_inference] Saving {len(signal_df)} signals to {output_file}")
-    
     # Save to parquet
-    # Ensure directory exists
     output_file.parent.mkdir(parents=True, exist_ok=True)
     signal_df.write_parquet(output_file)
     
+    logger.info(f"[run_live_inference] Saved {len(signal_df)} signals to {output_file}")
     logger.info("[run_live_inference] Done.")
 
 if __name__ == "__main__":
