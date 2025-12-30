@@ -408,38 +408,61 @@ def main() -> None:
         help="AlphaLab 数据目录（默认 lab/flagship_alpha_momentum）",
     )
     parser.add_argument(
+        "--strategy",
+        type=str,
+        choices=["v5", "v7"],
+        default="v7",
+        help="Strategy version (v5: Classic, v7: Aggressive). Sets default parameters.",
+    )
+    parser.add_argument(
         "--min-adv-usd",
         type=float,
-        default=4.0e7,
-        help="最小日均成交额（美元，默认 4.0×10^7）",
+        help="最小日均成交额（美元）。若未指定，根据 --strategy 自动设置。",
     )
     parser.add_argument(
         "--min-price",
         type=float,
-        default=10.0,
-        help="最低股价（默认 10 USD）",
+        help="最低股价。若未指定，根据 --strategy 自动设置。",
     )
     parser.add_argument(
         "--max-price",
         type=float,
-        default=1000000.0,
-        help="最高股价（默认 1,000,000 USD）",
+        help="最高股价。若未指定，根据 --strategy 自动设置。",
     )
     parser.add_argument(
         "--min-market-cap",
         type=float,
-        default=2.0e9,
-        help="最小市值（默认 2.0e9）",
+        help="最小市值。若未指定，根据 --strategy 自动设置。",
     )
     parser.add_argument(
         "--max-market-cap",
         type=float,
-        default=100.0e9,
-        help="最大市值（默认 100.0e9）",
+        help="最大市值。若未指定，根据 --strategy 自动设置。",
     )
     
     args = parser.parse_args()
     
+    # Set defaults based on strategy
+    min_adv_usd = args.min_adv_usd
+    min_price = args.min_price
+    max_price = args.max_price
+    min_market_cap = args.min_market_cap
+    max_market_cap = args.max_market_cap
+
+    if args.strategy == "v5":
+        if min_adv_usd is None: min_adv_usd = 2.5e8
+        if min_price is None: min_price = 20.0
+        if max_price is None: max_price = 600.0
+        # V5 doesn't explicitly limit market cap in doc, but we can set broad limits
+        if min_market_cap is None: min_market_cap = 0.0 
+        if max_market_cap is None: max_market_cap = float('inf')
+    elif args.strategy == "v7":
+        if min_adv_usd is None: min_adv_usd = 4.0e7
+        if min_price is None: min_price = 10.0
+        if max_price is None: max_price = 1000000.0 # Effectively unlimited up
+        if min_market_cap is None: min_market_cap = 2.0e9
+        if max_market_cap is None: max_market_cap = 1.0e11
+
     start_date = datetime.fromisoformat(args.start).date()
     end_date = datetime.fromisoformat(args.end).date()
     
@@ -447,11 +470,11 @@ def main() -> None:
         start_date=start_date,
         end_date=end_date,
         lab_dir=args.lab_path,
-        min_adv_usd=args.min_adv_usd,
-        min_price=args.min_price,
-        max_price=args.max_price,
-        min_market_cap=args.min_market_cap,
-        max_market_cap=args.max_market_cap,
+        min_adv_usd=min_adv_usd,
+        min_price=min_price,
+        max_price=max_price,
+        min_market_cap=min_market_cap,
+        max_market_cap=max_market_cap,
     )
 
 

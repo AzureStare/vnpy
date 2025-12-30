@@ -22,6 +22,7 @@ from flagship.paper_trading.config import (
     LAB_PATH, LIVE_MODEL_PATH, CURRENT_REGIME_ID
 )
 from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
+from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
 from flagship.scripts.pg_ticker_db import get_selected_symbols_in_range
 from flagship.model.train_flagship_lgb import build_lgb_dataset, log_feature_importance
 
@@ -31,7 +32,8 @@ def train_daily_model(
     target_date: date | None = None,
     lab_path: Path = LAB_PATH,
     output_model_path: Path = LIVE_MODEL_PATH,
-    regime_id: int = CURRENT_REGIME_ID
+    regime_id: int = CURRENT_REGIME_ID,
+    strategy_version: str = "v7"
 ) -> None:
     """
     Retrain the model using data up to the target date.
@@ -41,11 +43,12 @@ def train_daily_model(
         lab_path: Path to AlphaLab.
         output_model_path: Path to save the new model.
         regime_id: ID of the regime (for potential parameter lookup).
+        strategy_version: "v5" or "v7".
     """
     if target_date is None:
         target_date = date.today()
         
-    logger.info(f"[train_daily_model] Starting daily model retraining for {target_date} (V7.0 Aggressive)")
+    logger.info(f"[train_daily_model] Starting daily model retraining for {target_date} (Strategy: {strategy_version})")
     
     # 1. Define Data Segments
     # Dynamic split:
@@ -79,6 +82,10 @@ def train_daily_model(
     # 2. Load Data
     lab = AlphaLab(str(lab_path))
     # 仅训练“静态过滤后的 universe”：从 daily_selection 中取训练窗口内出现过的标的集合
+    # NOTE: daily_selection table should ideally match the strategy's universe criteria.
+    # If mixed (v5 and v7 in same table), we might get a union. 
+    # For now, we rely on the DB containing selection relevant to the strategy we run, 
+    # or just assume the model can handle a broader universe.
     vt_symbols = get_selected_symbols_in_range(start_date=train_start, end_date=valid_end)
     if not vt_symbols:
         raise RuntimeError(
@@ -107,8 +114,18 @@ def train_daily_model(
         raise RuntimeError("Failed to load bar data for training.")
 
     # 3. Compute Factors
-    logger.info("[train_daily_model] Computing factors (V7)...")
-    dataset = FlagshipAlphaMomentumV7Dataset(
+    logger.info(f"[train_daily_model] Computing factors ({strategy_version})...")
+    
+    if strategy_version == "v5":
+        DatasetClass = FlagshipAlphaMomentumV5Dataset
+        # V5 Feature Columns
+        feature_cols = ["alpha_mom", "alpha_vwap", "residual_vwap", "alpha_trend", "rs_10d"]
+    else:
+        DatasetClass = FlagshipAlphaMomentumV7Dataset
+        # V7 Feature Columns
+        feature_cols = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta", "atr_percent"]
+
+    dataset = DatasetClass(
         df=raw_df,
         train_period=train_period,
         valid_period=valid_period,
@@ -134,11 +151,9 @@ def train_daily_model(
             label_col = c
             break
     
-    # V7 核心特征
-    feature_cols = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta", "atr_percent"]
     missing_feats = [c for c in feature_cols if c not in sample_train.columns]
     if missing_feats:
-        logger.warning(f"[train_daily_model] Missing some V7 features: {missing_feats}. Using available columns.")
+        logger.warning(f"[train_daily_model] Missing some features: {missing_feats}. Using available columns.")
         feature_cols = [c for c in sample_train.columns if c in feature_cols]
 
     train_df = sample_train.sort(["datetime", "vt_symbol"])
@@ -159,7 +174,7 @@ def train_daily_model(
         "seed": 2024,
     }
 
-    logger.info(f"[train_daily_model] Training LightGBM LambdaRank (V7), label={label_col}, features={len(feature_cols)}")
+    logger.info(f"[train_daily_model] Training LightGBM LambdaRank ({strategy_version}), label={label_col}, features={len(feature_cols)}")
     booster = lgb.train(
         params=params,
         train_set=train_set,
@@ -191,11 +206,12 @@ def train_daily_model(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=str, help="Target date YYYY-MM-DD")
+    parser.add_argument("--strategy", type=str, choices=["v5", "v7"], default="v7", help="Strategy version")
     args = parser.parse_args()
     
     target_dt = None
     if args.date:
         target_dt = datetime.strptime(args.date, "%Y-%m-%d").date()
         
-    train_daily_model(target_date=target_dt)
+    train_daily_model(target_date=target_dt, strategy_version=args.strategy)
 

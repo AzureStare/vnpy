@@ -22,6 +22,7 @@ from flagship.paper_trading.config import (
 )
 from flagship.paper_trading.ensure_data_completeness import get_daily_selection_from_postgres
 from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
+from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
 from flagship.backtest.index_regime_windows import get_regime_window
 
 def run_live_inference(
@@ -29,7 +30,8 @@ def run_live_inference(
     lab_path: Path = LAB_PATH,
     model_path: Path = LIVE_MODEL_PATH,
     output_file: Path = DAILY_SIGNAL_FILE,
-    regime_id: int = CURRENT_REGIME_ID
+    regime_id: int = CURRENT_REGIME_ID,
+    strategy_version: str = "v7"
 ) -> None:
     """
     Generate signals for the specific target date.
@@ -41,11 +43,12 @@ def run_live_inference(
         model_path: Path to the trained .pkl model.
         output_file: Path to save the resulting signal parquet.
         regime_id: ID of the regime to use for config/dataset prep.
+        strategy_version: "v5" or "v7".
     """
     if target_date is None:
         target_date = date.today() - timedelta(days=1)
     
-    logger.info(f"[run_live_inference] Generating signals for target date: {target_date} (V7.0 Aggressive)")
+    logger.info(f"[run_live_inference] Generating signals for target date: {target_date} (Strategy: {strategy_version})")
     logger.info(f"[run_live_inference] Using model: {model_path}")
     logger.info(f"[run_live_inference] Regime ID: {regime_id}")
 
@@ -96,8 +99,14 @@ def run_live_inference(
     logger.info(f"[run_live_inference] Loaded {len(raw_df)} rows of bar data.")
 
     # 3. Compute Factors
-    logger.info("[run_live_inference] Calculating factors (V7)...")
-    dataset = FlagshipAlphaMomentumV7Dataset(
+    logger.info(f"[run_live_inference] Calculating factors ({strategy_version})...")
+    
+    if strategy_version == "v5":
+        DatasetClass = FlagshipAlphaMomentumV5Dataset
+    else:
+        DatasetClass = FlagshipAlphaMomentumV7Dataset
+
+    dataset = DatasetClass(
         df=raw_df,
         train_period=train_period,
         valid_period=valid_period,
@@ -140,9 +149,11 @@ def run_live_inference(
     
     # 5. Export Signal
     # We need to include 'atr_14' and other cols for the strategy
-    select_cols = ["datetime", "vt_symbol", "atr_14", "close_price", "ema5", "ema10", "ema20", "ema50", "atr_percent"] 
-    # Add other potentially useful columns if they exist
-    for col in ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta"]:
+    select_cols = ["datetime", "vt_symbol", "atr_14", "close_price"]
+    
+    # Add strategy-specific optional columns if they exist
+    potential_cols = ["ema5", "ema10", "ema20", "ema50", "atr_percent", "alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "rs_10d", "beta"]
+    for col in potential_cols:
         if col in target_df.columns:
             select_cols.append(col)
             
@@ -161,10 +172,11 @@ def run_live_inference(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", type=str, help="Target date YYYY-MM-DD")
+    parser.add_argument("--strategy", type=str, choices=["v5", "v7"], default="v7", help="Strategy version")
     args = parser.parse_args()
     
     target_dt = None
     if args.date:
         target_dt = datetime.strptime(args.date, "%Y-%m-%d").date()
         
-    run_live_inference(target_date=target_dt)
+    run_live_inference(target_date=target_dt, strategy_version=args.strategy)

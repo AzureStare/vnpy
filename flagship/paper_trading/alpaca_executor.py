@@ -28,6 +28,7 @@ from vnpy.alpha.lab import AlphaLab
 
 from flagship.paper_trading.config import DAILY_SIGNAL_FILE, TOP_N, LAB_PATH
 from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
+from flagship.strategy.flagship_alpha_momentum_strategy_v7 import FlagshipAlphaMomentumStrategy as FlagshipAlphaMomentumStrategyV7
 from flagship.config.polygon_config import get_polygon_api_key
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
 from flagship.paper_trading.broker_alpaca import AlpacaAdapter
@@ -183,17 +184,24 @@ class StrategyRunner:
     """
     Runs the vnpy strategy logic using live data to determine target positions.
     """
-    def __init__(self, adapter: AlpacaAdapter):
+    def __init__(self, adapter: AlpacaAdapter, strategy_version: str = "v7"):
         self.adapter = adapter
         self.engine = MockEngine(adapter)
         self.lab = AlphaLab(str(LAB_PATH))
         
         # Initialize Strategy
-        # settings: top_n, etc. from config
-        settings = {"top_n": TOP_N} 
-        self.strategy = FlagshipAlphaMomentumStrategy(
+        if strategy_version == "v5":
+            StrategyClass = FlagshipAlphaMomentumStrategy
+            strategy_name = "Live_Flagship_V5"
+            settings = {"top_n": 5}
+        else:
+            StrategyClass = FlagshipAlphaMomentumStrategyV7
+            strategy_name = "Live_Flagship_V7_Aggressive"
+            settings = {"top_n": 8}
+
+        self.strategy = StrategyClass(
             strategy_engine=self.engine,
-            strategy_name="Live_Flagship_V7_Aggressive",
+            strategy_name=strategy_name,
             vt_symbols=[], # Will be populated dynamically or ignored
             setting=settings
         )
@@ -450,9 +458,16 @@ def main():
         default=False,
         help="Subscribe Polygon WS for tickers (pre-open price monitoring).",
     )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        choices=["v5", "v7"],
+        default="v7",
+        help="Strategy version to execute (v5 or v7). Default: v7.",
+    )
     args = parser.parse_args()
 
-    logger.info("Starting Alpaca Executor...")
+    logger.info(f"Starting Alpaca Executor (Strategy: {args.strategy})...")
     
     # 1. Setup Adapter
     try:
@@ -465,7 +480,7 @@ def main():
         adapter.cancel_all_open_orders()
 
     # 2. Setup Strategy Runner
-    runner = StrategyRunner(adapter)
+    runner = StrategyRunner(adapter, strategy_version=args.strategy)
     
     # 3. Inject Signals
     runner.inject_signal(DAILY_SIGNAL_FILE)
