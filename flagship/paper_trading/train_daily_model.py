@@ -123,7 +123,7 @@ def train_daily_model(
     else:
         DatasetClass = FlagshipAlphaMomentumV7Dataset
         # V7 Feature Columns
-        feature_cols = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta", "atr_percent"]
+        feature_cols = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta", "atr_percent", "return_5d"]
 
     dataset = DatasetClass(
         df=raw_df,

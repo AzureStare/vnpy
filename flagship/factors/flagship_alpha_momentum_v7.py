@@ -50,6 +50,9 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
         # V7 标签保持 rank_5d 逻辑，但增加对 5 日收益的计算
         self.add_feature("ret_5d", "ts_delay(close, -5) / close - 1")
         
+        # 新增 V7 特征：5日历史收益率 (Momentum 5d) - 用于区分启动与高潮
+        self.add_feature("return_5d", "close / ts_delay(close, 5) - 1")
+
         # 覆盖 V5 的处理，使用 V7 的 post_process
         self.processors["infer"] = self._post_process_v7
 
@@ -144,7 +147,7 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
 
         # 5. 因子合成与标准化 (LGB 模型会处理非线性，但我们仍需准备干净的特征)
         # 我们对所有核心特征进行截面 Z-Score
-        core_features = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta", "atr_percent"]
+        core_features = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta", "atr_percent", "return_5d"]
         for feat in core_features:
             if feat in df.columns:
                 df = df.with_columns([

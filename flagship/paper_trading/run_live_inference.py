@@ -152,7 +152,7 @@ def run_live_inference(
     select_cols = ["datetime", "vt_symbol", "atr_14", "close_price", "adv_usd"]
     
     # Add strategy-specific optional columns if they exist
-    potential_cols = ["ema5", "ema10", "ema20", "ema50", "atr_percent", "alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "rs_10d", "beta"]
+    potential_cols = ["ema5", "ema10", "ema20", "ema50", "atr_percent", "alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "rs_10d", "beta", "return_5d"]
     for col in potential_cols:
         if col in target_df.columns:
             select_cols.append(col)
