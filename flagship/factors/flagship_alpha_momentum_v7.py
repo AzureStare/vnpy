@@ -54,7 +54,7 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
         self.add_feature("return_5d", "close / ts_delay(close, 5) - 1")
 
         # 覆盖 V5 的处理，使用 V7 的 post_process
-        self.processors["infer"] = self._post_process_v7
+        self.add_processor("infer", self._post_process_v7)
 
     def _post_process_v7(self, df: pl.DataFrame) -> pl.DataFrame:
         """
@@ -116,7 +116,7 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
             df = df.with_columns([
                 (
                     pl.rolling_cov(pl.col("ret_i"), pl.col("ret_spy"), window_size=60) /
-                    (pl.rolling_var(pl.col("ret_spy"), window_size=60) + eps)
+                    (pl.col("ret_spy").rolling_var(window_size=60) + eps)
                 ).over("vt_symbol").alias("beta")
             ])
         else:

@@ -44,6 +44,8 @@ services:
       # Prometheus node_exporter textfile collector output (host-mounted via ./logs)
       FLAGSHIP_TEXTFILE_DIR: "/app/logs/metrics"
     volumes:
+      # Mount current directory for easy updates without rebuild
+      - .:/app
       # Persist AlphaLab data and logs
       - ./lab:/app/lab
       - ./logs:/app/logs

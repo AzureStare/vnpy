@@ -54,14 +54,15 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
     stop_loss_atr_multiplier: float = 2.5  # ATR 止损倍数
     max_daily_drawdown: float = 0.05
     
+    # 阶梯止盈阈值
+    profit_threshold_trend: float = 0.05  # 5% 进入趋势阶段
+    profit_threshold_win: float = 0.15    # 15% 进入获利丰厚阶段
+    spike_threshold: float = 0.10         # 10% 暴涨日阈值
+    
     # 仓位控制
     base_pos_size: float = 0.15  # 基础仓位 15%
     max_leverage: float = 1.6
     
-    # VIX 阈值
-    vix_threshold_1: float = 1.0
-    vix_threshold_2: float = 1.1
-
     def on_init(self) -> None:
         """策略初始化回调"""
         self.holding_days: defaultdict[str, int] = defaultdict(int)
@@ -71,13 +72,16 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
         
         # 记录当日最低价（用于 Spike Check）
         self.daily_lows: dict[str, float] = {}
+        # 记录当日是否触发过暴涨（10%+）
+        self.spike_triggered: dict[str, bool] = defaultdict(bool)
         
         self.bar_managers: dict[str, ArrayManager] = {}
         for vt_symbol in self.vt_symbols:
             self.bar_managers[vt_symbol] = ArrayManager(size=100)
         
-        self.current_vix: float | None = None
-        self.current_vix3m: float | None = None
+        # 大盘指标
+        self.spy_ema10: float | None = None
+        self.spy_ema20: float | None = None
         
         self.trade_entry_reasons: dict[str, str] = {}
         self.trade_exit_reasons: dict[str, str] = {}
@@ -89,7 +93,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
         self.current_trade_date: date | None = None
         self.daily_rebalance_done: bool = False
         
-        self.write_log("Flagship Alpha-Momentum V7.0 Strategy initialized")
+        self.write_log("Flagship Alpha-Momentum V7.0 Strategy initialized (Intraday Exit Mode)")
 
     def on_trade(self, trade: TradeData) -> None:
         """交易执行回调"""
@@ -97,6 +101,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             if trade.vt_symbol not in self.entry_prices:
                 self.entry_prices[trade.vt_symbol] = trade.price
                 self.entry_highs[trade.vt_symbol] = trade.price
+                self.spike_triggered[trade.vt_symbol] = False # 重置暴涨状态
                 if trade.vt_symbol in self.trade_entry_reasons:
                     self.trade_entry_reasons_by_tradeid[trade.vt_tradeid] = self.trade_entry_reasons[trade.vt_symbol]
         else:
@@ -106,6 +111,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             self.entry_prices.pop(trade.vt_symbol, None)
             self.entry_highs.pop(trade.vt_symbol, None)
             self.daily_lows.pop(trade.vt_symbol, None)
+            self.spike_triggered.pop(trade.vt_symbol, None)
             self.trade_entry_reasons.pop(trade.vt_symbol, None)
             self.trade_exit_reasons.pop(trade.vt_symbol, None)
 
@@ -125,6 +131,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             self.daily_rebalance_done = False
             for vt_symbol in [s for s, p in self.pos_data.items() if p > 0]:
                 self.holding_days[vt_symbol] += 1
+                self.spike_triggered[vt_symbol] = False # 新的一天重置暴涨记录
             if self.previous_net_value == 0:
                 self.previous_net_value = self.get_cash_available() + self.get_holding_value()
 
@@ -151,8 +158,20 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             # 更新前一日净值，用于次日回撤计算
             self.previous_net_value = self.get_cash_available() + self.get_holding_value()
 
+    def _update_bar_managers(self, bars: dict[str, BarData]) -> None:
+        """更新历史K线数据管理器"""
+        for vt_symbol, bar in bars.items():
+            if vt_symbol in self.bar_managers:
+                am = self.bar_managers[vt_symbol]
+                am.update_bar(bar)
+                
+                # 特殊处理 SPY 指标
+                if vt_symbol == "SPY.NASDAQ" and am.inited:
+                    self.spy_ema10 = am.ema(10)
+                    self.spy_ema20 = am.ema(20)
+
     def _check_profit_ladder_exit(self, bars: dict[str, BarData]) -> None:
-        """阶梯止盈检查逻辑"""
+        """阶梯止盈检查逻辑 (分钟级)"""
         for vt_symbol, bar in bars.items():
             pos = self.get_pos(vt_symbol)
             if pos <= 0:
@@ -163,152 +182,68 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             if not entry_price or not entry_high:
                 continue
                 
-            # 获取日级指标 (EMA, ATR)
+            # 获取日级指标 (来自信号文件)
             indicators = self.daily_indicators.get(vt_symbol, {})
             atr = indicators.get("atr_14")
-            ema10 = indicators.get("ema10")
-            ema5 = indicators.get("ema5")
             
-            # 计算当前浮盈
+            # 使用 ArrayManager 计算实时 EMA (更灵敏)
+            am = self.bar_managers.get(vt_symbol)
+            ema5 = am.ema(5) if am and am.inited else indicators.get("ema5")
+            ema10 = am.ema(10) if am and am.inited else indicators.get("ema10")
+            
+            # 计算当前浮盈 (基于分钟价)
             profit_pct = (bar.close_price / entry_price) - 1
             days = self.holding_days.get(vt_symbol, 0)
             
             exit_reason = None
             
-            # A. 硬止损 (通用)
-            hard_stop = entry_price * (1 - self.hard_stop_loss_pct)
-            if atr:
-                hard_stop = min(hard_stop, entry_price - 2.5 * atr)
+            # 0. 暴涨日实时保护 (Intraday Spike Guard)
+            # 如果盘中涨幅超过 10%，记录触发
+            day_return = (bar.close_price / bar.open_price - 1) if bar.open_price > 0 else 0
+            if day_return > self.spike_threshold:
+                self.spike_triggered[vt_symbol] = True
             
-            if bar.close_price < hard_stop:
-                exit_reason = f"硬止损触发 (Price < {hard_stop:.2f})"
-            
-            # B. 阶梯止盈 (Profit Ladder)
+            if self.spike_triggered[vt_symbol]:
+                # 触发暴涨后，若价格回落跌破当日最低价（收盘价附近的快速回落），立即锁定
+                if bar.close_price <= self.daily_lows.get(vt_symbol, 0):
+                    exit_reason = "暴涨日回落止盈 (Price <= Day Low)"
+
+            # 1. 宏观极速刹车 (SPY 盘中跌破 EMA10)
+            quick_brake = False
+            spy_bar = bars.get("SPY.NASDAQ")
+            if spy_bar and self.spy_ema10 and spy_bar.close_price < self.spy_ema10:
+                quick_brake = True
+
+            # 2. 阶梯止盈逻辑 (Profit Ladder)
             if not exit_reason:
-                if profit_pct < 0.05 and days < 3:
-                    # 早期阶段：仅硬止损，忽略 EMA
-                    pass
-                elif 0.05 <= profit_pct < 0.15:
-                    # 趋势阶段：收盘跌破 EMA10
+                if profit_pct < self.profit_threshold_trend and days < 3:
+                    # A. 早期阶段：仅硬止损
+                    hard_stop = entry_price * (1 - self.hard_stop_loss_pct)
+                    if atr:
+                        hard_stop = min(hard_stop, entry_price - self.stop_loss_atr_multiplier * atr)
+                    if bar.close_price < hard_stop:
+                        exit_reason = f"早期硬止损 (Price < {hard_stop:.2f})"
+                
+                elif (self.profit_threshold_trend <= profit_pct < self.profit_threshold_win) and not quick_brake:
+                    # B. 趋势阶段：跌破 EMA10
                     if ema10 and bar.close_price < ema10:
-                        exit_reason = "EMA10 趋势离场"
-                elif profit_pct >= 0.15:
-                    # 获利丰厚阶段：收盘跌破 EMA5 或 从最高点回撤 10%
+                        exit_reason = "EMA10 趋势止盈"
+                
+                else:
+                    # C. 获利丰厚阶段 (>15%) 或 大盘刹车模式：使用 EMA5 或 10% 回撤
                     trailing_stop = entry_high * 0.90
+                    stop_line = trailing_stop
                     if ema5:
                         stop_line = max(ema5, trailing_stop)
-                    else:
-                        stop_line = trailing_stop
-                        
+                    
                     if bar.close_price < stop_line:
-                        exit_reason = f"利润锁定离场 (Price < {stop_line:.2f})"
+                        exit_reason = f"利润锁定/大盘避险 (Price < {stop_line:.2f})"
             
             if exit_reason:
-                self.write_log(f"{vt_symbol} 离场: {exit_reason}, 收益: {profit_pct:.2%}")
+                self.write_log(f"{vt_symbol} 盘中离场: {exit_reason}, 当前收益: {profit_pct:.2%}")
                 self.trade_exit_reasons[vt_symbol] = exit_reason
                 self.set_target(vt_symbol, 0)
                 self.execute_trading(bars, price_add=self.price_add)
-
-    def _run_daily_rebalance(self, bars: dict[str, BarData]) -> None:
-        """每日选股与调仓"""
-        last_signal = self.get_signal()
-        if last_signal.is_empty():
-            return
-            
-        # 缓存指标
-        for row in last_signal.iter_rows(named=True):
-            self.daily_indicators[row["vt_symbol"]] = row
-            
-        # 1. 结构过滤器 (Setup A/B)
-        candidates = []
-        top_50 = last_signal.sort("signal", descending=True).head(50)
-        
-        for row in top_50.iter_rows(named=True):
-            symbol = row["vt_symbol"]
-            if symbol not in bars: continue
-            if self.get_pos(symbol) > 0: continue
-            
-            p = row["close_price"]
-            ema10 = row.get("ema10")
-            ema20 = row.get("ema20")
-            ema50 = row.get("ema50")
-            
-            setup_a = False
-            # Setup A: Breakout (P > EMA20)
-            if ema20 and p > ema20:
-                setup_a = True
-                
-            setup_b = False
-            # Setup B: Pullback (P > EMA50, P < EMA10, P > EMA20)
-            if ema50 and ema10 and ema20 and p > ema50 and p < ema10 and p > ema20:
-                setup_b = True
-                
-            if setup_a or setup_b:
-                candidates.append(row)
-                
-        # 2. 最终选股 (Top N)
-        final_buy = sorted(candidates, key=lambda x: x["signal"], reverse=True)[:self.top_n]
-        
-        # 3. 杠杆计算 (SPY > MA50)
-        spy_row = last_signal.filter(pl.col("vt_symbol") == "SPY.NASDAQ")
-        leverage = 1.0
-        if not spy_row.is_empty():
-            spy_close = spy_row["close_price"][0]
-            # 注意：ma50 列如果不在信号文件中，这里会报错，所以我们在 run_live_inference 中输出了 ema50 暂用
-            spy_trend_ma = spy_row.get("ema50", [0])[0]
-            if spy_close > spy_trend_ma:
-                leverage = self.max_leverage 
-                
-        # 4. 动态信念加权 (Softmax) + 流动性约束
-        if final_buy:
-            total_equity = self.get_cash_available() + self.get_holding_value()
-            
-            # A. 计算 Softmax 权重
-            # V5 文档: W_i = exp(S_i * lambda) / sum(exp(S_j * lambda))
-            # S_i 应该是标准化后的分数，避免 exp 溢出
-            scores = np.array([x["signal"] for x in final_buy])
-            # Z-Score Standardize scores within the portfolio
-            if len(scores) > 1 and np.std(scores) > 0:
-                scores_norm = (scores - np.mean(scores)) / np.std(scores)
-            else:
-                scores_norm = np.zeros_like(scores) # Fallback to equal weight if std is 0
-                
-            lambda_param = 2.0
-            exp_scores = np.exp(scores_norm * lambda_param)
-            softmax_weights = exp_scores / np.sum(exp_scores)
-            
-            # B. 应用杠杆与分配资金
-            target_equity = total_equity * leverage
-            
-            for i, row in enumerate(final_buy):
-                symbol = row["vt_symbol"]
-                p = row["close_price"]
-                weight = softmax_weights[i]
-                
-                # 理论目标金额
-                target_val = target_equity * weight
-                
-                # C. 流动性硬约束 (1% ADV)
-                # 防止在重仓时遭遇流动性陷阱
-                adv = row.get("adv_usd", 0.0)
-                if adv > 0:
-                    max_val_liquidity = 0.01 * adv
-                    if target_val > max_val_liquidity:
-                        self.write_log(f"{symbol} 触发流动性约束: 目标 ${target_val:.0f} -> ${max_val_liquidity:.0f} (1% ADV)")
-                        target_val = max_val_liquidity
-                
-                volume = round_to(target_val / p, self.min_volume)
-                if volume > 0:
-                    self.set_target(symbol, volume)
-                    self.trade_entry_reasons[symbol] = f"V7, Score={row['signal']:.3f}, W={weight:.1%}"
-                    
-        self.execute_trading(bars, price_add=self.price_add)
-
-    def _update_bar_managers(self, bars: dict[str, BarData]) -> None:
-        """更新历史K线数据管理器"""
-        for vt_symbol, bar in bars.items():
-            if vt_symbol in self.bar_managers:
-                self.bar_managers[vt_symbol].update_bar(bar)
 
     def _get_vix_ratio(self, bars: dict[str, BarData]) -> float | None:
         """获取VIX期限结构比率"""

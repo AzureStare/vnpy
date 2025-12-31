@@ -66,7 +66,7 @@ def train_daily_model(
     # To prevent leakage where Train label overlaps with Valid features/label,
     # we need a gap of at least 5 days. We use 7 days for safety.
     train_end = valid_start - timedelta(days=7)
-    train_start = train_end - timedelta(days=730) # 2 years training window
+    train_start = train_end - timedelta(days=1095) # 3 years training window (Increased from 2y)
     
     # Check if we have enough history
     # Simple check: train_start should be reasonable
@@ -202,6 +202,30 @@ def train_daily_model(
     output_model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(booster, output_model_path)
     logger.info(f"[train_daily_model] Live model saved to: {output_model_path}")
+    
+    # Save a history copy for auditing
+    history_dir = output_model_path.parent / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    history_path = history_dir / f"booster_{target_date.strftime('%Y%m%d')}_{strategy_version}.joblib"
+    joblib.dump(booster, history_path)
+    logger.info(f"[train_daily_model] History model saved to: {history_path}")
+    
+    # Save training metrics for app console
+    metrics = {
+        "target_date": target_date.isoformat(),
+        "strategy_version": strategy_version,
+        "best_ndcg_5": float(best_score),
+        "train_period": train_period,
+        "valid_period": valid_period,
+        "feature_importance": dict(zip(feature_cols, booster.feature_importance().tolist())),
+        "generated_at": datetime.now().isoformat()
+    }
+    metrics_path = PROJECT_ROOT / "logs" / "app" / "model_metrics.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(metrics_path, "w") as f:
+        import json
+        json.dump(metrics, f, indent=2)
+    logger.info(f"[train_daily_model] Training metrics saved to: {metrics_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

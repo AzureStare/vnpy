@@ -283,7 +283,7 @@
       <!-- Selection Ranking -->
       <div class="card">
         <div class="card-header">
-          <h2>Selection Ranking (按 signal 降序)</h2>
+          <h2>Selection Ranking (Top 10 Signal)</h2>
           <div class="badge" id="selection-updated">未加载</div>
         </div>
         <div id="selection-error" class="error" style="display:none;"></div>
@@ -296,6 +296,20 @@
             <tbody></tbody>
           </table>
         </div>
+        
+        <div class="section-title" style="margin-top:24px;">Model Info (Latest Training)</div>
+        <div class="kpi-grid" style="grid-template-columns: 1fr 1fr; margin-bottom: 8px;">
+           <div class="kpi-card">
+              <div class="kpi-label">Training Date</div>
+              <div class="kpi-value" id="model-date" style="font-size:14px;">-</div>
+           </div>
+           <div class="kpi-card">
+              <div class="kpi-label">Valid NDCG@5</div>
+              <div class="kpi-value good" id="model-ndcg" style="font-size:14px;">-</div>
+           </div>
+        </div>
+        <div class="section-title" style="font-size:12px; color:var(--muted);">Feature Importance (Top 5)</div>
+        <div id="feature-importance" style="font-size:12px; font-family:var(--mono); line-height:1.4;"></div>
       </div>
     </div>
 
@@ -611,6 +625,18 @@
         el.textContent = 'Selection 加载失败: ' + e.message;
         el.style.display = 'block';
         setBadge(document.getElementById('selection-updated'), '');
+      }
+
+      try {
+        const data = await loadJson('/data/model_metrics.json');
+        document.getElementById('model-date').textContent = data.target_date || '-';
+        document.getElementById('model-ndcg').textContent = data.best_ndcg_5 ? data.best_ndcg_5.toFixed(4) : '-';
+        
+        const importance = data.feature_importance || {};
+        const sorted = Object.entries(importance).sort((a,b) => b[1] - a[1]).slice(0, 5);
+        document.getElementById('feature-importance').innerHTML = sorted.map(([k, v]) => `<div>${k.padEnd(12)}: ${v}</div>`).join('');
+      } catch (e) {
+        console.warn('Model metrics not available yet');
       }
 
       try {

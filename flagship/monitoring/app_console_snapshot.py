@@ -40,7 +40,7 @@ from vnpy.alpha.lab import AlphaLab
 from vnpy.trader.logger import logger
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "logs" / "app"
-DEFAULT_SELECTION_TOP_N = int(os.getenv("FLAGSHIP_APP_SELECTION_TOPN", "30"))
+DEFAULT_SELECTION_TOP_N = int(os.getenv("FLAGSHIP_APP_SELECTION_TOPN", "10"))
 DEFAULT_SELECTION_DATE_CANDIDATES = int(os.getenv("FLAGSHIP_APP_SELECTION_DATE_CANDIDATES", "30"))
 
 

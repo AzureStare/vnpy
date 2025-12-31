@@ -185,15 +185,31 @@ if [ $? -ne 0 ]; then
 fi
 CYCLE_LAST_STEP="4_5_check_lab_freshness"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
 
-# 5. Train Daily Model (New Step)
-echo "[5/8] Retraining Daily Model..." | tee -a "$LOG_FILE"
-STEP_START_TS="$(date +%s)"
-$PYTHON_BIN flagship/paper_trading/train_daily_model.py --date "$TRADING_DATE" >> "$LOG_FILE" 2>&1
-if [ $? -ne 0 ]; then
-  CYCLE_RUNNING=0; CYCLE_SUCCESS=0; CYCLE_LAST_STEP="5_train_daily_model"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
-  echo "ERROR: Model training failed." | tee -a "$LOG_FILE"; exit 1
+# 5. Train Model (Weekly on Mondays, or if missing)
+MODEL_FILE="$PROJECT_ROOT/lab/flagship_alpha_momentum/model/live_model.joblib"
+DOW=$(date +%u)
+SHOULD_TRAIN=0
+
+if [ ! -f "$MODEL_FILE" ]; then
+  echo "[5/8] Model file missing, forcing training..." | tee -a "$LOG_FILE"
+  SHOULD_TRAIN=1
+elif [ "$DOW" -eq 1 ]; then
+  echo "[5/8] Today is Monday, scheduled weekly retraining..." | tee -a "$LOG_FILE"
+  SHOULD_TRAIN=1
+else
+  echo "[5/8] Not Monday and model exists, skipping retraining today." | tee -a "$LOG_FILE"
 fi
-CYCLE_LAST_STEP="5_train_daily_model"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
+
+if [ "$SHOULD_TRAIN" -eq 1 ]; then
+  echo "[5/8] Retraining Model (3-year window)..." | tee -a "$LOG_FILE"
+  STEP_START_TS="$(date +%s)"
+  $PYTHON_BIN flagship/paper_trading/train_daily_model.py --date "$TRADING_DATE" --strategy v7 >> "$LOG_FILE" 2>&1
+  if [ $? -ne 0 ]; then
+    CYCLE_RUNNING=0; CYCLE_SUCCESS=0; CYCLE_LAST_STEP="5_train_model"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
+    echo "ERROR: Model training failed." | tee -a "$LOG_FILE"; exit 1
+  fi
+  CYCLE_LAST_STEP="5_train_model"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
+fi
 
 # 6. Run Inference
 echo "[6/8] Generating Signals..." | tee -a "$LOG_FILE"
