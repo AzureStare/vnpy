@@ -66,7 +66,7 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
 
         eps: float = 1e-8
         
-        # 1. 计算基础趋势特征 (EMA 等)
+        # 1. 计算基础趋势特征 (EMA 等) 和 ADV
         df = df.sort(["vt_symbol", "datetime"])
         df = df.with_columns([
             pl.col("close_price").ewm_mean(span=5, adjust=False, min_samples=1).over("vt_symbol").alias("ema5"),
@@ -74,6 +74,12 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
             pl.col("close_price").ewm_mean(span=20, adjust=False, min_samples=1).over("vt_symbol").alias("ema20"),
             pl.col("close_price").ewm_mean(span=50, adjust=False, min_samples=1).over("vt_symbol").alias("ema50"),
         ])
+        
+        # 计算 ADV (30d median volume * close) 用于仓位管理
+        if "volume" in df.columns and "close_price" in df.columns:
+            df = df.with_columns([
+                 (pl.col("volume").rolling_median(window_size=30, min_periods=1).over("vt_symbol") * pl.col("close_price")).alias("adv_usd")
+            ])
         
         # atr_percent: ATR / Price
         if "atr_14" in df.columns:

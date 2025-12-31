@@ -259,18 +259,48 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             if spy_close > spy_trend_ma:
                 leverage = self.max_leverage 
                 
-        # 4. 执行买入
+        # 4. 动态信念加权 (Softmax) + 流动性约束
         if final_buy:
             total_equity = self.get_cash_available() + self.get_holding_value()
-            target_value_per_stock = (total_equity * leverage) / self.top_n
             
-            for row in final_buy:
+            # A. 计算 Softmax 权重
+            # V5 文档: W_i = exp(S_i * lambda) / sum(exp(S_j * lambda))
+            # S_i 应该是标准化后的分数，避免 exp 溢出
+            scores = np.array([x["signal"] for x in final_buy])
+            # Z-Score Standardize scores within the portfolio
+            if len(scores) > 1 and np.std(scores) > 0:
+                scores_norm = (scores - np.mean(scores)) / np.std(scores)
+            else:
+                scores_norm = np.zeros_like(scores) # Fallback to equal weight if std is 0
+                
+            lambda_param = 2.0
+            exp_scores = np.exp(scores_norm * lambda_param)
+            softmax_weights = exp_scores / np.sum(exp_scores)
+            
+            # B. 应用杠杆与分配资金
+            target_equity = total_equity * leverage
+            
+            for i, row in enumerate(final_buy):
                 symbol = row["vt_symbol"]
                 p = row["close_price"]
-                volume = round_to(target_value_per_stock / p, self.min_volume)
+                weight = softmax_weights[i]
+                
+                # 理论目标金额
+                target_val = target_equity * weight
+                
+                # C. 流动性硬约束 (1% ADV)
+                # 防止在重仓时遭遇流动性陷阱
+                adv = row.get("adv_usd", 0.0)
+                if adv > 0:
+                    max_val_liquidity = 0.01 * adv
+                    if target_val > max_val_liquidity:
+                        self.write_log(f"{symbol} 触发流动性约束: 目标 ${target_val:.0f} -> ${max_val_liquidity:.0f} (1% ADV)")
+                        target_val = max_val_liquidity
+                
+                volume = round_to(target_val / p, self.min_volume)
                 if volume > 0:
                     self.set_target(symbol, volume)
-                    self.trade_entry_reasons[symbol] = f"V7 Setup, Score={row['signal']:.3f}"
+                    self.trade_entry_reasons[symbol] = f"V7, Score={row['signal']:.3f}, W={weight:.1%}"
                     
         self.execute_trading(bars, price_add=self.price_add)
 

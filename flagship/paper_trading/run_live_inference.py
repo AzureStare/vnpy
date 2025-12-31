@@ -149,7 +149,7 @@ def run_live_inference(
     
     # 5. Export Signal
     # We need to include 'atr_14' and other cols for the strategy
-    select_cols = ["datetime", "vt_symbol", "atr_14", "close_price"]
+    select_cols = ["datetime", "vt_symbol", "atr_14", "close_price", "adv_usd"]
     
     # Add strategy-specific optional columns if they exist
     potential_cols = ["ema5", "ema10", "ema20", "ema50", "atr_percent", "alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "rs_10d", "beta"]
