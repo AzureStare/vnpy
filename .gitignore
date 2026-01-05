@@ -85,5 +85,6 @@ backtest_report/
 # .cursor
 .cursor/
 .cursor_project_rules/
+cursor_project_rules/
 NEW_ARCHITECTURE.md
 .gitignore
