@@ -374,3 +374,116 @@ def get_selected_symbols_in_range(start_date: date, end_date: date) -> list[str]
             rows = cur.fetchall()
             return [row[0] for row in rows]
 
+
+def create_users_table() -> None:
+    """创建用户表"""
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    role TEXT DEFAULT 'user', -- 'admin' or 'user'
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            logger.info("Created table: users")
+
+
+def add_user(username: str, password_hash: str, role: str = "user") -> bool:
+    """添加或更新用户"""
+    try:
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO users (username, password_hash, role) 
+                    VALUES (%s, %s, %s) 
+                    ON CONFLICT (username) DO UPDATE SET 
+                        password_hash=EXCLUDED.password_hash, 
+                        role=EXCLUDED.role
+                    """,
+                    (username, password_hash, role),
+                )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to add user: {e}")
+        return False
+
+
+def get_user(username: str) -> dict | None:
+    """获取用户信息"""
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username, password_hash, role FROM users WHERE username = %s", (username,))
+            row = cur.fetchone()
+            if row:
+                return {"username": row[0], "password_hash": row[1], "role": row[2]}
+    return None
+
+
+def list_users() -> list[dict]:
+    """列出所有用户"""
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username, role, created_at FROM users ORDER BY created_at")
+            rows = cur.fetchall()
+            return [{"username": r[0], "role": r[1], "created_at": r[2].isoformat()} for r in rows]
+
+
+def delete_user(username: str) -> bool:
+    """删除用户"""
+    try:
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM users WHERE username = %s", (username,))
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete user: {e}")
+        return False
+
+
+def create_daily_ranking_history_table() -> None:
+    """创建每日信号排名历史表"""
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS daily_ranking_history (
+                    trade_date DATE NOT NULL,
+                    vt_symbol TEXT NOT NULL,
+                    signal DOUBLE PRECISION,
+                    close_price DOUBLE PRECISION,
+                    adv_usd DOUBLE PRECISION,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (trade_date, vt_symbol)
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_daily_ranking_history_date 
+                    ON daily_ranking_history(trade_date);
+                
+                CREATE INDEX IF NOT EXISTS idx_daily_ranking_history_symbol 
+                    ON daily_ranking_history(vt_symbol);
+            """)
+            logger.info("Created table: daily_ranking_history")
+
+
+def save_daily_ranking_history(trade_date: date, ranking_data: list[dict[str, Any]]) -> None:
+    """保存每日排名历史"""
+    if not ranking_data:
+        return
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM daily_ranking_history WHERE trade_date = %s", (trade_date,))
+            values = [
+                (trade_date, r["vt_symbol"], r["signal"], r["close_price"], r["adv_usd"])
+                for r in ranking_data
+            ]
+            execute_values(
+                cur,
+                """
+                INSERT INTO daily_ranking_history (trade_date, vt_symbol, signal, close_price, adv_usd)
+                VALUES %s
+                """,
+                values
+            )
+

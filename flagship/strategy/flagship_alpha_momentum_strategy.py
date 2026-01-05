@@ -7,13 +7,12 @@ import numpy as np
 import pandas as pd
 import pytz
 
-from flagship.strategy.base_strategy import FlagshipBaseStrategy
-from vnpy.alpha.engine import AlphaEngine
+from vnpy.alpha.strategy import AlphaStrategy
 from vnpy.trader.constant import Direction, Interval, Offset, OrderType, Status
 from vnpy.trader.object import BarData, OrderData, TickData, TradeData
 from vnpy.trader.utility import BarGenerator
 
-class FlagshipAlphaMomentumStrategy(FlagshipBaseStrategy):
+class FlagshipAlphaMomentumStrategy(AlphaStrategy):
     """
     Flagship Alpha-Momentum Strategy V5 (Restored)
     

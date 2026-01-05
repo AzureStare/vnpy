@@ -277,6 +277,7 @@ def incremental_update(
     vt_symbols: list[str] | None = None,
     overlap_days: int = 1,
     max_symbols: int | None = None,
+    force_start_date: date | None = None,
 ) -> UpdateStats:
     client = create_polygon_client()
 
@@ -301,18 +302,19 @@ def incremental_update(
         file_path = folder / f"{vt_symbol}.parquet"
         last_dt = _max_datetime_from_parquet(file_path)
 
-        # 日线：如果已经有 end_date 当天的数据，直接跳过，避免对全市场重复打 Polygon 请求。
-        # 分钟：同一天仍可能持续产生新分钟，因此不按 date 直接跳过。
-        if last_dt is not None and interval == Interval.DAILY and last_dt.date() >= end_date:
+        if force_start_date:
+            start_date = force_start_date
+        elif last_dt is None:
+            # 没有历史：回溯 3 年作为默认补齐（或者根据需求调整）
+            start_date = end_date - timedelta(days=1095)
+        else:
+            # 增量起点：最后一天往前 overlap_days
+            start_date = last_dt.date() - timedelta(days=max(0, overlap_days))
+
+        # 日线优化：如果已经有 end_date 当天的数据且没强制指定开始日期，跳过
+        if not force_start_date and last_dt is not None and interval == Interval.DAILY and last_dt.date() >= end_date:
             skipped += 1
             continue
-
-        if last_dt is None:
-            # 没有历史：从 end_date 往前 overlap_days 作为最小增量（避免全量回灌）
-            start_date = end_date - timedelta(days=max(1, overlap_days))
-        else:
-            # 增量起点：最后一天往前 overlap_days（允许少量重复，AlphaLab 会去重）
-            start_date = last_dt.date() - timedelta(days=max(0, overlap_days))
 
         if start_date > end_date:
             skipped += 1
@@ -381,6 +383,7 @@ def main() -> None:
     parser.add_argument("--selection-end", type=str, help="YYYY-MM-DD (for daily_selection)")
     parser.add_argument("--vt-symbols", type=str, help="Comma-separated vt_symbols (for vt_symbols mode)")
 
+    parser.add_argument("--start-date", type=str, help="Force backfill from this date (YYYY-MM-DD)")
     parser.add_argument("--overlap-days", type=int, default=1)
     parser.add_argument("--max-symbols", type=int, default=None)
     args = parser.parse_args()
@@ -398,6 +401,8 @@ def main() -> None:
     if args.vt_symbols:
         vt_symbols = [s.strip() for s in args.vt_symbols.split(",") if s.strip()]
 
+    force_start_date = _parse_date(args.start_date) if args.start_date else None
+
     lab = AlphaLab(str(lab_path))
 
     if args.interval in ("daily", "both"):
@@ -411,6 +416,7 @@ def main() -> None:
             vt_symbols=vt_symbols,
             overlap_days=args.overlap_days,
             max_symbols=args.max_symbols,
+            force_start_date=force_start_date,
         )
         logger.info(f"[incremental_update] DAILY done: {stats}")
 
@@ -425,6 +431,7 @@ def main() -> None:
             vt_symbols=vt_symbols,
             overlap_days=args.overlap_days,
             max_symbols=args.max_symbols,
+            force_start_date=force_start_date,
         )
         logger.info(f"[incremental_update] MINUTE done: {stats}")
 

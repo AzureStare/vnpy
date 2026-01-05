@@ -108,13 +108,15 @@ if [ $? -ne 0 ]; then
 fi
 CYCLE_LAST_STEP="2_update_daily_full_market"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
 
-# Infer DATA_DATE (previous trading day close) from AlphaLab index daily parquet (SPY/QQQ)
-DATA_DATE="$($PYTHON_BIN - <<'PY'
+# Infer DATA_DATE (previous trading day close) if not already set
+if [ -z "$DATA_DATE" ] || [ "$DATA_DATE" = "unknown" ]; then
+  DATA_DATE="$($PYTHON_BIN - <<'PY'
 from flagship.paper_trading.config import LAB_PATH
 from flagship.paper_trading.trading_calendar import infer_data_date_from_lab
 print(infer_data_date_from_lab(LAB_PATH).isoformat())
 PY
 )"
+fi
 echo "TRADING_DATE=${TRADING_DATE} DATA_DATE=${DATA_DATE} HOLIDAY_MODE=${HOLIDAY_MODE}" | tee -a "$LOG_FILE"
 write_metrics
 
@@ -139,9 +141,9 @@ if [ "$HOLIDAY_MODE" = "1" ]; then
 fi
 
 # 3. Run Daily Selection (U_t based on DATA_DATE close)
-echo "[3/8] Running Daily Selection..." | tee -a "$LOG_FILE"
+echo "[3/8] Running Daily Selection (v7)..." | tee -a "$LOG_FILE"
 STEP_START_TS="$(date +%s)"
-$PYTHON_BIN flagship/paper_trading/run_daily_selection.py --date "$DATA_DATE" >> "$LOG_FILE" 2>&1
+$PYTHON_BIN flagship/paper_trading/run_daily_selection.py --date "$DATA_DATE" --strategy v7 >> "$LOG_FILE" 2>&1
 if [ $? -ne 0 ]; then
   CYCLE_RUNNING=0; CYCLE_SUCCESS=0; CYCLE_LAST_STEP="3_daily_selection"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
   echo "ERROR: Daily selection failed." | tee -a "$LOG_FILE"; exit 1
@@ -212,9 +214,9 @@ if [ "$SHOULD_TRAIN" -eq 1 ]; then
 fi
 
 # 6. Run Inference
-echo "[6/8] Generating Signals..." | tee -a "$LOG_FILE"
+echo "[6/8] Generating Signals (v7)..." | tee -a "$LOG_FILE"
 STEP_START_TS="$(date +%s)"
-$PYTHON_BIN flagship/paper_trading/run_live_inference.py --date "$DATA_DATE" >> "$LOG_FILE" 2>&1
+$PYTHON_BIN flagship/paper_trading/run_live_inference.py --date "$DATA_DATE" --strategy v7 >> "$LOG_FILE" 2>&1
 if [ $? -ne 0 ]; then
   CYCLE_RUNNING=0; CYCLE_SUCCESS=0; CYCLE_LAST_STEP="6_run_inference"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
   echo "ERROR: Inference failed." | tee -a "$LOG_FILE"; exit 1
@@ -232,9 +234,13 @@ fi
 CYCLE_LAST_STEP="6_5_recheck_lab_freshness"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
 
 # 7. Execute Orders (open rebalance)
-echo "[7/8] Executing Orders..." | tee -a "$LOG_FILE"
+echo "[7/8] Executing Orders (v7)..." | tee -a "$LOG_FILE"
 STEP_START_TS="$(date +%s)"
-$PYTHON_BIN flagship/paper_trading/alpaca_executor.py --use-polygon-ws >> "$LOG_FILE" 2>&1
+$PYTHON_BIN flagship/paper_trading/alpaca_executor.py \
+  --use-polygon-ws \
+  --strategy v7 \
+  --max-wait-seconds "${FLAGSHIP_EXECUTOR_MAX_WAIT_SECONDS:-259200}" \
+  >> "$LOG_FILE" 2>&1
 if [ $? -ne 0 ]; then
   CYCLE_RUNNING=0; CYCLE_SUCCESS=0; CYCLE_LAST_STEP="7_execute_orders"; CYCLE_LAST_STEP_DURATION=$(( $(date +%s) - STEP_START_TS )); write_metrics
   echo "ERROR: Execution failed." | tee -a "$LOG_FILE"; exit 1

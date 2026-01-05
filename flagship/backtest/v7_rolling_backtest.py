@@ -40,14 +40,16 @@ from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7D
 from flagship.model.train_flagship_lgb import build_lgb_dataset
 import lightgbm as lgb
 from flagship.scripts.pg_ticker_db import get_selected_symbols_in_range
+from flagship.backtest.flagship_alpha_momentum_backtest import run_backtest
 
 # Backtest Configuration
 LAB_PATH = Path("lab/flagship_alpha_momentum")
 MODEL_DIR = Path("flagship/models/backtest_v7_rolling")
 SIGNAL_DIR = Path("flagship/signals/backtest_v7_rolling")
 STEP_DAYS = 30 # Retrain every 30 days
-TRAIN_WINDOW = 730 # 2 Years
+TRAIN_WINDOW = 1095 # 3 Years
 EMBARGO_DAYS = 7
+BACKTEST_UNIVERSE_TOP_N = 8  # Limit minute-bar backtest universe to daily Top-N union for performance
 
 def train_model_for_window(
     train_start: date,
@@ -105,7 +107,7 @@ def train_model_for_window(
 
     # Features & Label
     label_col = "rank_5d" if "rank_5d" in sample_train.columns else "label"
-    feature_cols = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "beta", "atr_percent", "return_5d"]
+    feature_cols = ["alpha_mom", "alpha_vwap", "alpha_trend", "rs_score", "beta", "atr_percent", "return_5d"]
     # Filter available features
     feature_cols = [c for c in feature_cols if c in sample_train.columns]
     
@@ -186,8 +188,13 @@ def generate_signals_for_window(
     
     # Export
     # Include cols needed for strategy
+    # Ensure adv_usd exists, if not fallback to 0 (though factor script should provide it)
+    if "adv_usd" not in infer_df.columns:
+        logger.warning("adv_usd missing in infer_df, filling with 0")
+        infer_df = infer_df.with_columns(pl.lit(0.0).alias("adv_usd"))
+        
     cols_to_save = ["datetime", "vt_symbol", "atr_14", "close_price", "adv_usd"]
-    opt_cols = ["ema5", "ema10", "ema20", "ema50", "atr_percent", "alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "return_5d"]
+    opt_cols = ["ema5", "ema10", "ema20", "ema50", "atr_percent", "alpha_mom", "alpha_vwap", "alpha_trend", "rs_score", "return_5d"]
     for c in opt_cols:
         if c in infer_df.columns:
             cols_to_save.append(c)
@@ -208,6 +215,10 @@ def generate_signals_for_window(
 def run_rolling_backtest(start_date: str, end_date: str):
     start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
     end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+    
+    # Create directories
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    SIGNAL_DIR.mkdir(parents=True, exist_ok=True)
     
     lab = AlphaLab(str(LAB_PATH))
     current_dt = start_dt
@@ -256,20 +267,96 @@ def run_rolling_backtest(start_date: str, end_date: str):
     if not signal_files:
         logger.error("No signal files generated.")
         return
-        
-    full_df = pl.read_parquet(signal_files[0])
-    for p in signal_files[1:]:
-        full_df = pl.concat([full_df, pl.read_parquet(p)])
+
+    # NOTE:
+    # We may have schema drift across historical runs (e.g. rs_60d renamed to rs_score).
+    # Normalize columns before concatenation to avoid polars ShapeError.
+    dfs: list[pl.DataFrame] = []
+    all_cols: set[str] = set()
+
+    for p in signal_files:
+        df = pl.read_parquet(p)
+
+        # Normalize RS column naming
+        if "rs_60d" in df.columns and "rs_score" not in df.columns:
+            df = df.rename({"rs_60d": "rs_score"})
+        if "rs_score" in df.columns and "rs_60d" not in df.columns:
+            df = df.with_columns(pl.col("rs_score").alias("rs_60d"))
+
+        all_cols.update(df.columns)
+        dfs.append(df)
+
+    cols_order: list[str] = ["datetime", "vt_symbol"] + [
+        c for c in sorted(all_cols) if c not in ("datetime", "vt_symbol")
+    ]
+
+    aligned: list[pl.DataFrame] = []
+    for df in dfs:
+        missing = [c for c in cols_order if c not in df.columns]
+        if missing:
+            df = df.with_columns([pl.lit(None).alias(c) for c in missing])
+        aligned.append(df.select(cols_order))
+
+    full_df = pl.concat(aligned)
         
     full_df = full_df.sort(["datetime", "vt_symbol"]).unique(subset=["datetime", "vt_symbol"], keep="last")
     
     merged_path = SIGNAL_DIR / "v7_rolling_backtest_signals.parquet"
     full_df.write_parquet(merged_path)
     logger.info(f"Merged signals saved to {merged_path}")
+
+    # Also save to AlphaLab signal store so run_backtest can load it by name
+    try:
+        lab.save_signal("v7_rolling_backtest_signals", full_df)
+        logger.info("Saved merged signals to AlphaLab: v7_rolling_backtest_signals")
+    except Exception as exc:
+        logger.warning(f"Failed to save merged signals to AlphaLab: {exc}")
+
+    # Reduce minute-level backtest universe:
+    # BacktestingEngine loads ALL minute bars for vt_symbols upfront (very expensive).
+    # So we only keep the union of daily Top-N symbols across the backtest period.
+    backtest_vt_symbols: list[str] | None = None
+    try:
+        top_n = int(BACKTEST_UNIVERSE_TOP_N)
+        universe_df = (
+            full_df
+            .with_columns(pl.col("datetime").dt.date().alias("_trade_date"))
+            .filter(~pl.col("vt_symbol").is_in(["SPY.NASDAQ"]))
+            .sort(["_trade_date", "signal"], descending=[False, True])
+            .group_by("_trade_date", maintain_order=True)
+            .agg(pl.col("vt_symbol").head(top_n).alias("_top_symbols"))
+            .explode("_top_symbols")
+            .select(pl.col("_top_symbols").alias("vt_symbol"))
+            .unique()
+            .sort("vt_symbol")
+        )
+        backtest_vt_symbols = universe_df["vt_symbol"].to_list()
+        for s in ["SPY.NASDAQ", "VIX.CBOE", "VIX3M.CBOE"]:
+            if s not in backtest_vt_symbols:
+                backtest_vt_symbols.append(s)
+        backtest_vt_symbols = sorted(set(backtest_vt_symbols))
+        logger.info(
+            f"Minute backtest universe reduced: top_n={top_n}, vt_symbols={len(backtest_vt_symbols)}"
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to build reduced minute backtest universe, will use full signal universe: {exc}")
+        backtest_vt_symbols = None
     
-    # Run Backtesting Engine (Optional, need to implement BacktestingEngine call)
-    # For now, just generating signals is the heavy lifting.
-    # The user can then run a strategy backtest script using this signal file.
+    # Run Strategy Backtest Engine automatically
+    logger.info("Step 3: Running Strategy Backtest Engine...")
+    run_backtest(
+        lab_path=LAB_PATH,
+        start=datetime.combine(start_dt, datetime.min.time()),
+        end=datetime.combine(end_dt, datetime.max.time()),
+        interval=Interval.MINUTE,
+        signal_name="v7_rolling_backtest_signals",
+        strategy_version="v7",
+        strategy_setting={},  # keep V7 class defaults; avoid V5-style fallback defaults in run_backtest
+        vt_symbols=backtest_vt_symbols,
+        use_postgres_selection=False # Already filtered in signal gen
+    )
+    
+    logger.info("Rolling Backtest Workflow Finished Successfully.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

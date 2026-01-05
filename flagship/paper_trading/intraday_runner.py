@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -43,7 +44,7 @@ from flagship.paper_trading.polygon_ws import (
     polygon_ws_import_error,
 )
 from flagship.paper_trading.trading_calendar import get_holiday_info, is_market_closed_day
-from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
+from flagship.strategy.flagship_alpha_momentum_strategy_v7 import FlagshipAlphaMomentumStrategy
 
 try:
     # alpaca-py
@@ -103,10 +104,28 @@ def _build_watchlist(
     adapter: AlpacaAdapter,
     signal_df: pl.DataFrame | None,
     source: str,
+    signal_top_n: int,
 ) -> list[WatchedSymbol]:
     root_to_vt: dict[str, str] = {}
     if signal_df is not None:
-        for vt in signal_df["vt_symbol"].to_list():
+        df = signal_df
+
+        # Reduce signal-based subscriptions to Top-N by score (positions are always included).
+        if signal_top_n > 0 and "signal" in df.columns:
+            try:
+                df = df.sort("signal", descending=True).head(int(signal_top_n))
+            except Exception:
+                df = signal_df
+
+        # Always keep SPY for macro risk checks if present (even if not in Top-N)
+        try:
+            spy = signal_df.filter(pl.col("vt_symbol") == "SPY.NASDAQ")
+            if not spy.is_empty():
+                df = pl.concat([df, spy]).unique(subset=["vt_symbol"], keep="first")
+        except Exception:
+            pass
+
+        for vt in df["vt_symbol"].to_list():
             vt_str = str(vt)
             root = vt_str.split(".")[0]
             root_to_vt[root] = vt_str
@@ -384,6 +403,12 @@ def main() -> None:
         help="Which universe to subscribe/track.",
     )
     parser.add_argument(
+        "--signal-top-n",
+        type=int,
+        default=int(os.getenv("FLAGSHIP_INTRADAY_SIGNAL_TOPN", "10")),
+        help="Limit signal-based WS watchlist to Top-N symbols by score (default: 10). Positions are always included.",
+    )
+    parser.add_argument(
         "--rth-only",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -442,7 +467,7 @@ def main() -> None:
         logger.warning(f"[IntradayRunner] Signal not loaded: {exc}")
         signal_df = None
 
-    watched = _build_watchlist(lab, adapter, signal_df, args.symbols_source)
+    watched = _build_watchlist(lab, adapter, signal_df, args.symbols_source, int(args.signal_top_n))
     if not watched:
         raise RuntimeError("No symbols to track (empty watchlist).")
 

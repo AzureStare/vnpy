@@ -23,6 +23,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    ports:
+      - "8000:8000"
     environment:
       # Timezone for cron schedule
       TZ: America/New_York
@@ -34,18 +36,26 @@ services:
       DATABASE_USER: vnpy
       DATABASE_PASSWORD: "${POSTGRES_PASSWORD:-change_me}"
 
-      # Cron schedule inside container (default: 09:00 ET, Mon-Fri)
-      # Run after market close: 16:15 ET, Mon-Fri (15 minutes after 16:00 close)
+      # Cron schedule inside container:
+      # Run after market close (16:15 ET, Mon-Fri). The daily cycle will prepare signals and then
+      # alpaca_executor will wait for the next open to place orders.
       FLAGSHIP_CRON_SCHEDULE: "15 16 * * 1-5"
       FLAGSHIP_CRON_COMMAND: "/app/flagship/paper_trading/run_full_daily_cycle.sh"
+      # Start intraday runner shortly after open (exit-only, WS-based)
+      FLAGSHIP_CRON_SCHEDULE_INTRADAY: "35 9 * * 1-5"
+      FLAGSHIP_CRON_COMMAND_INTRADAY: "/app/flagship/paper_trading/start_intraday_runner.sh"
+      # Limit WS watchlist to Top-N signals (+ positions + SPY)
+      FLAGSHIP_INTRADAY_SIGNAL_TOPN: "10"
       # Portfolio heartbeat during RTH (every 5 minutes) - update portfolio + orders
       FLAGSHIP_CRON_SCHEDULE_PORTFOLIO: "*/5 9-16 * * 1-5"
-      FLAGSHIP_CRON_COMMAND_PORTFOLIO: "python /app/flagship/monitoring/app_console_snapshot.py portfolio orders"
+      FLAGSHIP_CRON_COMMAND_PORTFOLIO: "python /app/flagship/monitoring/app_console_snapshot.py portfolio orders market_status"
       # Prometheus node_exporter textfile collector output (host-mounted via ./logs)
       FLAGSHIP_TEXTFILE_DIR: "/app/logs/metrics"
     volumes:
       # Mount current directory for easy updates without rebuild
       - .:/app
+      # Override entrypoint for live updates (avoid rebuilding image for cron tweaks)
+      - ./entrypoint.sh:/entrypoint.sh:ro
       # Persist AlphaLab data and logs
       - ./lab:/app/lab
       - ./logs:/app/logs

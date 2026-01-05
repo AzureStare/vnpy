@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flagship Console - Login</title>
+  <style>
+    :root {
+      --bg: #f8f9fa;
+      --accent: #0d6efd;
+      --text: #212529;
+      --line: #dee2e6;
+    }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+    .login-card {
+      background: white;
+      padding: 40px;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+      width: 100%;
+      max-width: 400px;
+    }
+    h1 { margin: 0 0 24px; font-size: 24px; text-align: center; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; margin-bottom: 8px; font-size: 14px; font-weight: 600; }
+    input {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-size: 16px;
+      box-sizing: border-box;
+    }
+    .btn {
+      width: 100%;
+      padding: 12px;
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 12px;
+    }
+    .btn:hover { background: #0b5ed7; }
+    .error { color: #dc3545; font-size: 14px; margin-top: 12px; text-align: center; display: none; }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <h1>Flagship Login</h1>
+    <div id="error-msg" class="error">用户名或密码错误</div>
+    <form id="login-form">
+      <div class="form-group">
+        <label>Username</label>
+        <input type="text" id="username" required>
+      </div>
+      <div class="form-group">
+        <label>Password</label>
+        <input type="password" id="password" required>
+      </div>
+      <button type="submit" class="btn">Login</button>
+    </form>
+  </div>
+
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const user = document.getElementById('username').value;
+      const pass = document.getElementById('password').value;
+      const errorEl = document.getElementById('error-msg');
+
+      const formData = new FormData();
+      formData.append('username', user);
+      formData.append('password', pass);
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          body: formData
+        });
+        if (res.ok) {
+          const data = await res.json();
+          localStorage.setItem('flagship_token', data.access_token);
+          localStorage.setItem('flagship_role', data.role);
+          window.location.href = '/';
+        } else {
+          errorEl.style.display = 'block';
+        }
+      } catch (err) {
+        errorEl.textContent = '服务器连接失败';
+        errorEl.style.display = 'block';
+      }
+    });
+  </script>
+</body>
+</html>
+

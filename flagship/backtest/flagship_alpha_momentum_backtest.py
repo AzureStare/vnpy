@@ -25,11 +25,19 @@ from vnpy.trader.constant import Interval
 from vnpy.trader.logger import logger
 from vnpy.trader.setting import SETTINGS
 from vnpy.alpha import AlphaLab, BacktestingEngine
-from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
 from flagship.config import VT_SETTING_PATH
 from flagship.scripts.pg_ticker_db import get_pg_connection
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# 延迟导入策略类，以便根据参数选择
+def get_strategy_class(strategy_name: str):
+    if strategy_name.lower() == "v7":
+        from flagship.strategy.flagship_alpha_momentum_strategy_v7 import FlagshipAlphaMomentumStrategy as V7Strategy
+        return V7Strategy
+    else:
+        from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy as V5Strategy
+        return V5Strategy
 
 from flagship.backtest.backtest_session_alignment import (
     RegularTradingHoursFilteredAlphaLab,
@@ -407,6 +415,7 @@ def run_backtest(
     use_postgres_selection: bool = True,
     commission_rate: float | None = None,
     rth_only: bool | None = None,
+    strategy_version: str = "v5",
 ) -> dict[str, Any] | None:
     """
     运行 Flagship Alpha-Momentum 策略回测。
@@ -421,13 +430,15 @@ def run_backtest(
         risk_free: 无风险利率
         annual_days: 年化交易日数
         strategy_setting: 策略参数字典
-        commission_rate: 交易佣金费率（默认为 None，优先从 strategy_setting 读取，否则默认为 0.0）
+        commission_rate: 交易佣金费率（默认为 None，优先 from strategy_setting 读取，否则默认为 0.0）
+        strategy_version: 策略版本 ("v5" 或 "v7")
     """
     # 设置日志文件（必须在记录日志之前）
     log_path = setup_backtest_logging(lab_path, start, end, signal_name)
     
     logger.info("=" * 80)
     logger.info(f"[run_backtest] 开始运行回测")
+    logger.info(f"[run_backtest] 策略版本: {strategy_version}")
     logger.info(f"[run_backtest] Lab 路径: {lab_path}")
     logger.info(f"[run_backtest] 回测日期范围: {start} 到 {end}")
     logger.info(f"[run_backtest] K线周期: {interval}")
@@ -728,8 +739,9 @@ def run_backtest(
     logger.info(f"[run_backtest] 回测引擎参数设置完成")
 
     # 添加策略并运行回测
-    logger.info(f"[run_backtest] 添加策略: FlagshipAlphaMomentumStrategy")
-    engine.add_strategy(FlagshipAlphaMomentumStrategy, strategy_setting, signal_df)
+    strategy_class = get_strategy_class(strategy_version)
+    logger.info(f"[run_backtest] 添加策略: {strategy_class.__name__} (Version: {strategy_version})")
+    engine.add_strategy(strategy_class, strategy_setting, signal_df)
 
     logger.info(f"[run_backtest] 加载历史数据...")
     engine.load_data()
@@ -1520,6 +1532,13 @@ def main() -> None:
         type=float,
         help="交易佣金费率 (例如 0.0001 表示万分之一)",
     )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        choices=["v5", "v7"],
+        default="v5",
+        help="策略版本 (默认 v5)",
+    )
     args = parser.parse_args()
 
     interval = Interval.DAILY if args.interval == "daily" else Interval.MINUTE
@@ -1544,6 +1563,11 @@ def main() -> None:
     else:
         end = end_in
 
+    # 如果信号名包含 v7 且 strategy 是默认值 v5，自动切换到 v7
+    strategy_version = args.strategy
+    if "v7" in args.signal_name.lower() and strategy_version == "v5":
+        strategy_version = "v7"
+
     run_backtest(
         lab_path=args.lab_path,
         start=start,
@@ -1555,6 +1579,7 @@ def main() -> None:
         use_postgres_selection=args.use_postgres_selection,
         commission_rate=args.commission_rate,
         rth_only=rth_only,
+        strategy_version=strategy_version,
     )
 
 

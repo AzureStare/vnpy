@@ -49,6 +49,12 @@ alpha = [
     "torch>=2.6.0",
     "pyarrow>=19.0.1",
 ]
+app-console = [
+    "fastapi>=0.116.0",
+    "uvicorn>=0.35.0",
+    "python-jose[cryptography]>=3.3.0",
+    "python-multipart>=0.0.9",
+]
 dev = [
     "pandas-stubs>=2.2.3.250308",
     "hatchling>=1.27.0",

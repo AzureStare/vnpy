@@ -37,7 +37,7 @@ COPY flagship /app/flagship
 # - flagship code is imported by path (scripts insert PROJECT_ROOT into sys.path).
 RUN python -m pip install --upgrade pip setuptools wheel \
     && pip install ".[alpha]" \
-    && pip install polygon-api-client alpaca-py psycopg2-binary
+    && pip install polygon-api-client alpaca-py psycopg2-binary fastapi uvicorn python-jose[cryptography] python-multipart boto3
 
 # Runtime scripts
 COPY entrypoint.sh /entrypoint.sh

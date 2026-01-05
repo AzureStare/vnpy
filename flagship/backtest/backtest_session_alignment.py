@@ -11,11 +11,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime
+from pathlib import Path
 from typing import Any
 
 import polars as pl
 
 from vnpy.trader.constant import Interval
+from vnpy.trader.logger import logger
+from vnpy.trader.object import BarData
+from vnpy.trader.utility import extract_vt_symbol
 from vnpy.alpha import AlphaLab, BacktestingEngine
 
 
@@ -125,6 +129,119 @@ class RegularTradingHoursFilteredAlphaLab:
     def __init__(self, base: AlphaLab, *, rth_only: bool) -> None:
         self._base = base
         self._rth_only = rth_only
+        self._fallback_notice_emitted: bool = False
+
+    def _get_folder_path(self, interval: Interval) -> Path | None:
+        if interval == Interval.DAILY:
+            return self._base.daily_path
+        if interval == Interval.MINUTE:
+            return self._base.minute_path
+        return None
+
+    def _load_bars_from_parquet_as_vt_symbol(
+        self,
+        *,
+        vt_symbol: str,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+        parquet_path: Path,
+    ) -> list[BarData]:
+        """
+        Load parquet bars but label them as the requested vt_symbol.
+
+        This provides an exchange-suffix fallback (e.g. requested "BAC.NYSE" but only
+        "BAC.NASDAQ.parquet" exists). The underlying ticker data is the same; only the
+        filename suffix differs.
+        """
+        if not parquet_path.exists():
+            return []
+
+        df = pl.read_parquet(parquet_path)
+        df = df.filter((pl.col("datetime") >= start) & (pl.col("datetime") <= end))
+        if df.is_empty():
+            return []
+
+        symbol, exchange = extract_vt_symbol(vt_symbol)
+
+        bars: list[BarData] = []
+        for row in df.iter_rows(named=True):
+            bars.append(
+                BarData(
+                    symbol=symbol,
+                    exchange=exchange,
+                    datetime=row["datetime"],
+                    interval=interval,
+                    open_price=row["open"],
+                    high_price=row["high"],
+                    low_price=row["low"],
+                    close_price=row["close"],
+                    volume=row.get("volume", 0),
+                    turnover=row.get("turnover", 0),
+                    open_interest=row.get("open_interest", 0),
+                    gateway_name="DB",
+                )
+            )
+        return bars
+
+    def _load_bar_data_with_exchange_fallback(
+        self,
+        vt_symbol: str,
+        interval: Interval,
+        start: datetime,
+        end: datetime,
+    ) -> list[Any]:
+        folder_path = self._get_folder_path(interval)
+        if folder_path is None:
+            return self._base.load_bar_data(vt_symbol, interval, start, end)
+
+        primary_file = folder_path.joinpath(f"{vt_symbol}.parquet")
+        if primary_file.exists():
+            return self._base.load_bar_data(vt_symbol, interval, start, end)
+
+        # Fallback by symbol (keep requested exchange in returned BarData)
+        # vt_symbol may contain dots inside symbol itself (e.g. "BRK.B.NYSE"),
+        # so always split on the last dot.
+        symbol_part = vt_symbol.rsplit(".", 1)[0]
+
+        # Prefer NASDAQ as historical lab data may be stored with NASDAQ suffix.
+        preferred_exchanges = ("NASDAQ", "NYSE", "AMEX", "BATS", "IEX")
+        for ex in preferred_exchanges:
+            candidate = folder_path.joinpath(f"{symbol_part}.{ex}.parquet")
+            if candidate.exists():
+                if not self._fallback_notice_emitted:
+                    logger.info(
+                        "[AlphaLab fallback] Detected exchange-suffix mismatch in parquet filenames "
+                        "(e.g. requested *.NYSE but only *.NASDAQ exists). Using symbol-only fallback."
+                    )
+                    self._fallback_notice_emitted = True
+                return self._load_bars_from_parquet_as_vt_symbol(
+                    vt_symbol=vt_symbol,
+                    interval=interval,
+                    start=start,
+                    end=end,
+                    parquet_path=candidate,
+                )
+
+        # Last resort: any matching file
+        any_candidates = sorted(folder_path.glob(f"{symbol_part}.*.parquet"))
+        if any_candidates:
+            candidate = any_candidates[0]
+            if not self._fallback_notice_emitted:
+                logger.info(
+                    "[AlphaLab fallback] Detected exchange-suffix mismatch in parquet filenames "
+                    "(e.g. requested *.NYSE but only *.NASDAQ exists). Using symbol-only fallback."
+                )
+                self._fallback_notice_emitted = True
+            return self._load_bars_from_parquet_as_vt_symbol(
+                vt_symbol=vt_symbol,
+                interval=interval,
+                start=start,
+                end=end,
+                parquet_path=candidate,
+            )
+
+        return []
 
     def load_bar_data(
         self,
@@ -133,7 +250,7 @@ class RegularTradingHoursFilteredAlphaLab:
         start: datetime,
         end: datetime,
     ) -> list[Any]:
-        bars = self._base.load_bar_data(vt_symbol, interval, start, end)
+        bars = self._load_bar_data_with_exchange_fallback(vt_symbol, interval, start, end)
         if self._rth_only and interval == Interval.MINUTE:
             bars = [
                 bar

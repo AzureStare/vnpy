@@ -252,3 +252,268 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
         if vix_bar and vix3m_bar and vix_bar.close_price > 0 and vix3m_bar.close_price > 0:
             return vix_bar.close_price / vix3m_bar.close_price
         return None
+
+    def _cache_daily_indicators(self, signal_df: pl.DataFrame) -> None:
+        """
+        缓存信号文件中的日级指标（用于分钟级止盈止损）。
+
+        说明：
+        - 策略分钟级 exit 会优先用 ArrayManager 的实时 EMA；若未 inited，则回退到这里缓存的日级 EMA。
+        - adv_usd 用于 1% ADV 流动性硬约束。
+        """
+        if signal_df.is_empty() or "vt_symbol" not in signal_df.columns:
+            return
+
+        candidate_cols = [
+            "atr_14",
+            "ema5",
+            "ema10",
+            "ema20",
+            "ema50",
+            "atr_percent",
+            "close_price",
+            "adv_usd",
+        ]
+        indicator_cols = [c for c in candidate_cols if c in signal_df.columns]
+        if not indicator_cols:
+            return
+
+        for row in signal_df.select(["vt_symbol", *indicator_cols]).iter_rows(named=True):
+            vt_symbol = row["vt_symbol"]
+            indicators: dict[str, float] = {}
+            for c in indicator_cols:
+                v = row.get(c)
+                if v is None:
+                    continue
+                try:
+                    indicators[c] = float(v)
+                except Exception:
+                    continue
+            if indicators:
+                self.daily_indicators[vt_symbol] = indicators
+
+    def _is_risk_off(self, signal_df: pl.DataFrame, bars: dict[str, BarData]) -> bool:
+        """
+        风险关闭模式：
+        - 触发条件：SPY < EMA20
+        - 动作：停止新开仓（止盈止损仍按分钟执行）
+        """
+        try:
+            spy_df = signal_df.filter(pl.col("vt_symbol") == "SPY.NASDAQ")
+            if not spy_df.is_empty() and "close_price" in spy_df.columns and "ema20" in spy_df.columns:
+                spy_close = spy_df["close_price"][0]
+                spy_ema20 = spy_df["ema20"][0]
+                if spy_close is not None and spy_ema20 is not None and float(spy_close) < float(spy_ema20):
+                    return True
+        except Exception:
+            pass
+
+        # Fallback to intraday EMA20 if daily signal missing
+        spy_bar = bars.get("SPY.NASDAQ")
+        if spy_bar and self.spy_ema20 is not None and spy_bar.close_price < self.spy_ema20:
+            return True
+
+        return False
+
+    def _get_target_leverage(self, signal_df: pl.DataFrame, bars: dict[str, BarData]) -> float:
+        """
+        杠杆模式：
+        - 条件：SPY > EMA50 时，允许上调至 max_leverage；否则保持 1.0。
+        """
+        leverage: float = 1.0
+        try:
+            spy_df = signal_df.filter(pl.col("vt_symbol") == "SPY.NASDAQ")
+            if not spy_df.is_empty() and "close_price" in spy_df.columns and "ema50" in spy_df.columns:
+                spy_close = spy_df["close_price"][0]
+                spy_ema50 = spy_df["ema50"][0]
+                if spy_close is not None and spy_ema50 is not None and float(spy_close) > float(spy_ema50):
+                    leverage = float(self.max_leverage)
+        except Exception:
+            pass
+
+        return leverage
+
+    def _build_candidate_df(
+        self,
+        signal_df: pl.DataFrame,
+        *,
+        exclude_symbols: set[str],
+        top_k: int = 50,
+    ) -> pl.DataFrame:
+        """从信号中构建候选列表（按 signal 降序，取 Top K）。"""
+        if signal_df.is_empty() or "signal" not in signal_df.columns:
+            return pl.DataFrame()
+
+        excluded = set(exclude_symbols)
+        excluded.update({"SPY.NASDAQ", "VIX.CBOE", "VIX3M.CBOE"})
+
+        df = signal_df
+        if excluded:
+            df = df.filter(~pl.col("vt_symbol").is_in(list(excluded)))
+
+        df = df.filter(pl.col("signal") >= float(self.min_score_threshold))
+        df = df.sort("signal", descending=True)
+        return df.head(top_k)
+
+    def _compute_softmax_weights(
+        self,
+        *,
+        signal_df: pl.DataFrame,
+        target_symbols: list[str],
+        lambda_: float = 2.0,
+    ) -> dict[str, float]:
+        """
+        Softmax 权重（Dynamic Conviction Weighting）：
+        - 先对当日截面 signal 做 z-score
+        - 再做 softmax(exp(z * lambda))
+        """
+        if not target_symbols:
+            return {}
+
+        # Missing signal column => equal weight
+        if signal_df.is_empty() or "signal" not in signal_df.columns:
+            equal = 1.0 / float(len(target_symbols))
+            return {s: equal for s in target_symbols}
+
+        # Cross-sectional mean/std
+        try:
+            series = signal_df.select(pl.col("signal").cast(pl.Float64)).to_series()
+            mean_signal = float(series.mean())
+            std_signal = float(series.std())
+        except Exception:
+            mean_signal = 0.0
+            std_signal = 1.0
+
+        if std_signal <= 1e-12:
+            std_signal = 1.0
+
+        subset = (
+            signal_df
+            .filter(pl.col("vt_symbol").is_in(target_symbols))
+            .select(["vt_symbol", "signal"])
+        )
+
+        if subset.is_empty():
+            equal = 1.0 / float(len(target_symbols))
+            return {s: equal for s in target_symbols}
+
+        symbols: list[str] = []
+        zscores: list[float] = []
+        for row in subset.iter_rows(named=True):
+            sym = row["vt_symbol"]
+            val = row.get("signal")
+            if val is None:
+                continue
+            symbols.append(sym)
+            zscores.append((float(val) - mean_signal) / std_signal)
+
+        if not symbols:
+            equal = 1.0 / float(len(target_symbols))
+            return {s: equal for s in target_symbols}
+
+        z_arr = np.asarray(zscores, dtype=float) * float(lambda_)
+        z_arr = z_arr - float(np.max(z_arr))  # stable softmax
+        exp_scores = np.exp(z_arr)
+        denom = float(exp_scores.sum())
+        if denom <= 0:
+            equal = 1.0 / float(len(symbols))
+            weights = {s: equal for s in symbols}
+        else:
+            weights = {symbols[i]: float(exp_scores[i] / denom) for i in range(len(symbols))}
+
+        # Ensure all targets have a key
+        for s in target_symbols:
+            weights.setdefault(s, 0.0)
+        return weights
+
+    def _run_daily_rebalance(self, bars: dict[str, BarData]) -> None:
+        """
+        每日调仓：
+        - 候选：当日信号 Top 50
+        - 组合：最多 top_n，优先保留已有持仓，不强制因排名掉出而卖出（让利润奔跑）
+        - 新开仓：risk-off（SPY < EMA20）时禁止新开仓
+        - 仓位：Softmax 权重 + 杠杆模式（SPY > EMA50） + 1% ADV 约束
+        """
+        current_date: date
+        if self.current_trade_date is not None:
+            current_date = self.current_trade_date
+        else:
+            first_bar = next(iter(bars.values()))
+            current_date = first_bar.datetime.replace(tzinfo=None).date()
+
+        # SignalResolver 会将 minute dt 映射到 trade_date snapshot
+        signal_df = self.get_signal()
+        if signal_df is None or signal_df.is_empty():
+            self.write_log(f"[rebalance] {current_date} no signal, skip")
+            return
+
+        # Tradeable subset for this backtest run (avoid targeting symbols without bars)
+        tradable_set = set(self.vt_symbols)
+        tradable_df = (
+            signal_df.filter(pl.col("vt_symbol").is_in(list(tradable_set)))
+            if tradable_set
+            else signal_df
+        )
+
+        # Cache daily indicators (for exits & adv cap)
+        self._cache_daily_indicators(tradable_df)
+
+        # Risk-Off mode: stop new buys
+        if self._is_risk_off(signal_df, bars):
+            self.write_log(f"[rebalance] {current_date} Risk-Off (SPY < EMA20): skip new entries")
+            return
+
+        # Current holdings (exclude indices)
+        index_symbols = {"SPY.NASDAQ", "VIX.CBOE", "VIX3M.CBOE"}
+        held_symbols = [s for s, p in self.pos_data.items() if p > 0 and s not in index_symbols]
+
+        # Candidate list: Top 50 by model signal, excluding holdings
+        candidate_df = self._build_candidate_df(tradable_df, exclude_symbols=set(held_symbols), top_k=50)
+
+        # Add new positions up to top_n
+        slots = max(0, int(self.top_n) - len(held_symbols))
+        new_symbols: list[str] = []
+        if slots > 0 and not candidate_df.is_empty():
+            new_symbols = candidate_df.head(slots)["vt_symbol"].to_list()
+
+        target_symbols: list[str] = list(held_symbols) + list(new_symbols)
+        if not target_symbols:
+            self.write_log(f"[rebalance] {current_date} no target symbols, skip")
+            return
+
+        # Softmax weights (lambda=2.0) on daily cross-section z-scored signal
+        weights = self._compute_softmax_weights(signal_df=signal_df, target_symbols=target_symbols, lambda_=2.0)
+
+        # Leverage regime
+        target_leverage = self._get_target_leverage(signal_df, bars)
+        gross_exposure = min(float(self.max_leverage), float(target_leverage)) * float(self.cash_ratio)
+
+        portfolio_value = self.get_portfolio_value()
+        for vt_symbol in target_symbols:
+            bar = bars.get(vt_symbol)
+            if not bar or bar.close_price <= 0:
+                continue
+
+            w = float(weights.get(vt_symbol, 0.0))
+            if w <= 0:
+                continue
+
+            target_value = portfolio_value * gross_exposure * w
+
+            # Liquidity hard constraint: position value <= 1% ADV
+            adv_usd = self.daily_indicators.get(vt_symbol, {}).get("adv_usd")
+            if adv_usd is not None and adv_usd > 0:
+                max_position_value = adv_usd * 0.01
+                target_value = min(target_value, max_position_value)
+
+            target_volume = int(target_value / bar.close_price)
+            if target_volume <= 0:
+                continue
+
+            self.set_target(vt_symbol, target_volume)
+
+        self.execute_trading(bars, price_add=self.price_add)
+        self.write_log(
+            f"[rebalance] {current_date} held={len(held_symbols)} new={len(new_symbols)} "
+            f"targets={len(target_symbols)} gross_exposure={gross_exposure:.2f}"
+        )

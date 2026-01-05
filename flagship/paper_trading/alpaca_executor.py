@@ -445,7 +445,17 @@ def main():
         default=True,
         help="Wait until market open before placing orders (default: true).",
     )
-    parser.add_argument("--max-wait-seconds", type=int, default=10 * 3600, help="Max seconds to wait for open.")
+    # NOTE:
+    # This executor is commonly triggered after market close (e.g. 16:15 ET) to prepare signals,
+    # then wait until the next market open to place rebalance orders. 10 hours is NOT enough for
+    # an overnight gap (and never enough for a weekend). Use a larger default to avoid silently
+    # timing out and skipping the open.
+    parser.add_argument(
+        "--max-wait-seconds",
+        type=int,
+        default=72 * 3600,  # ~3 days, covers Fri close -> Mon open and most holidays
+        help="Max seconds to wait for next market open before skipping execution.",
+    )
     parser.add_argument(
         "--cancel-open-orders",
         action=argparse.BooleanOptionalAction,

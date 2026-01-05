@@ -152,7 +152,7 @@ def run_live_inference(
     select_cols = ["datetime", "vt_symbol", "atr_14", "close_price", "adv_usd"]
     
     # Add strategy-specific optional columns if they exist
-    potential_cols = ["ema5", "ema10", "ema20", "ema50", "atr_percent", "alpha_mom", "alpha_vwap", "alpha_trend", "rs_60d", "rs_10d", "beta", "return_5d"]
+    potential_cols = ["ema5", "ema10", "ema20", "ema50", "atr_percent", "alpha_mom", "alpha_vwap", "alpha_trend", "rs_score", "rs_10d", "beta", "return_5d"]
     for col in potential_cols:
         if col in target_df.columns:
             select_cols.append(col)
@@ -167,6 +167,46 @@ def run_live_inference(
     signal_df.write_parquet(output_file)
     
     logger.info(f"[run_live_inference] Saved {len(signal_df)} signals to {output_file}")
+
+    # 6. Save Top 50 Ranking to Postgres daily_ranking_history
+    try:
+        from flagship.scripts.pg_ticker_db import get_pg_connection, get_ticker_market_caps_batch
+        top_50 = signal_df.sort("signal", descending=True).head(50)
+        
+        # Batch fetch market caps for these 50 symbols
+        symbols_only = [s.split(".")[0] for s in top_50["vt_symbol"].to_list()]
+        market_caps = get_ticker_market_caps_batch(symbols_only, target_date)
+        
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                # Clear existing for same date
+                cur.execute("DELETE FROM daily_ranking_history WHERE trade_date = %s", (target_date,))
+                
+                rows = []
+                for i, row in enumerate(top_50.iter_rows(named=True)):
+                    raw_sym = row["vt_symbol"].split(".")[0]
+                    mkt_cap = market_caps.get(raw_sym)
+                    
+                    rows.append((
+                        target_date,
+                        row["vt_symbol"],
+                        float(row["signal"]),
+                        i + 1,
+                        float(row["close_price"]),
+                        mkt_cap,
+                        float(row.get("adv_usd") or 0.0)
+                    ))
+                
+                from psycopg2.extras import execute_values
+                execute_values(cur, """
+                    INSERT INTO daily_ranking_history (trade_date, vt_symbol, signal_score, rank_pos, close_price, market_cap, adv_usd)
+                    VALUES %s
+                """, rows)
+                conn.commit()
+        logger.info(f"[run_live_inference] Saved Top 50 rankings to Postgres for {target_date} (incl. MarketCap)")
+    except Exception as exc:
+        logger.error(f"[run_live_inference] Failed to save rankings to Postgres: {exc}")
+
     logger.info("[run_live_inference] Done.")
 
 if __name__ == "__main__":

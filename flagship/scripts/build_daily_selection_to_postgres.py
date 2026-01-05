@@ -1,11 +1,6 @@
 """
 从 AlphaLab 日线数据批量生成日度选股结果并保存到 PostgreSQL。
-
-基于 Flagship Alpha-Momentum v4.0 策略文档的筛选逻辑：
-- ADV >= $2.5亿（成交量中位数 × 收盘价）
-- 价格范围：$20 - $600
-- MA50趋势过滤（在因子计算阶段应用）
-- 相对强度过滤（在因子计算阶段应用）
+优化版：按股票处理数据，大幅提升多日期范围下的处理速度。
 """
 from __future__ import annotations
 
@@ -44,6 +39,7 @@ def create_daily_selection_table() -> None:
                     close_price DOUBLE PRECISION,
                     adv_usd DOUBLE PRECISION,
                     med_volume BIGINT,
+                    market_cap DOUBLE PRECISION,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (trade_date, vt_symbol)
                 );
@@ -58,250 +54,24 @@ def create_daily_selection_table() -> None:
 
 
 def get_valid_common_stocks() -> set[str]:
-    """
-    从PostgreSQL的ref_tickers表获取所有有效的common stock列表。
-    
-    Returns:
-        包含所有ticker_type='CS'的股票symbol集合（格式：SYMBOL.EXCHANGE）
-    """
+    """从PostgreSQL获取有效的Common Stock列表"""
     try:
-        ref_tickers = get_ref_tickers(
-            market="stocks",
-            locale="us",
-            ticker_type="CS",  # 只选择Common Stock
-            active=True,
-        )
-        
-        # Exchange映射：从Polygon的exchange代码映射到vnpy的Exchange枚举
-        EXCHANGE_MAP = {
-            "XNAS": "NASDAQ",
-            "NASDAQ": "NASDAQ",
-            "XNYS": "NYSE",
-            "NYSE": "NYSE",
-            "XASE": "AMEX",
-            "AMEX": "AMEX",
-            "BATS": "BATS",
-            "IEXG": "IEX",
-        }
-        
-        # 构建vt_symbol集合（symbol + exchange）
+        ref_tickers = get_ref_tickers(market="stocks", locale="us", ticker_type="CS", active=True)
+        EXCHANGE_MAP = {"XNAS": "NASDAQ", "NASDAQ": "NASDAQ", "XNYS": "NYSE", "NYSE": "NYSE", "XASE": "AMEX", "AMEX": "AMEX", "BATS": "BATS", "IEXG": "IEX"}
         valid_symbols = set()
         for ticker in ref_tickers:
             symbol = ticker["symbol"]
             primary_exchange = ticker.get("primary_exchange", "")
-            
-            # 映射exchange
-            exchange = EXCHANGE_MAP.get(primary_exchange, "NASDAQ")  # 默认NASDAQ
-            
-            vt_symbol = f"{symbol}.{exchange}"
-            valid_symbols.add(vt_symbol)
-        
+            exchange = EXCHANGE_MAP.get(primary_exchange, "NASDAQ")
+            valid_symbols.add(f"{symbol}.{exchange}")
         logger.info(f"从PostgreSQL加载了 {len(valid_symbols)} 只Common Stock")
         return valid_symbols
-    
     except Exception as exc:
         logger.error(f"从PostgreSQL加载ref_tickers失败: {exc}")
-        logger.warning("将使用空集合，所有股票将被过滤")
         return set()
 
 
-def filter_universe_from_lab(
-    lab: AlphaLab,
-    trade_date: date,
-    min_adv_usd: float = 4.0e7,
-    min_price: float = 10.0,
-    max_price: float = 1000000.0,
-    min_market_cap: float = 2.0e9,
-    max_market_cap: float = 100.0e9,
-) -> list[dict[str, Any]]:
-    """
-    从 AlphaLab 日线数据筛选指定日期的股票池。
-    
-    根据策略文档 V7.0 要求：
-    - ADV >= $4000万（成交量中位数 × 收盘价）
-    - 价格范围：>= $10
-    - 市值范围：$2B - $100B
-    - 基础趋势：Price > MA50
-    - 排除 OTC、ETPs（ETF/ETN）、ADRs
-    """
-    logger.info(f"[{trade_date}] 开始从 lab 筛选股票池 (V7.0 Aggressive)...")
-    
-    # 先从PostgreSQL获取所有有效的Common Stock列表
-    valid_common_stocks = get_valid_common_stocks()
-    if not valid_common_stocks:
-        logger.warning(f"[{trade_date}] 未找到有效的Common Stock列表，无法进行筛选")
-        return []
-    
-    # 获取所有日线文件
-    daily_files = sorted(lab.daily_path.glob("*.parquet"))
-    logger.info(f"[{trade_date}] 发现 {len(daily_files)} 个日线文件")
-    
-    # 批量获取市值数据
-    from flagship.scripts.pg_ticker_db import get_pg_connection
-    raw_symbols = [s.split(".")[0] for s in valid_common_stocks]
-    market_caps = {}
-    with get_pg_connection() as conn:
-        with conn.cursor() as cur:
-            # 获取每个 symbol 在 trade_date 或之前的最新市值
-            # 注意：这在数万只股票上可能较慢，但 valid_common_stocks 只有 5000 只，可以接受
-            cur.execute("""
-                SELECT DISTINCT ON (symbol) symbol, market_cap
-                FROM ticker_daily_fundamentals
-                WHERE symbol = ANY(%s) AND as_of_date <= %s
-                ORDER BY symbol, as_of_date DESC;
-            """, (raw_symbols, trade_date))
-            market_caps = {row[0]: row[1] for row in cur.fetchall() if row[1] is not None}
-    
-    # 计算需要的历史数据范围（需要过去50天计算MA50）
-    lookback_start = trade_date - timedelta(days=90)
-    
-    passed_symbols: list[dict[str, Any]] = []
-    metric_fail = liquidity_fail = price_fail = market_cap_fail = not_cs_fail = trend_fail = 0
-    
-    for idx, file_path in enumerate(daily_files, start=1):
-        vt_symbol = file_path.stem
-        
-        # 只处理PostgreSQL中标记为Common Stock的股票
-        if vt_symbol not in valid_common_stocks:
-            not_cs_fail += 1
-            continue
-        
-        # 市值筛选
-        raw_symbol = vt_symbol.split(".")[0]
-        mkt_cap = market_caps.get(raw_symbol)
-        if mkt_cap is None or not (min_market_cap <= mkt_cap <= max_market_cap):
-            market_cap_fail += 1
-            continue
-
-        try:
-            # 读取日线数据
-            df = pl.read_parquet(file_path)
-            if df.is_empty() or "datetime" not in df.columns:
-                metric_fail += 1
-                continue
-            
-            # 过滤日期范围
-            trade_date_dt = datetime.combine(trade_date, datetime.min.time())
-            lookback_start_dt = datetime.combine(lookback_start, datetime.min.time())
-            
-            df = df.filter(
-                (pl.col("datetime") >= pl.lit(lookback_start_dt)) &
-                (pl.col("datetime") <= pl.lit(trade_date_dt))
-            ).sort("datetime")
-            
-            # 检查是否有 trade_date 当天的数据
-            trade_date_rows = df.filter(pl.col("datetime").dt.date() == trade_date)
-            if trade_date_rows.is_empty():
-                metric_fail += 1
-                continue
-            
-            # 至少需要50天的数据计算MA50
-            if df.height < 50:
-                metric_fail += 1
-                continue
-            
-            # 提取收盘价和成交量
-            closes = df["close"].to_list()
-            volumes = df["volume"].to_list()
-            
-            # 计算指标（使用 trade_date 当天的收盘价）
-            last_close = closes[-1]
-            
-            # 取过去30天的成交量中位数
-            recent_volumes = volumes[-30:]
-            med_vol = statistics.median(recent_volumes)
-            adv_usd = med_vol * last_close
-            
-            # 流动性筛选
-            if adv_usd < min_adv_usd:
-                liquidity_fail += 1
-                continue
-            
-            # 价格筛选
-            if not (min_price <= last_close <= max_price):
-                price_fail += 1
-                continue
-            
-            # 基础趋势过滤：Price > MA50
-            ma50 = sum(closes[-50:]) / 50.0
-            if last_close <= ma50:
-                trend_fail += 1
-                continue
-            
-            passed_symbols.append({
-                "vt_symbol": vt_symbol,
-                "close_price": last_close,
-                "adv_usd": adv_usd,
-                "med_volume": int(med_vol),
-            })
-        
-        except Exception:
-            metric_fail += 1
-            continue
-        
-        if idx % 1000 == 0:
-            logger.info(
-                f"[{trade_date}] Progress {idx}/{len(daily_files)}: "
-                f"passed={len(passed_symbols)}, "
-                f"fail:metric={metric_fail},liquidity={liquidity_fail},price={price_fail},cap={market_cap_fail},trend={trend_fail}"
-            )
-    
-    logger.info(
-        f"[{trade_date}] 筛选完成: passed={len(passed_symbols)}, "
-        f"metric_fail={metric_fail}, liquidity_fail={liquidity_fail}, price_fail={price_fail}, market_cap_fail={market_cap_fail}, trend_fail={trend_fail}"
-    )
-    
-    return passed_symbols
-
-
-def save_selection_to_postgres(
-    trade_date: date,
-    selections: list[dict[str, Any]],
-) -> None:
-    """将选股结果保存到PostgreSQL"""
-    if not selections:
-        logger.warning(f"[{trade_date}] 没有选股结果，跳过保存")
-        return
-    
-    with get_pg_connection() as conn:
-        with conn.cursor() as cur:
-            # 先删除该日期的旧数据（如果存在）
-            cur.execute(
-                "DELETE FROM daily_selection WHERE trade_date = %s",
-                (trade_date,)
-            )
-            
-            # 批量插入新数据
-            values = [
-                (
-                    trade_date,
-                    sel["vt_symbol"],
-                    sel["close_price"],
-                    sel["adv_usd"],
-                    sel["med_volume"],
-                )
-                for sel in selections
-            ]
-            
-            from psycopg2.extras import execute_values
-            execute_values(
-                cur,
-                """
-                INSERT INTO daily_selection (trade_date, vt_symbol, close_price, adv_usd, med_volume)
-                VALUES %s
-                ON CONFLICT (trade_date, vt_symbol) DO UPDATE SET
-                    close_price = EXCLUDED.close_price,
-                    adv_usd = EXCLUDED.adv_usd,
-                    med_volume = EXCLUDED.med_volume,
-                    created_at = CURRENT_TIMESTAMP
-                """,
-                values,
-            )
-            
-            logger.info(f"[{trade_date}] 已保存 {len(selections)} 只股票到PostgreSQL")
-
-
-def build_selection_for_date_range(
+def build_selection_optimized(
     start_date: date,
     end_date: date,
     lab_dir: Path,
@@ -310,139 +80,235 @@ def build_selection_for_date_range(
     max_price: float = 1000000.0,
     min_market_cap: float = 2.0e9,
     max_market_cap: float = 100.0e9,
+    force: bool = False
 ) -> None:
-    """
-    为日期范围内的每个交易日生成选股结果并保存到PostgreSQL。
-    """
+    """优化版：支持增量更新，按股票文件读取，大幅提升效率"""
     logger.info("=" * 80)
-    logger.info(f"批量生成日度选股结果并保存到PostgreSQL (V7.0 Aggressive)")
-    logger.info(f"日期范围: {start_date} 到 {end_date}")
-    logger.info(f"Lab 目录: {lab_dir}")
-    logger.info(f"筛选参数: ADV >= {min_adv_usd}, Price >= {min_price}, Cap: {min_market_cap}-{max_market_cap}")
-    logger.info("=" * 80)
+    logger.info(f"优化版：生成选股结果 ({start_date} 到 {end_date})")
     
-    # 创建表（如果不存在）
     create_daily_selection_table()
-    
-    # 初始化 AlphaLab
     lab = AlphaLab(str(lab_dir))
+    valid_common_stocks = get_valid_common_stocks()
+    daily_files = sorted(lab.daily_path.glob("*.parquet"))
     
-    # 遍历每个交易日
-    current_date = start_date
-    total_days = 0
-    processed_days = 0
-    skipped_days = 0
+    # 1. 预加载已有的选股结果，用于增量跳过
+    existing_keys = set()
+    if not force:
+        logger.info("正在查询数据库已有的选股记录 (增量模式)...")
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT trade_date, vt_symbol FROM daily_selection 
+                    WHERE trade_date >= %s AND trade_date <= %s AND market_cap IS NOT NULL
+                """, (start_date, end_date))
+                for dt, sym in cur.fetchall():
+                    existing_keys.add((dt, sym))
+        logger.info(f"数据库已存在 {len(existing_keys)} 条完整记录，将自动跳过。")
+
+    # 2. 批量加载市值数据 (缓存)
+    logger.info("正在从数据库预加载市值数据...")
+    raw_symbols = [s.split(".")[0] for s in valid_common_stocks]
+    market_cap_dict = {} # {symbol: {date: cap}}
+    latest_market_caps = {} # {symbol: cap} fallback
     
-    while current_date <= end_date:
-        # 跳过周末
-        if current_date.weekday() >= 5:
-            current_date += timedelta(days=1)
+    # 获取 API Key 用于实时补全历史市值
+    api_key = None
+    if VT_SETTING_PATH.exists():
+        with open(VT_SETTING_PATH, "r") as f:
+            api_key = json.load(f).get("datafeed.password")
+    
+    from flagship.scripts.sync_ticker_info import get_market_cap_from_massive_v3
+    from flagship.scripts.pg_ticker_db import upsert_ticker_detail
+
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            # 尝试获取历史市值
+            cur.execute("""
+                SELECT symbol, as_of_date, market_cap 
+                FROM ticker_daily_fundamentals 
+                WHERE symbol = ANY(%s) AND as_of_date >= %s AND as_of_date <= %s
+            """, (raw_symbols, start_date - timedelta(days=30), end_date))
+            for sym, dt, cap in cur.fetchall():
+                if sym not in market_cap_dict: market_cap_dict[sym] = {}
+                market_cap_dict[sym][dt] = cap
+            
+            # 获取每个股票最新的市值作为兜底
+            cur.execute("""
+                SELECT DISTINCT ON (symbol) symbol, market_cap 
+                FROM ticker_daily_fundamentals 
+                WHERE symbol = ANY(%s)
+                ORDER BY symbol, as_of_date DESC
+            """, (raw_symbols,))
+            for sym, cap in cur.fetchall():
+                latest_market_caps[sym] = cap
+
+    all_results = []
+    # Cache per-symbol shares estimate to avoid per-day market cap API calls.
+    # We infer shares from (market_cap / close) on the first date we successfully fetch market_cap.
+    shares_cache: dict[str, float] = {}
+    total_processed = 0
+    
+    # Debug counters
+    fail_reasons = {"no_data": 0, "market_cap": 0, "price": 0, "liquidity": 0, "trend": 0, "skipped": 0}
+    
+    logger.info(f"开始扫描 {len(daily_files)} 个股票文件...")
+    
+    for idx, file_path in enumerate(daily_files, start=1):
+        vt_symbol = file_path.stem
+        if vt_symbol not in valid_common_stocks:
             continue
-        
-        total_days += 1
+            
+        raw_symbol = vt_symbol.split(".")[0]
+        ticker_caps = market_cap_dict.get(raw_symbol, {})
+        fallback_cap = latest_market_caps.get(raw_symbol)
         
         try:
-            # 筛选股票池
-            selections = filter_universe_from_lab(
-                lab,
-                current_date,
-                min_adv_usd=min_adv_usd,
-                min_price=min_price,
-                max_price=max_price,
-                min_market_cap=min_market_cap,
-                max_market_cap=max_market_cap,
-            )
+            df = pl.read_parquet(file_path).sort("datetime")
+            if df.is_empty(): 
+                fail_reasons["no_data"] += 1
+                continue
             
-            if selections:
-                # 保存到PostgreSQL
-                save_selection_to_postgres(current_date, selections)
-                processed_days += 1
-                logger.info(f"[{current_date}] 完成: {len(selections)} 只股票")
-            else:
-                skipped_days += 1
-                logger.warning(f"[{current_date}] 未找到符合条件的股票")
-        
-        except Exception as exc:
-            logger.error(f"[{current_date}] 处理失败: {exc}", exc_info=True)
-            skipped_days += 1
-        
-        # 移动到下一个交易日
-        current_date += timedelta(days=1)
-    
-    logger.info("=" * 80)
-    logger.info("批量生成完成:")
-    logger.info(f"  - 总交易日数: {total_days}")
-    logger.info(f"  - 成功处理: {processed_days}")
-    logger.info(f"  - 跳过/失败: {skipped_days}")
-    logger.info("=" * 80)
+            # 过滤日期
+            mask = (pl.col("datetime").dt.date() >= start_date) & (pl.col("datetime").dt.date() <= end_date)
+            target_df = df.filter(mask)
+            
+            if target_df.is_empty(): 
+                fail_reasons["no_data"] += 1
+                continue
+
+            # 提前计算指标
+            df_with_inds = df.with_columns([
+                pl.col("close").alias("last_close"),
+                pl.col("volume").rolling_median(window_size=30).alias("med_vol_30"),
+                pl.col("close").rolling_mean(window_size=50).alias("ma50")
+            ])
+            target_df = df_with_inds.filter(mask)
+            
+            for row in target_df.iter_rows(named=True):
+                trade_date = row["datetime"].date()
+                
+                # 增量检查：如果已经有了，直接跳过
+                if (trade_date, vt_symbol) in existing_keys:
+                    fail_reasons["skipped"] += 1
+                    continue
+
+                # 筛选条件
+                # 1. 价格
+                if not (min_price <= row["last_close"] <= max_price):
+                    fail_reasons["price"] += 1
+                    continue
+                
+                # 2. 流动性
+                adv_usd = row["med_vol_30"] * row["last_close"] if row["med_vol_30"] else 0
+                if adv_usd < min_adv_usd:
+                    fail_reasons["liquidity"] += 1
+                    continue
+                    
+                # 3. 趋势
+                if row["ma50"] is None or row["last_close"] <= row["ma50"]:
+                    fail_reasons["trend"] += 1
+                    continue
+
+                # 4. 市值（只在通过价格/流动性/趋势后才触发，显著减少 API 调用）
+                close_px = float(row["last_close"])
+                mkt_cap: float | None = None
+
+                shares = shares_cache.get(raw_symbol)
+                if shares is not None:
+                    mkt_cap = shares * close_px
+                else:
+                    cap0: float | None = None
+
+                    # Prefer exact market cap for this date if we already have it in DB cache
+                    cap_cached = ticker_caps.get(trade_date)
+                    if cap_cached is not None:
+                        cap0 = float(cap_cached)
+                    else:
+                        # Fetch once from Massive (point-in-time), then infer shares and reuse
+                        if api_key:
+                            cap_api = get_market_cap_from_massive_v3(raw_symbol, api_key, trade_date)
+                            if cap_api is not None:
+                                cap0 = float(cap_api)
+                                # Cache to DB for auditing
+                                upsert_ticker_detail(raw_symbol, trade_date, {"market_cap": cap0})
+                                # Cache to in-memory dict for possible reuse within this run
+                                ticker_caps[trade_date] = cap0
+
+                    # Last fallback: use latest known market cap if exists
+                    if cap0 is None and fallback_cap is not None:
+                        cap0 = float(fallback_cap)
+
+                    if cap0 is not None and close_px > 0:
+                        shares = cap0 / close_px
+                        shares_cache[raw_symbol] = shares
+                        mkt_cap = shares * close_px  # equals cap0 for the anchor date
+
+                if mkt_cap is None or not (min_market_cap <= mkt_cap <= max_market_cap):
+                    fail_reasons["market_cap"] += 1
+                    continue
+                
+                all_results.append((
+                    trade_date,
+                    vt_symbol,
+                    row["last_close"],
+                    adv_usd,
+                    int(row["med_vol_30"]),
+                    mkt_cap
+                ))
+            
+            total_processed += 1
+            if total_processed % 500 == 0:
+                logger.info(f"已处理 {total_processed}/{len(daily_files)} 只股票, 累计选中 {len(all_results)} 条, 跳过 {fail_reasons['skipped']} 条")
+                
+        except Exception as e:
+            logger.warning(f"处理 {vt_symbol} 出错: {e}")
+
+    logger.info(f"扫描结束。最终选中 {len(all_results)} 条记录。")
+    logger.info(f"最终失败原因统计: {fail_reasons}")
+
+    # 批量写入数据库
+    if all_results:
+        logger.info(f"正在将 {len(all_results)} 条记录写入数据库...")
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                from psycopg2.extras import execute_values
+                # 分块写入，避免事务过大
+                batch_size = 10000
+                for i in range(0, len(all_results), batch_size):
+                    batch = all_results[i : i + batch_size]
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO daily_selection (trade_date, vt_symbol, close_price, adv_usd, med_volume, market_cap)
+                        VALUES %s
+                        ON CONFLICT (trade_date, vt_symbol) DO UPDATE SET
+                            close_price = EXCLUDED.close_price,
+                            adv_usd = EXCLUDED.adv_usd,
+                            med_volume = EXCLUDED.med_volume,
+                            market_cap = EXCLUDED.market_cap,
+                            created_at = CURRENT_TIMESTAMP
+                        """,
+                        batch
+                    )
+        logger.info("数据保存完成。")
+    else:
+        logger.warning("未找到任何符合条件的选股结果。")
 
 
 def main() -> None:
-    # 重新加载 vt_setting.json
-    if VT_SETTING_PATH.exists():
-        try:
-            setting_data = json.loads(VT_SETTING_PATH.read_text(encoding="utf-8"))
-            SETTINGS.update(setting_data)
-        except Exception as exc:
-            logger.warning(f"Failed to reload vt_setting.json: {exc}")
-    
-    parser = argparse.ArgumentParser(
-        description="从 AlphaLab 批量生成日度选股结果并保存到PostgreSQL (V7.0 Aggressive)."
-    )
-    parser.add_argument(
-        "--start",
-        type=str,
-        required=True,
-        help="起始日期 (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--end",
-        type=str,
-        required=True,
-        help="结束日期 (YYYY-MM-DD)",
-    )
-    parser.add_argument(
-        "--lab-path",
-        type=Path,
-        default=DEFAULT_LAB_DIR,
-        help="AlphaLab 数据目录（默认 lab/flagship_alpha_momentum）",
-    )
-    parser.add_argument(
-        "--strategy",
-        type=str,
-        choices=["v5", "v7"],
-        default="v7",
-        help="Strategy version (v5: Classic, v7: Aggressive). Sets default parameters.",
-    )
-    parser.add_argument(
-        "--min-adv-usd",
-        type=float,
-        help="最小日均成交额（美元）。若未指定，根据 --strategy 自动设置。",
-    )
-    parser.add_argument(
-        "--min-price",
-        type=float,
-        help="最低股价。若未指定，根据 --strategy 自动设置。",
-    )
-    parser.add_argument(
-        "--max-price",
-        type=float,
-        help="最高股价。若未指定，根据 --strategy 自动设置。",
-    )
-    parser.add_argument(
-        "--min-market-cap",
-        type=float,
-        help="最小市值。若未指定，根据 --strategy 自动设置。",
-    )
-    parser.add_argument(
-        "--max-market-cap",
-        type=float,
-        help="最大市值。若未指定，根据 --strategy 自动设置。",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", type=str, required=True)
+    parser.add_argument("--end", type=str, required=True)
+    parser.add_argument("--lab-path", type=Path, default=DEFAULT_LAB_DIR)
+    parser.add_argument("--strategy", type=str, choices=["v5", "v7"], default="v7")
+    parser.add_argument("--min-adv-usd", type=float)
+    parser.add_argument("--min-price", type=float)
+    parser.add_argument("--max-price", type=float)
+    parser.add_argument("--min-market-cap", type=float)
+    parser.add_argument("--max-market-cap", type=float)
     
     args = parser.parse_args()
     
-    # Set defaults based on strategy
     min_adv_usd = args.min_adv_usd
     min_price = args.min_price
     max_price = args.max_price
@@ -453,20 +319,19 @@ def main() -> None:
         if min_adv_usd is None: min_adv_usd = 2.5e8
         if min_price is None: min_price = 20.0
         if max_price is None: max_price = 600.0
-        # V5 doesn't explicitly limit market cap in doc, but we can set broad limits
         if min_market_cap is None: min_market_cap = 0.0 
         if max_market_cap is None: max_market_cap = float('inf')
     elif args.strategy == "v7":
         if min_adv_usd is None: min_adv_usd = 4.0e7
         if min_price is None: min_price = 10.0
-        if max_price is None: max_price = 1000000.0 # Effectively unlimited up
+        if max_price is None: max_price = 1000000.0
         if min_market_cap is None: min_market_cap = 2.0e9
         if max_market_cap is None: max_market_cap = 1.0e11
 
     start_date = datetime.fromisoformat(args.start).date()
     end_date = datetime.fromisoformat(args.end).date()
     
-    build_selection_for_date_range(
+    build_selection_optimized(
         start_date=start_date,
         end_date=end_date,
         lab_dir=args.lab_path,
@@ -480,4 +345,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

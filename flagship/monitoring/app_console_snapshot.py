@@ -34,7 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from flagship.paper_trading.broker_alpaca import AlpacaAdapter
-from flagship.paper_trading.config import ALPACA_API_KEY, ALPACA_BASE_URL, ALPACA_SECRET_KEY, LAB_PATH
+from flagship.paper_trading.config import ALPACA_API_KEY, ALPACA_BASE_URL, ALPACA_SECRET_KEY, LAB_PATH, SETTINGS as VT_SETTINGS
 from flagship.scripts.pg_ticker_db import get_pg_connection
 from vnpy.alpha.lab import AlphaLab
 from vnpy.trader.logger import logger
@@ -42,6 +42,7 @@ from vnpy.trader.logger import logger
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "logs" / "app"
 DEFAULT_SELECTION_TOP_N = int(os.getenv("FLAGSHIP_APP_SELECTION_TOPN", "10"))
 DEFAULT_SELECTION_DATE_CANDIDATES = int(os.getenv("FLAGSHIP_APP_SELECTION_DATE_CANDIDATES", "30"))
+DEFAULT_MASSIVE_TIMEOUT_SECONDS = int(os.getenv("FLAGSHIP_APP_MASSIVE_TIMEOUT", "10"))
 
 
 def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -318,6 +319,69 @@ def snapshot_performance(output_dir: Path, lookback_days: int = 365) -> Dict[str
     return data
 
 
+# ---------------- Market Status (Massive) ----------------
+def snapshot_market_status(output_dir: Path, timeout_seconds: int = DEFAULT_MASSIVE_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    """
+    Fetch market status from Massive (Polygon rebrand) and write logs/app/market_status.json.
+
+    API:
+    - GET /v1/marketstatus/now?apiKey=...
+    """
+    api_key = (
+        os.getenv("MASSIVE_API_KEY")
+        or os.getenv("POLYGON_API_KEY")
+        or str(VT_SETTINGS.get("datafeed.password") or "").strip()
+    )
+    if not api_key:
+        data = {
+            "generated_at": _now_iso(),
+            "source": "massive",
+            "error": "missing_api_key",
+        }
+        target = output_dir / "market_status.json"
+        _atomic_write_json(target, data)
+        logger.warning("[app_console_snapshot] market_status: api key missing (set vt_setting.json datafeed.password or MASSIVE_API_KEY)")
+        return data
+
+    import urllib.parse
+    import urllib.request
+
+    url = "https://api.massive.com/v1/marketstatus/now"
+    url = f"{url}?{urllib.parse.urlencode({'apiKey': api_key})}"
+
+    try:
+        req = urllib.request.Request(url=url, method="GET", headers={"User-Agent": "flagship-app-console/1.0"})
+        with urllib.request.urlopen(req, timeout=int(timeout_seconds)) as resp:
+            raw = resp.read().decode("utf-8")
+            payload = json.loads(raw)
+            date_header = resp.headers.get("Date")
+    except Exception as exc:
+        data = {
+            "generated_at": _now_iso(),
+            "source": "massive",
+            "error": str(exc),
+        }
+        target = output_dir / "market_status.json"
+        _atomic_write_json(target, data)
+        logger.warning(f"[app_console_snapshot] market_status fetch failed: {exc}")
+        return data
+
+    data = {
+        "generated_at": _now_iso(),
+        "source": "massive",
+        "server_time": payload.get("serverTime"),
+        "date_header": date_header,
+        "market": payload.get("market"),
+        "exchanges": payload.get("exchanges"),
+        "early_hours": payload.get("earlyHours"),
+        "after_hours": payload.get("afterHours"),
+    }
+    target = output_dir / "market_status.json"
+    _atomic_write_json(target, data)
+    logger.info(f"[app_console_snapshot] wrote {target}")
+    return data
+
+
 # ---------------- Selection ----------------
 def _load_signal_parquet(lab_path: Path) -> pl.DataFrame:
     signal_path = lab_path / "signal" / "daily_signal.parquet"
@@ -361,18 +425,19 @@ def _load_daily_selection(trade_date: date) -> Dict[str, Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT vt_symbol, close_price, adv_usd, med_volume
+                SELECT vt_symbol, close_price, adv_usd, med_volume, market_cap
                 FROM daily_selection
                 WHERE trade_date = %s
                 """,
                 (trade_date,),
             )
             for row in cur.fetchall():
-                vt_symbol, close_price, adv_usd, med_volume = row
+                vt_symbol, close_price, adv_usd, med_volume, market_cap = row
                 out[str(vt_symbol)] = {
                     "close_price": float(close_price) if close_price is not None else None,
                     "adv_usd": float(adv_usd) if adv_usd is not None else None,
                     "med_volume": int(med_volume) if med_volume is not None else None,
+                    "market_cap": float(market_cap) if market_cap is not None else None,
                 }
     return out
 
@@ -389,6 +454,7 @@ def build_signal_only_rows(
         close_price: float | None = float(raw_close) if raw_close is not None else None
         adv_usd: float | None = None
         med_volume: int | None = None
+        market_cap: float | None = None
 
         # Even when Postgres daily_selection is missing, we can enrich with AlphaLab daily parquet.
         if lab_path and as_of_date:
@@ -407,6 +473,7 @@ def build_signal_only_rows(
                 "close_price": close_price,
                 "adv_usd": adv_usd,
                 "med_volume": med_volume,
+                "market_cap": market_cap,
             }
         )
     rows = sorted(rows, key=lambda r: (r["signal"] is None, -(r["signal"] or 0.0)))
@@ -499,6 +566,7 @@ def build_selection_rows(
             close_price = sel.get("close_price")
             adv_usd = sel.get("adv_usd")
             med_volume = sel.get("med_volume")
+            market_cap = sel.get("market_cap")
 
             # If ADV/MedVol missing, compute from lab
             if (
@@ -520,6 +588,7 @@ def build_selection_rows(
                 "close_price": close_price,
                 "adv_usd": adv_usd,
                 "med_volume": med_volume,
+                "market_cap": market_cap,
             }
 
     rows = sorted(
@@ -559,7 +628,14 @@ def snapshot_selection(output_dir: Path, lab_path: Path, top_n: int = DEFAULT_SE
     }
     target = output_dir / "selection.json"
     _atomic_write_json(target, data)
-    logger.info(f"[app_console_snapshot] wrote {target}")
+    
+    # Save a historical copy
+    history_dir = output_dir / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    history_target = history_dir / f"selection_{as_of_date.strftime('%Y%m%d')}.json"
+    _atomic_write_json(history_target, data)
+    
+    logger.info(f"[app_console_snapshot] wrote {target} and history {history_target}")
     return data
 
 
@@ -569,7 +645,7 @@ def main() -> None:
     parser.add_argument(
         "mode",
         nargs="+",
-        choices=["portfolio", "selection", "orders", "performance", "all"],
+        choices=["portfolio", "selection", "orders", "performance", "market_status", "all"],
         help="Snapshot type(s) to generate (can specify multiple)",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output directory for JSON files")
@@ -585,7 +661,7 @@ def main() -> None:
 
     modes = set(args.mode)
     if "all" in modes:
-        modes = {"portfolio", "selection", "orders", "performance"}
+        modes = {"portfolio", "selection", "orders", "performance", "market_status"}
 
     if "portfolio" in modes:
         snapshot_portfolio(args.output_dir)
@@ -598,6 +674,9 @@ def main() -> None:
 
     if "performance" in modes:
         snapshot_performance(args.output_dir)
+
+    if "market_status" in modes:
+        snapshot_market_status(args.output_dir)
 
 
 if __name__ == "__main__":

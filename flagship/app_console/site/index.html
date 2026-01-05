@@ -193,6 +193,43 @@
       overflow: auto;
       max-height: 400px;
     }
+    .progress-container {
+      width: 100%;
+      height: 8px;
+      background: var(--panel-2);
+      border-radius: 4px;
+      margin: 12px 0;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-bar {
+      height: 100%;
+      background: var(--accent);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+    }
+    .status-pill.running { background: #e7f3ff; color: var(--accent); border-color: #baddff; }
+    .status-pill.completed { background: #e6fffa; color: var(--good); border-color: #b2f5ea; }
+    .status-pill.failed { background: #fff5f5; color: var(--bad); border-color: #feb2b2; }
+    
+    .backtest-panel {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 24px;
+    }
+    .backtest-info { flex: 1; }
+    .backtest-actions { display: flex; gap: 12px; }
   </style>
 </head>
 <body>
@@ -203,13 +240,42 @@
         <div class="meta" id="meta-env">Environment: paper</div>
       </div>
       <div class="header-right">
+          <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px; margin-right:12px;">
+            <div class="status-pill" id="market-status-pill">Market: -</div>
+            <div class="meta" id="market-server-time" style="text-align:right;"></div>
+          </div>
         <div class="date-range">
           <label>From:</label>
           <input type="date" id="date-from" />
           <label>To:</label>
           <input type="date" id="date-to" />
         </div>
-        <a href="/data/report_latest.html" class="btn btn-primary" download>下载报告</a>
+      </div>
+    </div>
+
+    <!-- Backtest Control Panel -->
+    <div class="card card-full" style="margin-bottom: 20px; border-left: 4px solid var(--accent);">
+      <div class="backtest-panel">
+        <div class="backtest-info">
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 4px;">
+            <h2 style="margin: 0;">V7 Backtest Engine</h2>
+            <span id="backtest-status-pill" class="status-pill">Idle</span>
+          </div>
+          <div class="meta" id="backtest-message">Ready to run 3-year rolling walk-forward backtest.</div>
+          <div id="backtest-progress-container" class="progress-container">
+            <div id="backtest-progress-bar" class="progress-bar"></div>
+          </div>
+        </div>
+        <div class="backtest-actions">
+          <div class="date-range" style="margin-right: 12px; flex-wrap: nowrap;">
+            <label style="white-space: nowrap;">Start:</label>
+            <input type="date" id="backtest-from" value="2025-01-01" style="width: 130px;" />
+            <label style="white-space: nowrap;">End:</label>
+            <input type="date" id="backtest-to" style="width: 130px;" />
+          </div>
+          <button id="btn-backtest" class="btn btn-primary" style="min-width: 140px;">Run V7 Backtest</button>
+          <a href="/data/report_latest.html" id="link-report" class="btn" style="display: none;">Download Report</a>
+        </div>
       </div>
     </div>
 
@@ -291,7 +357,7 @@
         <div class="scrollable">
           <table id="selection-table">
             <thead>
-              <tr><th>#</th><th>Symbol</th><th>Signal</th><th>Close</th><th>ADV</th><th>MedVol</th></tr>
+              <tr><th>#</th><th>Symbol</th><th>Signal</th><th>Close</th><th>ADV</th><th>MktCap</th></tr>
             </thead>
             <tbody></tbody>
           </table>
@@ -338,10 +404,106 @@
         </table>
       </div>
     </div>
+
+    <!-- User Management (Admin Only) -->
+    <div id="admin-user-panel" class="card card-full" style="display:none; margin-top: 20px;">
+      <div class="card-header">
+        <h2>User Management</h2>
+        <button id="btn-add-user" class="btn btn-primary">Add New User</button>
+      </div>
+      <div class="scrollable">
+        <table id="users-table">
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Role</th>
+              <th>Created At</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <script>
+    // Auth Check
+    const token = localStorage.getItem('flagship_token');
+    const userRole = localStorage.getItem('flagship_role');
+    if (!token) window.location.href = '/login.html';
+
+    // Hide admin elements
+    if (userRole !== 'admin') {
+      document.querySelector('.card-full[style*="border-left"]').style.display = 'none';
+    } else {
+      document.getElementById('admin-user-panel').style.display = 'block';
+      loadUsers();
+    }
+
     const fmt = new Intl.NumberFormat("en-US", {maximumFractionDigits: 2});
+    
+    // ...
+    
+    // User Management Logic
+    async function loadUsers() {
+      try {
+        const res = await fetch('/api/users', {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const users = await res.json();
+        const tbody = document.querySelector('#users-table tbody');
+        tbody.innerHTML = '';
+        users.forEach(u => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${u.username}</td>
+            <td>${u.role}</td>
+            <td>${new Date(u.created_at).toLocaleString()}</td>
+            <td><button class="btn btn-sm btn-danger" onclick="deleteUser('${u.username}')" ${u.username === 'admin' ? 'disabled' : ''}>Delete</button></td>
+          `;
+          tbody.appendChild(tr);
+        });
+      } catch (e) {
+        console.error('Failed to load users:', e);
+      }
+    }
+
+    window.deleteUser = async function(username) {
+      if (!confirm(`Delete user ${username}?`)) return;
+      try {
+        const res = await fetch(`/api/users/${username}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        if (res.ok) loadUsers();
+      } catch (e) {
+        alert('Failed to delete user: ' + e.message);
+      }
+    }
+
+    document.getElementById('btn-add-user').addEventListener('click', async () => {
+      const user = prompt('Enter username:');
+      if (!user) return;
+      const pass = prompt('Enter password:');
+      if (!pass) return;
+      const role = prompt('Enter role (admin/user):', 'user');
+      
+      try {
+        const res = await fetch('/api/users', {
+          method: 'POST',
+          headers: { 
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ username: user, password: pass, role: role })
+        });
+        if (res.ok) loadUsers();
+        else alert('Failed to create user');
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    });
     const fmt0 = new Intl.NumberFormat("en-US", {maximumFractionDigits: 0});
     const fmt4 = new Intl.NumberFormat("en-US", {maximumFractionDigits: 4});
     const fmtPct = new Intl.NumberFormat("en-US", {style: "percent", maximumFractionDigits: 2});
@@ -354,15 +516,23 @@
     // Initialize date pickers (default: last 30 days)
     function initDatePickers() {
       const today = new Date();
-      const toDate = new Date(today);
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = yesterday.toISOString().split('T')[0];
+
       const fromDate = new Date(today);
       fromDate.setDate(fromDate.getDate() - 30);
+      const fromDateStr = fromDate.toISOString().split('T')[0];
 
-      document.getElementById('date-from').value = fromDate.toISOString().split('T')[0];
-      document.getElementById('date-to').value = toDate.toISOString().split('T')[0];
+      document.getElementById('date-from').value = fromDateStr;
+      document.getElementById('date-to').value = yesterdayStr;
+      
+      // Default backtest range: 2025-01-01 to yesterday
+      document.getElementById('backtest-from').value = '2025-01-01';
+      document.getElementById('backtest-to').value = yesterdayStr;
 
       dateFrom = fromDate;
-      dateTo = toDate;
+      dateTo = yesterday;
 
       document.getElementById('date-from').addEventListener('change', (e) => {
         dateFrom = e.target.value ? new Date(e.target.value) : null;
@@ -375,7 +545,13 @@
     }
 
     async function loadJson(url) {
-      const res = await fetch(url + '?t=' + Date.now());
+      const res = await fetch(url + '?t=' + Date.now(), {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.status === 401) {
+        localStorage.removeItem('flagship_token');
+        window.location.href = '/login.html';
+      }
       if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
       return res.json();
     }
@@ -426,7 +602,7 @@
           <td>${fmt4.format(r.signal)}</td>
           <td>${fmt.format(r.close_price || 0)}</td>
           <td>${fmt0.format(r.adv_usd || 0)}</td>
-          <td>${fmt0.format(r.med_volume || 0)}</td>
+          <td>${fmt.format((r.market_cap || 0) / 1e9)}B</td>
         `;
         tbody.appendChild(tr);
       });
@@ -607,6 +783,30 @@
     }
 
     async function refresh() {
+      const selectedDate = document.getElementById('date-to').value; // Use 'To' date as target date for rankings
+      const todayStr = new Date().toISOString().split('T')[0];
+
+      // Market status (Massive)
+      try {
+        const ms = await loadJson('/data/market_status.json');
+        const market = (ms.market || '').toString().toLowerCase();
+        const pill = document.getElementById('market-status-pill');
+        pill.textContent = `Market: ${market || '-'}`;
+        pill.classList.remove('running', 'completed', 'failed');
+        if (market === 'open') pill.classList.add('completed');
+        else if (market === 'closed') pill.classList.add('failed');
+        else pill.classList.add('running');
+
+        const st = ms.server_time || ms.date_header || '';
+        document.getElementById('market-server-time').textContent = st ? `Server: ${st}` : '';
+      } catch (e) {
+        const pill = document.getElementById('market-status-pill');
+        pill.textContent = 'Market: -';
+        pill.classList.remove('running', 'completed', 'failed');
+        document.getElementById('market-server-time').textContent = '';
+      }
+      
+      // Portfolio, Orders, Performance stay current (or filtered by date picker internally)
       try {
         const data = await loadJson('/data/portfolio.json');
         renderPortfolio(data);
@@ -617,8 +817,30 @@
         setBadge(document.getElementById('portfolio-updated'), '');
       }
 
+      // Selection Ranking: fetch current or historical
       try {
-        const data = await loadJson('/data/selection.json');
+        const latestUrl = '/data/selection.json';
+        let selectionUrl = latestUrl;
+
+        // When date-to is set (default is yesterday), try to load a dated snapshot first.
+        // If it doesn't exist (holiday/weekend/missing snapshot), fall back to the latest snapshot.
+        if (selectedDate) {
+          const dateClean = selectedDate.replaceAll('-', '');
+          selectionUrl = `/data/history/selection_${dateClean}.json`;
+        }
+
+        let data = null;
+        try {
+          data = await loadJson(selectionUrl);
+        } catch (innerErr) {
+          data = await loadJson(latestUrl);
+
+          // Align date picker to the actual available trade date to avoid repeated 404 retries.
+          if (data && data.as_of_date) {
+            document.getElementById('date-to').value = data.as_of_date;
+            dateTo = new Date(data.as_of_date);
+          }
+        }
         renderSelection(data);
       } catch (e) {
         const el = document.getElementById('selection-error');
@@ -658,6 +880,98 @@
     }
 
     initDatePickers();
+    
+    // Backtest Logic
+    const btnBacktest = document.getElementById('btn-backtest');
+    const pillBacktest = document.getElementById('backtest-status-pill');
+    const msgBacktest = document.getElementById('backtest-message');
+    const progressContainer = document.getElementById('backtest-progress-container');
+    const progressBar = document.getElementById('backtest-progress-bar');
+    const linkReport = document.getElementById('link-report');
+    let backtestInterval = null;
+
+    async function checkBacktestStatus() {
+      try {
+        const res = await fetch('/api/backtest/status', {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const data = await res.json();
+        
+        if (data.status === 'running') {
+          pillBacktest.textContent = 'Running';
+          pillBacktest.className = 'status-pill running';
+          msgBacktest.textContent = data.message || 'Processing...';
+          progressContainer.style.display = 'block';
+          progressBar.style.width = (data.progress * 100) + '%';
+          btnBacktest.disabled = true;
+          linkReport.style.display = 'none';
+          
+          if (!backtestInterval) {
+            backtestInterval = setInterval(checkBacktestStatus, 3000);
+          }
+        } else if (data.status === 'completed') {
+          pillBacktest.textContent = 'Completed';
+          pillBacktest.className = 'status-pill completed';
+          msgBacktest.textContent = 'Last run finished successfully.';
+          progressContainer.style.display = 'none';
+          btnBacktest.disabled = false;
+          linkReport.style.display = 'inline-block';
+          
+          if (backtestInterval) {
+            clearInterval(backtestInterval);
+            backtestInterval = null;
+          }
+        } else if (data.status === 'failed') {
+          pillBacktest.textContent = 'Failed';
+          pillBacktest.className = 'status-pill failed';
+          msgBacktest.textContent = 'Error: ' + data.message;
+          progressContainer.style.display = 'none';
+          btnBacktest.disabled = false;
+          linkReport.style.display = 'none';
+          
+          if (backtestInterval) {
+            clearInterval(backtestInterval);
+            backtestInterval = null;
+          }
+        } else {
+          pillBacktest.textContent = 'Idle';
+          pillBacktest.className = 'status-pill';
+          msgBacktest.textContent = 'Ready to run 3-year rolling walk-forward backtest.';
+          progressContainer.style.display = 'none';
+          btnBacktest.disabled = false;
+          linkReport.style.display = 'none';
+        }
+      } catch (e) {
+        console.error('Failed to check backtest status:', e);
+      }
+    }
+
+    btnBacktest.addEventListener('click', async () => {
+      const startDate = document.getElementById('backtest-from').value;
+      const endDate = document.getElementById('backtest-to').value;
+      
+      if (!confirm(`Start V7 Rolling Backtest from ${startDate} to ${endDate}? This may take several minutes.`)) return;
+      try {
+        const res = await fetch('/api/backtest/run', { 
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({ start_date: startDate, end_date: endDate })
+        });
+        const data = await res.json();
+        if (data.status === 'success') {
+          checkBacktestStatus();
+        } else {
+          alert(data.message || data.detail || 'Unknown error');
+        }
+      } catch (e) {
+        alert('Failed to trigger backtest: ' + e.message);
+      }
+    });
+
+    checkBacktestStatus();
     refresh();
     setInterval(refresh, 60000);
     window.addEventListener('resize', () => {
