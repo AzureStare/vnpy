@@ -243,6 +243,7 @@
           <div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px; margin-right:12px;">
             <div class="status-pill" id="market-status-pill">Market: -</div>
             <div class="meta" id="market-server-time" style="text-align:right;"></div>
+            <div class="meta" id="market-countdown" style="text-align:right;"></div>
           </div>
         <div class="date-range">
           <label>From:</label>
@@ -512,6 +513,7 @@
     let dateTo = null;
     let performanceData = null;
     let ordersData = null;
+    let marketCountdownInterval = null;
 
     // Initialize date pickers (default: last 30 days)
     function initDatePickers() {
@@ -782,6 +784,58 @@
       ctx.fillText(fmt.format(maxEquity), padding / 2, padding + 12);
     }
 
+    function stopMarketCountdown() {
+      if (marketCountdownInterval) {
+        clearInterval(marketCountdownInterval);
+        marketCountdownInterval = null;
+      }
+      const el = document.getElementById('market-countdown');
+      if (el) el.textContent = '';
+    }
+
+    function _pad2(n) {
+      return String(n).padStart(2, '0');
+    }
+
+    function _formatHms(totalSeconds) {
+      const s = Math.max(0, Math.floor(totalSeconds));
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      return `${_pad2(h)}:${_pad2(m)}:${_pad2(sec)}`;
+    }
+
+    function startMarketOpenCountdown(market, serverTimeText, nextOpenText) {
+      stopMarketCountdown();
+
+      const el = document.getElementById('market-countdown');
+      if (!el) return;
+
+      const mkt = (market || '').toString().toLowerCase();
+      if (mkt === 'open') return;
+
+      const serverMs = Date.parse(serverTimeText || '');
+      const nextOpenMs = Date.parse(nextOpenText || '');
+      if (!Number.isFinite(serverMs) || !Number.isFinite(nextOpenMs)) return;
+
+      // Calibrate client clock to Massive server time at fetch moment.
+      const offsetMs = serverMs - Date.now();
+
+      const tick = () => {
+        const nowMs = Date.now() + offsetMs;
+        const diffMs = nextOpenMs - nowMs;
+        if (diffMs <= 0) {
+          el.textContent = '';
+          stopMarketCountdown();
+          return;
+        }
+        el.textContent = `Next Open In: ${_formatHms(diffMs / 1000)}`;
+      };
+
+      tick();
+      marketCountdownInterval = setInterval(tick, 1000);
+    }
+
     async function refresh() {
       const selectedDate = document.getElementById('date-to').value; // Use 'To' date as target date for rankings
       const todayStr = new Date().toISOString().split('T')[0];
@@ -799,11 +853,13 @@
 
         const st = ms.server_time || ms.date_header || '';
         document.getElementById('market-server-time').textContent = st ? `Server: ${st}` : '';
+        startMarketOpenCountdown(market, st, ms.next_open || '');
       } catch (e) {
         const pill = document.getElementById('market-status-pill');
         pill.textContent = 'Market: -';
         pill.classList.remove('running', 'completed', 'failed');
         document.getElementById('market-server-time').textContent = '';
+        stopMarketCountdown();
       }
       
       // Portfolio, Orders, Performance stay current (or filtered by date picker internally)

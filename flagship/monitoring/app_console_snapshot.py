@@ -23,8 +23,11 @@ import os
 import sys
 import tempfile
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -43,6 +46,8 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "logs" / "app"
 DEFAULT_SELECTION_TOP_N = int(os.getenv("FLAGSHIP_APP_SELECTION_TOPN", "10"))
 DEFAULT_SELECTION_DATE_CANDIDATES = int(os.getenv("FLAGSHIP_APP_SELECTION_DATE_CANDIDATES", "30"))
 DEFAULT_MASSIVE_TIMEOUT_SECONDS = int(os.getenv("FLAGSHIP_APP_MASSIVE_TIMEOUT", "10"))
+DEFAULT_MARKET_OPEN_ET = dtime(9, 30)
+EASTERN = ZoneInfo("America/New_York")
 
 
 def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -68,6 +73,35 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    try:
+        # Support common ISO format with trailing 'Z'
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _parse_hhmm(text: str | None) -> dtime | None:
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except Exception:
+            continue
+    return None
 
 
 # ---------------- Alpaca REST (fallback) ----------------
@@ -366,6 +400,80 @@ def snapshot_market_status(output_dir: Path, timeout_seconds: int = DEFAULT_MASS
         logger.warning(f"[app_console_snapshot] market_status fetch failed: {exc}")
         return data
 
+    # Parse server time (prefer payload.serverTime, fallback to Date header, then local utc)
+    server_dt = _parse_iso_datetime(payload.get("serverTime"))
+    if server_dt is None and date_header:
+        try:
+            server_dt = parsedate_to_datetime(date_header)
+        except Exception:
+            server_dt = None
+    if server_dt is None:
+        server_dt = datetime.now(timezone.utc)
+    if server_dt.tzinfo is None:
+        server_dt = server_dt.replace(tzinfo=timezone.utc)
+    server_et = server_dt.astimezone(EASTERN)
+
+    # Fetch upcoming holidays/early closes to compute next open (Massive upcoming endpoint).
+    holiday_by_date: dict[date, dict[str, Any]] = {}
+    try:
+        upcoming_url = "https://api.massive.com/v1/marketstatus/upcoming"
+        upcoming_url = f"{upcoming_url}?{urllib.parse.urlencode({'apiKey': api_key})}"
+        req2 = urllib.request.Request(url=upcoming_url, method="GET", headers={"User-Agent": "flagship-app-console/1.0"})
+        with urllib.request.urlopen(req2, timeout=int(timeout_seconds)) as resp2:
+            raw2 = resp2.read().decode("utf-8")
+            upcoming_payload = json.loads(raw2)
+
+        items: list[dict[str, Any]] = []
+        if isinstance(upcoming_payload, list):
+            items = [it for it in upcoming_payload if isinstance(it, dict)]
+        elif isinstance(upcoming_payload, dict):
+            # Some APIs may wrap list under 'results'
+            raw_items = upcoming_payload.get("results")
+            if isinstance(raw_items, list):
+                items = [it for it in raw_items if isinstance(it, dict)]
+
+        for it in items:
+            try:
+                d = date.fromisoformat(str(it.get("date") or ""))
+            except Exception:
+                continue
+            holiday_by_date[d] = it
+    except Exception as exc:
+        logger.warning(f"[app_console_snapshot] market_status upcoming fetch failed: {exc}")
+
+    def _is_closed_day(d: date) -> bool:
+        if d.weekday() >= 5:
+            return True
+        it = holiday_by_date.get(d)
+        if not it:
+            return False
+        status = str(it.get("status") or "").strip().lower().replace("-", "_").replace(" ", "_")
+        return status == "closed"
+
+    def _session_open_time(d: date) -> dtime:
+        it = holiday_by_date.get(d)
+        if it:
+            t = _parse_hhmm(it.get("open"))
+            if t:
+                return t
+        return DEFAULT_MARKET_OPEN_ET
+
+    next_open_dt: datetime | None = None
+    cursor_date = server_et.date()
+    for _ in range(30):  # safety bound (~6 weeks)
+        if _is_closed_day(cursor_date):
+            cursor_date += timedelta(days=1)
+            continue
+        open_dt = datetime.combine(cursor_date, _session_open_time(cursor_date), tzinfo=EASTERN)
+        if server_et < open_dt:
+            next_open_dt = open_dt
+            break
+        cursor_date += timedelta(days=1)
+
+    seconds_to_open: int | None = None
+    if next_open_dt is not None:
+        seconds_to_open = int(max(0.0, (next_open_dt - server_et).total_seconds()))
+
     data = {
         "generated_at": _now_iso(),
         "source": "massive",
@@ -375,6 +483,8 @@ def snapshot_market_status(output_dir: Path, timeout_seconds: int = DEFAULT_MASS
         "exchanges": payload.get("exchanges"),
         "early_hours": payload.get("earlyHours"),
         "after_hours": payload.get("afterHours"),
+        "next_open": next_open_dt.isoformat() if next_open_dt else None,
+        "seconds_to_open": seconds_to_open,
     }
     target = output_dir / "market_status.json"
     _atomic_write_json(target, data)
