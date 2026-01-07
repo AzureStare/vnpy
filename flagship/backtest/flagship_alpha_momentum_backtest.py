@@ -26,7 +26,7 @@ from vnpy.trader.logger import logger
 from vnpy.trader.setting import SETTINGS
 from vnpy.alpha import AlphaLab, BacktestingEngine
 from flagship.config import VT_SETTING_PATH
-from flagship.scripts.pg_ticker_db import get_pg_connection
+from flagship.universe.pg_ticker_db import get_pg_connection
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 

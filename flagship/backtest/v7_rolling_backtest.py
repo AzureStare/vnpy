@@ -39,7 +39,7 @@ from vnpy.alpha.dataset import Segment
 from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
 from flagship.model.train_flagship_lgb import build_lgb_dataset
 import lightgbm as lgb
-from flagship.scripts.pg_ticker_db import get_selected_symbols_in_range
+from flagship.universe.pg_ticker_db import get_selected_symbols_in_range
 from flagship.backtest.flagship_alpha_momentum_backtest import run_backtest
 
 # Backtest Configuration

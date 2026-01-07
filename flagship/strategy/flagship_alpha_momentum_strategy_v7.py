@@ -62,7 +62,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
     # 仓位控制
     base_pos_size: float = 0.15  # 基础仓位 15%
     max_leverage: float = 1.6
-    
+
     def on_init(self) -> None:
         """策略初始化回调"""
         self.holding_days: defaultdict[str, int] = defaultdict(int)
@@ -213,7 +213,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             spy_bar = bars.get("SPY.NASDAQ")
             if spy_bar and self.spy_ema10 and spy_bar.close_price < self.spy_ema10:
                 quick_brake = True
-
+            
             # 2. 阶梯止盈逻辑 (Profit Ladder)
             if not exit_reason:
                 if profit_pct < self.profit_threshold_trend and days < 3:
@@ -235,7 +235,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
                     stop_line = trailing_stop
                     if ema5:
                         stop_line = max(ema5, trailing_stop)
-                    
+                        
                     if bar.close_price < stop_line:
                         exit_reason = f"利润锁定/大盘避险 (Price < {stop_line:.2f})"
             

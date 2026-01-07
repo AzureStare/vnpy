@@ -40,22 +40,23 @@ services:
       # Run after market close (16:15 ET, Mon-Fri). The daily cycle will prepare signals and then
       # alpaca_executor will wait for the next open to place orders.
       FLAGSHIP_CRON_SCHEDULE: "15 16 * * 1-5"
-      FLAGSHIP_CRON_COMMAND: "/app/flagship/paper_trading/run_full_daily_cycle.sh"
-      # Start intraday runner shortly after open (exit-only, WS-based)
-      FLAGSHIP_CRON_SCHEDULE_INTRADAY: "35 9 * * 1-5"
-      FLAGSHIP_CRON_COMMAND_INTRADAY: "/app/flagship/paper_trading/start_intraday_runner.sh"
+      FLAGSHIP_CRON_COMMAND: "python -m flagship.trading.orchestration.daily_cycle_runner --strategy v7"
+      # Intraday runner is now supervised by a always-on IntradayDaemon (program-driven, no cron).
+      FLAGSHIP_ENABLE_INTRADAY_DAEMON: "1"
+      FLAGSHIP_INTRADAY_START_HHMM: "09:35"
+      # Legacy cron-based intraday start (disabled by default to avoid duplicates)
+      FLAGSHIP_CRON_SCHEDULE_INTRADAY: ""
+      FLAGSHIP_CRON_COMMAND_INTRADAY: ""
       # Limit WS watchlist to Top-N signals (+ positions + SPY)
       FLAGSHIP_INTRADAY_SIGNAL_TOPN: "10"
       # Portfolio heartbeat during RTH (every 5 minutes) - update portfolio + orders
-      FLAGSHIP_CRON_SCHEDULE_PORTFOLIO: "*/5 9-16 * * 1-5"
+      FLAGSHIP_CRON_SCHEDULE_PORTFOLIO: "*/1 9-16 * * 1-5"
       FLAGSHIP_CRON_COMMAND_PORTFOLIO: "python /app/flagship/monitoring/app_console_snapshot.py portfolio orders market_status"
       # Prometheus node_exporter textfile collector output (host-mounted via ./logs)
       FLAGSHIP_TEXTFILE_DIR: "/app/logs/metrics"
     volumes:
       # Mount current directory for easy updates without rebuild
       - .:/app
-      # Override entrypoint for live updates (avoid rebuilding image for cron tweaks)
-      - ./entrypoint.sh:/entrypoint.sh:ro
       # Persist AlphaLab data and logs
       - ./lab:/app/lab
       - ./logs:/app/logs

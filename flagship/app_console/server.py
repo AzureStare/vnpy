@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from flagship.scripts.pg_ticker_db import (
+from flagship.universe.pg_ticker_db import (
     create_users_table, add_user, get_user, list_users, delete_user
 )
 
@@ -52,6 +52,13 @@ class BacktestRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
 
+class DailyOpsRequest(BaseModel):
+    """
+    Manual trigger for the daily ops pipeline (daily_cycle_runner).
+    """
+    trading_date: Optional[str] = None  # YYYY-MM-DD (ET)
+    strategy: str = "v7"
+
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
@@ -63,6 +70,13 @@ app.add_middleware(
 LOG_DIR = PROJECT_ROOT / "logs" / "backtest"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 STATUS_FILE = LOG_DIR / "status.json"
+
+APP_DATA_DIR = PROJECT_ROOT / "logs" / "app"
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DAILY_OPS_DIR = APP_DATA_DIR / "daily_ops"
+DAILY_OPS_DIR.mkdir(parents=True, exist_ok=True)
+DAILY_OPS_STATUS_FILE = DAILY_OPS_DIR / "status.json"
 
 # Utility
 def get_password_hash(password: str) -> str:
@@ -154,6 +168,86 @@ def _update_status(
             payload["log_file"] = str(log_file)
         json.dump(payload, f)
 
+def _update_daily_ops_status(
+    status: str,
+    message: str = "",
+    progress: float = 0,
+    pid: int | None = None,
+    log_file: str | None = None,
+):
+    with open(DAILY_OPS_STATUS_FILE, "w") as f:
+        payload = {
+            "status": status,
+            "message": message,
+            "progress": progress,
+            "updated_at": datetime.now().isoformat(),
+        }
+        if pid is not None:
+            payload["pid"] = int(pid)
+        if log_file is not None:
+            payload["log_file"] = str(log_file)
+        json.dump(payload, f)
+
+def run_daily_ops_task(strategy: str = "v7", trading_date: str | None = None):
+    """
+    Run daily_cycle_runner as a background task, writing logs into logs/app/daily_ops/.
+    """
+    log_path: Path | None = None
+    log_fp = None
+    log_rel: str | None = None
+    try:
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = DAILY_OPS_DIR / f"daily_ops_{run_ts}.log"
+        log_fp = open(log_path, "w", encoding="utf-8")
+        log_rel = f"daily_ops/{log_path.name}"
+        log_fp.write(f"[{datetime.now().isoformat()}] Daily ops start: strategy={strategy} trading_date={trading_date or 'default'}\n")
+        log_fp.flush()
+
+        cmd: list[str] = [
+            sys.executable,
+            "-m",
+            "flagship.trading.orchestration.daily_cycle_runner",
+            "--strategy",
+            str(strategy),
+        ]
+        if trading_date:
+            cmd += ["--trading-date", str(trading_date)]
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=PROJECT_ROOT,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        _update_daily_ops_status(
+            "running",
+            "Daily ops running...",
+            0.1,
+            pid=proc.pid,
+            log_file=log_rel,
+        )
+
+        rc = proc.wait()
+        if rc == 0:
+            _update_daily_ops_status("completed", "Daily ops completed.", 1.0, log_file=log_rel)
+        else:
+            _update_daily_ops_status("failed", f"Daily ops failed (code {rc}). See {log_rel}", 1.0, log_file=log_rel)
+    except Exception as e:
+        _update_daily_ops_status("failed", str(e), 1.0, log_file=log_rel)
+        try:
+            if log_fp is not None:
+                log_fp.write(f"[{datetime.now().isoformat()}] ERROR: {e}\n")
+                log_fp.flush()
+        except Exception:
+            pass
+    finally:
+        try:
+            if log_fp is not None:
+                log_fp.close()
+        except Exception:
+            pass
+
 def run_backtest_task(start_date: str, end_date: str):
     log_path: Path | None = None
     log_fp = None
@@ -206,20 +300,53 @@ def run_backtest_task(start_date: str, end_date: str):
             
             if has_s3:
                 _update_status("running", f"Syncing full market history via Polygon S3 (Fast)...", 0.1, log_file=log_path.name)
-                subprocess.run([
-                    "python", "flagship/scripts/import_polygon_s3_data.py", 
-                    "--start", data_start_date, "--end", end_date
-                ], cwd=PROJECT_ROOT, check=True, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
+                subprocess.run(
+                    [
+                        "python",
+                        "-m",
+                        "flagship.market_data.import_polygon_s3_data",
+                        "--start",
+                        data_start_date,
+                        "--end",
+                        end_date,
+                    ],
+                    cwd=PROJECT_ROOT,
+                    check=True,
+                    stdout=log_fp,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
             else:
                 _update_status("running", f"Syncing market data via REST API (Slow)...", 0.1, log_file=log_path.name)
-                subprocess.run([
-                    "python", "flagship/scripts/update_lab_data_incremental.py", 
-                    "--end-date", end_date, "--start-date", data_start_date,
-                    "--interval", "daily", "--universe", "ref_tickers_cs"
-                ], cwd=PROJECT_ROOT, check=True, stdout=log_fp, stderr=subprocess.STDOUT, text=True)
+                subprocess.run(
+                    [
+                        "python",
+                        "-m",
+                        "flagship.market_data.update_lab_data_incremental",
+                        "--end-date",
+                        end_date,
+                        "--start-date",
+                        data_start_date,
+                        "--interval",
+                        "daily",
+                        "--universe",
+                        "ref_tickers_cs",
+                    ],
+                    cwd=PROJECT_ROOT,
+                    check=True,
+                    stdout=log_fp,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
             
             subprocess.run(
-                ["python", "flagship/paper_trading/update_market_indices.py", "--lookback", "1200"],
+                [
+                    "python",
+                    "-m",
+                    "flagship.trading.orchestration.update_market_indices",
+                    "--lookback",
+                    "1200",
+                ],
                 cwd=PROJECT_ROOT,
                 check=True,
                 stdout=log_fp,
@@ -233,7 +360,8 @@ def run_backtest_task(start_date: str, end_date: str):
         sel_proc = subprocess.Popen(
             [
                 "python",
-                "flagship/scripts/build_daily_selection_to_postgres.py",
+                "-m",
+                "flagship.universe.build_daily_selection",
                 "--start",
                 data_start_date,
                 "--end",
@@ -336,6 +464,36 @@ async def trigger_backtest(req: BacktestRequest, background_tasks: BackgroundTas
     background_tasks.add_task(run_backtest_task, start_date, end_date)
     return {"status": "success", "message": "Backtest started."}
 
+@app.post("/api/daily_ops/run")
+async def trigger_daily_ops(req: DailyOpsRequest, background_tasks: BackgroundTasks, admin = Depends(check_admin)):
+    strategy = (req.strategy or "v7").strip()
+    if strategy not in ("v5", "v7"):
+        raise HTTPException(status_code=400, detail="Invalid strategy (must be v5 or v7)")
+
+    trading_date = (req.trading_date or "").strip() or None
+    if trading_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", trading_date):
+        raise HTTPException(status_code=400, detail="Invalid trading_date format (expected YYYY-MM-DD)")
+
+    # Concurrency guard
+    if DAILY_OPS_STATUS_FILE.exists():
+        try:
+            with open(DAILY_OPS_STATUS_FILE, "r") as f:
+                data = json.load(f)
+            if data.get("status") == "running":
+                pid = data.get("pid")
+                if pid is not None:
+                    try:
+                        if _is_pid_running(int(pid)):
+                            return {"status": "error", "message": "Daily ops already running"}
+                    except Exception:
+                        return {"status": "error", "message": "Daily ops already running"}
+                # stale running (no pid or pid not running) -> allow new trigger
+        except Exception:
+            pass
+
+    background_tasks.add_task(run_daily_ops_task, strategy, trading_date)
+    return {"status": "success", "message": "Daily ops started."}
+
 @app.get("/api/backtest/status")
 async def get_status(user = Depends(get_current_user)):
     if not STATUS_FILE.exists():
@@ -365,6 +523,25 @@ async def get_status(user = Depends(get_current_user)):
                         return {"status": "idle"}
                 except Exception:
                     pass
+
+    return data
+
+@app.get("/api/daily_ops/status")
+async def get_daily_ops_status(user = Depends(get_current_user)):
+    if not DAILY_OPS_STATUS_FILE.exists():
+        return {"status": "idle"}
+    with open(DAILY_OPS_STATUS_FILE, "r") as f:
+        data = json.load(f)
+
+    if data.get("status") == "running":
+        pid = data.get("pid")
+        if pid is not None:
+            try:
+                if not _is_pid_running(int(pid)):
+                    _update_daily_ops_status("idle", "Stale status reset (process not running).", 0.0)
+                    return {"status": "idle"}
+            except Exception:
+                pass
 
     return data
 

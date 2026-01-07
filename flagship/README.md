@@ -52,7 +52,7 @@ python -m pip install alpaca-py polygon-api-client psycopg2-binary
 
 说明：
 - Polygon API Key：也可以用环境变量 `POLYGON_API_KEY` 覆盖（优先级更高）。
-- Postgres：`flagship/scripts/pg_ticker_db.py` 支持用 `DATABASE_*` 环境变量覆盖连接参数（Docker/EC2 场景）。
+- Postgres：`flagship/universe/pg_ticker_db.py` 支持用 `DATABASE_*` 环境变量覆盖连接参数（Docker/EC2 场景）。
 - OpenAI：仅用于 `flagship/model/diagnose_factors.py` 的可选 LLM 总结（默认模型 `gpt-5.2`）。
 
 ## 目录结构（以仓库根目录为工作目录）
@@ -61,7 +61,7 @@ python -m pip install alpaca-py polygon-api-client psycopg2-binary
   - `flagship/scripts/`：数据准备、增量更新、pipeline、EC2 部署脚本
   - `flagship/model/`：训练/评估/因子诊断
   - `flagship/backtest/`：回测入口（默认 minute + RTH-only）
-  - `flagship/paper_trading/`：Alpaca Paper 全自动日循环 + 盘中 runner
+  - `flagship/trading/`：交易域包（orchestration/execution/intraday/realtime）
   - `flagship/strategy/`：策略类实现（`FlagshipAlphaMomentumStrategy`）
   - `flagship/docs/`：策略与部署文档（本地/服务器侧文件可能被 `.gitignore` 忽略）
 - `lab/flagship_alpha_momentum/`：AlphaLab 输出目录（数据/模型/信号/报告）
@@ -72,7 +72,7 @@ python -m pip install alpaca-py polygon-api-client psycopg2-binary
 ### 1) Regime 训练 +（可选）回测 Pipeline
 
 ```bash
-python flagship/scripts/run_lgb_pipeline.py --regime-id 1 --run-backtest
+python -m flagship.scripts.research.run_lgb_pipeline --regime-id 1 --run-backtest
 ```
 
 ### 2) 回测入口（分钟线 RTH-only 默认启用）
@@ -95,21 +95,20 @@ python flagship/model/diagnose_factors.py \
   --llm-summary --llm-model gpt-5.2
 ```
 
-### 4) Paper Trading：每日全自动（串行批处理 + 盘中守护）
+### 4) 盘后 Daily Cycle（数据更新/选股/训练/推理/产物）
 
 ```bash
-bash flagship/paper_trading/run_full_daily_cycle.sh
+python -m flagship.trading.orchestration.daily_cycle_runner --strategy v7
 ```
 
 要点：
-- `run_full_daily_cycle.sh` 是 **盘前串行任务**（数据更新 → 选股 → 补数 → 训练 → 推理 → 开盘调仓）。
-- 同脚本会启动 **盘中常驻服务** `intraday_runner.py`（分钟级止盈/止损/跟踪止盈等 exit-only）。
-- 可用环境变量关闭盘中 runner：`ENABLE_INTRADAY_RUNNER=0`.
+- Daily Cycle 负责 **盘后批处理**（数据更新 → 选股/补数 → 训练（按规则）→ 推理生成信号 → 快照/报告）。
+- 开盘调仓由常驻 `ExecutorDaemon` 负责；盘中退出由常驻 `IntradayDaemon` 负责（两者在 Docker entrypoint 内启动）。
 
-### 5) 单独启动盘中 Runner（用于调试/守护）
+### 5) 单独启动盘中 Runner（用于调试）
 
 ```bash
-python flagship/paper_trading/intraday_runner.py \
+python -m flagship.trading.intraday.intraday_runner \
   --mode exit-only \
   --rth-only \
   --poll-seconds 20
@@ -138,6 +137,6 @@ docker compose up -d app
 ```
 
 说明：
-- `app` 容器内默认运行 cron（`America/New_York` 时区），定时执行 `flagship/paper_trading/run_full_daily_cycle.sh`
+- `app` 容器内默认运行 cron（`America/New_York` 时区），定时执行 Daily Cycle（`python -m flagship.trading.orchestration.daily_cycle_runner --strategy v7`）
 - Postgres 连接优先读取 `DATABASE_*` 环境变量（见 `docker-compose.yml`）
 

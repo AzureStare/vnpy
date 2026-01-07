@@ -36,9 +36,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from flagship.paper_trading.broker_alpaca import AlpacaAdapter
-from flagship.paper_trading.config import ALPACA_API_KEY, ALPACA_BASE_URL, ALPACA_SECRET_KEY, LAB_PATH, SETTINGS as VT_SETTINGS
-from flagship.scripts.pg_ticker_db import get_pg_connection
+from flagship.trading.execution.broker_alpaca import AlpacaAdapter
+from flagship.trading.config import ALPACA_API_KEY, ALPACA_BASE_URL, ALPACA_SECRET_KEY, LAB_PATH, SETTINGS as VT_SETTINGS
+from flagship.universe.pg_ticker_db import get_pg_connection
 from vnpy.alpha.lab import AlphaLab
 from vnpy.trader.logger import logger
 
@@ -102,6 +102,98 @@ def _parse_hhmm(text: str | None) -> dtime | None:
         except Exception:
             continue
     return None
+
+
+def _get_massive_api_key() -> str | None:
+    api_key = (
+        os.getenv("MASSIVE_API_KEY")
+        or os.getenv("POLYGON_API_KEY")
+        or str(VT_SETTINGS.get("datafeed.password") or "").strip()
+    )
+    api_key = str(api_key or "").strip()
+    return api_key or None
+
+
+def _massive_get_json(path: str, api_key: str, timeout_seconds: int) -> tuple[Any, str | None]:
+    """
+    Minimal Massive (Polygon rebrand) REST helper using stdlib urllib.
+    Returns: (payload_json, date_header)
+    """
+    import urllib.parse
+    import urllib.request
+
+    base = "https://api.massive.com"
+    url = f"{base}{path}"
+    url = f"{url}?{urllib.parse.urlencode({'apiKey': api_key})}"
+
+    req = urllib.request.Request(url=url, method="GET", headers={"User-Agent": "flagship-app-console/1.0"})
+    with urllib.request.urlopen(req, timeout=int(timeout_seconds)) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw), resp.headers.get("Date")
+
+
+def _normalize_holiday_status(text: str | None) -> str:
+    return str(text or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _fetch_massive_upcoming_holidays(api_key: str, timeout_seconds: int) -> dict[date, dict[str, Any]]:
+    """
+    Fetch upcoming holidays/early closes from Massive.
+    Returns mapping: date -> raw holiday dict.
+    """
+    out: dict[date, dict[str, Any]] = {}
+    try:
+        payload, _ = _massive_get_json("/v1/marketstatus/upcoming", api_key=api_key, timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        logger.warning(f"[app_console_snapshot] massive upcoming fetch failed: {exc}")
+        return out
+
+    items: list[dict[str, Any]] = []
+    if isinstance(payload, list):
+        items = [it for it in payload if isinstance(it, dict)]
+    elif isinstance(payload, dict):
+        raw_items = payload.get("results")
+        if isinstance(raw_items, list):
+            items = [it for it in raw_items if isinstance(it, dict)]
+
+    for it in items:
+        try:
+            d = date.fromisoformat(str(it.get("date") or ""))
+        except Exception:
+            continue
+        out[d] = it
+    return out
+
+
+def _is_closed_trading_day(d: date, holiday_by_date: dict[date, dict[str, Any]] | None = None) -> bool:
+    """
+    True if market is closed on date d:
+    - weekend
+    - holiday status=closed (when available)
+    """
+    if d.weekday() >= 5:
+        return True
+    it = (holiday_by_date or {}).get(d)
+    if not it:
+        return False
+    return _normalize_holiday_status(it.get("status")) == "closed"
+
+
+def _next_trading_day(after_date: date, holiday_by_date: dict[date, dict[str, Any]] | None = None) -> date:
+    """
+    Return next trading day AFTER after_date, skipping weekend and known 'closed' holidays.
+    """
+    d = after_date + timedelta(days=1)
+    for _ in range(14):  # safety bound (~2 weeks)
+        if _is_closed_trading_day(d, holiday_by_date=holiday_by_date):
+            d += timedelta(days=1)
+            continue
+        return d
+
+    # Fallback: weekday-only
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
 
 
 # ---------------- Alpaca REST (fallback) ----------------
@@ -212,6 +304,7 @@ def snapshot_orders(output_dir: Path, limit: int = 1000) -> Dict[str, Any]:
                             "side": o.get("side"),
                             "qty": float(o.get("qty") or 0),
                             "filled_qty": float(o.get("filled_qty") or 0),
+                            "filled_avg_price": float(o["filled_avg_price"]) if o.get("filled_avg_price") is not None else None,
                             "status": o.get("status"),
                             "order_type": o.get("order_type"),
                             "limit_price": float(o["limit_price"]) if o.get("limit_price") is not None else None,
@@ -230,6 +323,7 @@ def snapshot_orders(output_dir: Path, limit: int = 1000) -> Dict[str, Any]:
                         "side": o.side.value if hasattr(o.side, "value") else str(o.side),
                         "qty": float(o.qty) if o.qty else 0,
                         "filled_qty": float(o.filled_qty) if o.filled_qty else 0,
+                        "filled_avg_price": float(getattr(o, "filled_avg_price", None)) if getattr(o, "filled_avg_price", None) is not None else None,
                         "status": o.status.value if hasattr(o.status, "value") else str(o.status),
                         "order_type": o.order_type.value if hasattr(o.order_type, "value") else str(o.order_type),
                         "limit_price": float(o.limit_price) if o.limit_price else None,
@@ -361,11 +455,7 @@ def snapshot_market_status(output_dir: Path, timeout_seconds: int = DEFAULT_MASS
     API:
     - GET /v1/marketstatus/now?apiKey=...
     """
-    api_key = (
-        os.getenv("MASSIVE_API_KEY")
-        or os.getenv("POLYGON_API_KEY")
-        or str(VT_SETTINGS.get("datafeed.password") or "").strip()
-    )
+    api_key = _get_massive_api_key()
     if not api_key:
         data = {
             "generated_at": _now_iso(),
@@ -377,18 +467,10 @@ def snapshot_market_status(output_dir: Path, timeout_seconds: int = DEFAULT_MASS
         logger.warning("[app_console_snapshot] market_status: api key missing (set vt_setting.json datafeed.password or MASSIVE_API_KEY)")
         return data
 
-    import urllib.parse
-    import urllib.request
-
-    url = "https://api.massive.com/v1/marketstatus/now"
-    url = f"{url}?{urllib.parse.urlencode({'apiKey': api_key})}"
-
     try:
-        req = urllib.request.Request(url=url, method="GET", headers={"User-Agent": "flagship-app-console/1.0"})
-        with urllib.request.urlopen(req, timeout=int(timeout_seconds)) as resp:
-            raw = resp.read().decode("utf-8")
-            payload = json.loads(raw)
-            date_header = resp.headers.get("Date")
+        payload, date_header = _massive_get_json(
+            "/v1/marketstatus/now", api_key=api_key, timeout_seconds=timeout_seconds
+        )
     except Exception as exc:
         data = {
             "generated_at": _now_iso(),
@@ -413,42 +495,7 @@ def snapshot_market_status(output_dir: Path, timeout_seconds: int = DEFAULT_MASS
         server_dt = server_dt.replace(tzinfo=timezone.utc)
     server_et = server_dt.astimezone(EASTERN)
 
-    # Fetch upcoming holidays/early closes to compute next open (Massive upcoming endpoint).
-    holiday_by_date: dict[date, dict[str, Any]] = {}
-    try:
-        upcoming_url = "https://api.massive.com/v1/marketstatus/upcoming"
-        upcoming_url = f"{upcoming_url}?{urllib.parse.urlencode({'apiKey': api_key})}"
-        req2 = urllib.request.Request(url=upcoming_url, method="GET", headers={"User-Agent": "flagship-app-console/1.0"})
-        with urllib.request.urlopen(req2, timeout=int(timeout_seconds)) as resp2:
-            raw2 = resp2.read().decode("utf-8")
-            upcoming_payload = json.loads(raw2)
-
-        items: list[dict[str, Any]] = []
-        if isinstance(upcoming_payload, list):
-            items = [it for it in upcoming_payload if isinstance(it, dict)]
-        elif isinstance(upcoming_payload, dict):
-            # Some APIs may wrap list under 'results'
-            raw_items = upcoming_payload.get("results")
-            if isinstance(raw_items, list):
-                items = [it for it in raw_items if isinstance(it, dict)]
-
-        for it in items:
-            try:
-                d = date.fromisoformat(str(it.get("date") or ""))
-            except Exception:
-                continue
-            holiday_by_date[d] = it
-    except Exception as exc:
-        logger.warning(f"[app_console_snapshot] market_status upcoming fetch failed: {exc}")
-
-    def _is_closed_day(d: date) -> bool:
-        if d.weekday() >= 5:
-            return True
-        it = holiday_by_date.get(d)
-        if not it:
-            return False
-        status = str(it.get("status") or "").strip().lower().replace("-", "_").replace(" ", "_")
-        return status == "closed"
+    holiday_by_date = _fetch_massive_upcoming_holidays(api_key=api_key, timeout_seconds=timeout_seconds)
 
     def _session_open_time(d: date) -> dtime:
         it = holiday_by_date.get(d)
@@ -461,7 +508,7 @@ def snapshot_market_status(output_dir: Path, timeout_seconds: int = DEFAULT_MASS
     next_open_dt: datetime | None = None
     cursor_date = server_et.date()
     for _ in range(30):  # safety bound (~6 weeks)
-        if _is_closed_day(cursor_date):
+        if _is_closed_trading_day(cursor_date, holiday_by_date=holiday_by_date):
             cursor_date += timedelta(days=1)
             continue
         open_dt = datetime.combine(cursor_date, _session_open_time(cursor_date), tzinfo=EASTERN)
@@ -720,20 +767,30 @@ def snapshot_selection(output_dir: Path, lab_path: Path, top_n: int = DEFAULT_SE
         signal_all.select(pl.col("datetime").dt.date().unique()).to_series().to_list()  # type: ignore[attr-defined]
     )
     candidates = _load_recent_selection_dates(max_signal_date, DEFAULT_SELECTION_DATE_CANDIDATES)
-    as_of_date = next((d for d in candidates if d in signal_dates), max_signal_date)
+    signal_date = next((d for d in candidates if d in signal_dates), max_signal_date)
 
-    signal_df = _slice_signal_for_date(signal_all, as_of_date)
-    selection_map = _load_daily_selection(as_of_date)
+    # Live semantics:
+    # - signal_date: the close date used to compute factors/signals (DATA_DATE)
+    # - trade_date: next trading day when these signals are intended to be executed at open
+    api_key = _get_massive_api_key()
+    holiday_by_date: dict[date, dict[str, Any]] = {}
+    if api_key:
+        holiday_by_date = _fetch_massive_upcoming_holidays(api_key=api_key, timeout_seconds=DEFAULT_MASSIVE_TIMEOUT_SECONDS)
+    trade_date = _next_trading_day(signal_date, holiday_by_date=holiday_by_date)
+
+    signal_df = _slice_signal_for_date(signal_all, signal_date)
+    selection_map = _load_daily_selection(signal_date)
 
     rows: List[Dict[str, Any]] = []
     if selection_map:
-        rows = build_selection_rows(signal_df, selection_map, top_n, lab_path=lab_path, as_of_date=as_of_date)
+        rows = build_selection_rows(signal_df, selection_map, top_n, lab_path=lab_path, as_of_date=signal_date)
     if not rows:
-        rows = build_signal_only_rows(signal_df, top_n, lab_path=lab_path, as_of_date=as_of_date)
+        rows = build_signal_only_rows(signal_df, top_n, lab_path=lab_path, as_of_date=signal_date)
 
     data = {
         "generated_at": _now_iso(),
-        "as_of_date": as_of_date.isoformat(),
+        "as_of_date": trade_date.isoformat(),
+        "signal_date": signal_date.isoformat(),
         "rows": rows,
     }
     target = output_dir / "selection.json"
@@ -742,7 +799,7 @@ def snapshot_selection(output_dir: Path, lab_path: Path, top_n: int = DEFAULT_SE
     # Save a historical copy
     history_dir = output_dir / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
-    history_target = history_dir / f"selection_{as_of_date.strftime('%Y%m%d')}.json"
+    history_target = history_dir / f"selection_{trade_date.strftime('%Y%m%d')}.json"
     _atomic_write_json(history_target, data)
     
     logger.info(f"[app_console_snapshot] wrote {target} and history {history_target}")

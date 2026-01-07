@@ -39,11 +39,6 @@ RUN python -m pip install --upgrade pip setuptools wheel \
     && pip install ".[alpha]" \
     && pip install polygon-api-client alpaca-py psycopg2-binary fastapi uvicorn python-jose[cryptography] python-multipart boto3
 
-# Runtime scripts
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh \
-    && chmod +x /app/flagship/paper_trading/run_full_daily_cycle.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["python", "-m", "flagship.scripts.jobs.container_entrypoint"]
 
 
