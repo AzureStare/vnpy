@@ -64,6 +64,26 @@ services:
       - ./vt_setting.json:/app/vt_setting.json:ro
     restart: unless-stopped
 
+  # --- IBKR Gateway (Paper) ---
+  # One IB Gateway instance per IBKR login (account). Keep it internal-only (no public port exposure).
+  # Credentials MUST be provided via server-side .env (do not commit).
+  ib_gateway_paper_01:
+    # NOTE: Use actively maintained image (newer IB Gateway builds) for login compatibility.
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: vnpy_ib_gateway_paper_01
+    environment:
+      TRADING_MODE: "paper"
+      TWS_USERID: "${IBKR_PAPER_01_USERID:-}"
+      TWS_PASSWORD: "${IBKR_PAPER_01_PASSWORD:-}"
+      # Ensure API connections are accepted (we also restrict via Trusted IPs/default container networking).
+      TWS_ACCEPT_INCOMING: "accept"
+      READ_ONLY_API: "no"
+      # Optional: set to allow VNC debugging (leave empty to disable password auth depending on image defaults).
+      VNC_SERVER_PASSWORD: "${IBKR_VNC_PASSWORD:-}"
+      # Paper gateway typically listens on 4002 by default (inside container).
+      # Expose internally to other containers; no host port mapping needed.
+    restart: unless-stopped
+
   # --- Monitoring stack (Prometheus + Grafana) ---
   prometheus:
     image: prom/prometheus:v2.53.0

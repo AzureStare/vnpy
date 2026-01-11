@@ -4,10 +4,12 @@ import { UserRole } from "../lib/auth";
 import { cn } from "../lib/cn";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
+import { MarketTimeStatus } from "./MarketTimeStatus";
 import { TimeZones } from "./TimeZones";
 
 const LABEL: Record<RouteKey, string> = {
-  paper: "Paper",
+  accounts: "Accounts",
+  portfolio: "Portfolio",
   backtest: "Backtest",
   reports: "Reports",
   settings: "Settings",
@@ -21,7 +23,7 @@ export function Layout(props: {
   children: React.ReactNode;
 }) {
   const { route, isAdmin, role, onLogout, children } = props;
-  const tabs = ROUTES.filter((r) => (isAdmin ? true : r === "paper" || r === "reports"));
+  const tabs = ROUTES.filter((r) => (isAdmin ? true : r === "portfolio" || r === "reports"));
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -32,10 +34,11 @@ export function Layout(props: {
               <div className="text-lg font-semibold tracking-tight">Flagship Ops Console</div>
               <Badge variant="outline">role={role}</Badge>
             </div>
-            <div className="mt-1 text-sm text-muted-foreground">Paper trading dashboard</div>
+            <div className="mt-1 text-sm text-muted-foreground">Trading dashboard</div>
           </div>
           <div className="flex items-center gap-2">
             <TimeZones />
+            <MarketTimeStatus />
             <Button variant="outline" onClick={onLogout}>
               Logout
             </Button>

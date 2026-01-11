@@ -13,13 +13,13 @@ NOTE:
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict
 
 import polars as pl
-from alpaca.trading.enums import OrderSide
 
 from vnpy.alpha.lab import AlphaLab
 from vnpy.trader.constant import Interval
@@ -27,8 +27,9 @@ from vnpy.trader.logger import logger
 from vnpy.trader.object import BarData
 
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
-from flagship.trading.execution.broker_alpaca import AlpacaAdapter
 from flagship.trading.config import LAB_PATH
+from flagship.trading.controls import get_disabled_vt_symbols
+from flagship.trading.execution.broker_base import BrokerAdapter, OrderSide
 from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
 from flagship.strategy.flagship_alpha_momentum_strategy_v7 import (
     FlagshipAlphaMomentumStrategy as FlagshipAlphaMomentumStrategyV7,
@@ -39,7 +40,7 @@ class _MockEngine:
     Minimal engine wrapper to satisfy Strategy requirements for target generation.
     """
 
-    def __init__(self, adapter: AlpacaAdapter):
+    def __init__(self, adapter: BrokerAdapter):
         self.adapter = adapter
         self.orders: dict[str, Any] = {}
         self.trades: dict[str, Any] = {}
@@ -104,7 +105,7 @@ class StrategyRunner:
     Runs the vnpy strategy logic using daily bars and the latest signal snapshot to determine target positions.
     """
 
-    def __init__(self, adapter: AlpacaAdapter, *, strategy_version: str = "v7", lab_path: Path = LAB_PATH):
+    def __init__(self, adapter: BrokerAdapter, *, strategy_version: str = "v7", lab_path: Path = LAB_PATH):
         self.adapter = adapter
         self.engine = _MockEngine(adapter)
         self.lab = AlphaLab(str(lab_path))
@@ -193,13 +194,22 @@ class StrategyRunner:
         self.engine.root_close = root_close
         logger.info(f"[OpenRebalance] constructed {len(bars)} bars for strategy execution.")
 
+        # Trading controls (dynamic): disabled symbols block new entries (strategy handles semantics).
+        disabled = get_disabled_vt_symbols()
+        try:
+            setattr(self.strategy, "disabled_vt_symbols", sorted(disabled))
+        except Exception:
+            pass
+        if disabled:
+            logger.info(f"[OpenRebalance] trading controls: disabled_symbols={len(disabled)}")
+
         self.strategy.on_bars(bars)
         targets = self.strategy.target_data
         logger.info(f"[OpenRebalance] strategy generated {len(targets)} target positions.")
         return targets
 
 
-def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]) -> None:
+def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_exposure_multiplier: float = 1.0) -> None:
     """
     Compare targets with actual positions and execute orders (market orders).
     Also writes `flagship_executor.prom` metrics for last run summary.
@@ -213,7 +223,7 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]) -> None
     current_positions = adapter.get_positions()
     buying_power = adapter.get_buying_power()
     budget = buying_power * 0.98  # safety buffer
-    logger.info(f"[Alpaca] buying_power={buying_power:.2f}, budget={budget:.2f}")
+    logger.info(f"[OpenRebalance] account={adapter.get_account_id()} buying_power={buying_power:.2f}, budget={budget:.2f}")
 
     # 1) Sell first
     for vt_symbol, target_qty in targets.items():
@@ -238,8 +248,16 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]) -> None
 
     # 2) Recompute buying power and plan buys
     buying_power = adapter.get_buying_power()
-    budget = buying_power * 0.98
-    logger.info(f"[Alpaca] buying_power_for_buys={buying_power:.2f}, budget={budget:.2f}")
+    budget_raw = buying_power * 0.98
+    m = float(buy_exposure_multiplier)
+    if not math.isfinite(m):
+        m = 1.0
+    m = float(min(1.0, max(0.0, m)))
+    budget = budget_raw * m
+    logger.info(
+        f"[OpenRebalance] account={adapter.get_account_id()} buying_power_for_buys={buying_power:.2f}, "
+        f"budget_raw={budget_raw:.2f}, buy_exposure_multiplier={m:.2f}, budget={budget:.2f}"
+    )
 
     buy_orders: list[dict[str, float | int | str]] = []
     total_estimated_cost = 0.0
@@ -293,6 +311,7 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]) -> None
             Sample("flagship_executor_sell_orders_submitted", float(sell_orders_submitted)),
             Sample("flagship_executor_buy_orders_submitted", float(buy_orders_submitted)),
             Sample("flagship_executor_buy_scale_ratio", float(buy_scale_ratio)),
+            Sample("flagship_executor_buy_exposure_multiplier", float(m)),
             Sample("flagship_executor_buying_power", float(buying_power)),
             Sample("flagship_executor_budget", float(budget)),
             Sample("flagship_executor_total_estimated_buy_cost", float(total_estimated_cost)),
@@ -302,6 +321,7 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]) -> None
             "flagship_executor_sell_orders_submitted": "Number of sell orders submitted in last rebalance run.",
             "flagship_executor_buy_orders_submitted": "Number of buy orders submitted in last rebalance run.",
             "flagship_executor_buy_scale_ratio": "Buy scaling ratio applied due to buying power constraint (1.0=no scale).",
+            "flagship_executor_buy_exposure_multiplier": "Buy-side exposure multiplier applied to budget (0..1).",
             "flagship_executor_buying_power": "Buying power observed at the start of buy planning.",
             "flagship_executor_budget": "Budget used for buy planning (buying_power * buffer).",
             "flagship_executor_total_estimated_buy_cost": "Estimated total buy cost before scaling.",
@@ -311,6 +331,7 @@ def execute_rebalance(adapter: AlpacaAdapter, targets: Dict[str, float]) -> None
             "flagship_executor_sell_orders_submitted": "gauge",
             "flagship_executor_buy_orders_submitted": "gauge",
             "flagship_executor_buy_scale_ratio": "gauge",
+            "flagship_executor_buy_exposure_multiplier": "gauge",
             "flagship_executor_buying_power": "gauge",
             "flagship_executor_budget": "gauge",
             "flagship_executor_total_estimated_buy_cost": "gauge",

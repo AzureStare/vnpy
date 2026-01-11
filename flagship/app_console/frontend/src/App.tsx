@@ -8,7 +8,8 @@ import { fetchJson } from "./lib/api";
 import { playCloseSound, playOpenSound } from "./lib/sound";
 import { loadTradeAlertsState, saveTradeAlertsState, TradeAlertsState } from "./lib/trade_alerts";
 
-import { PaperPage } from "./pages/PaperPage";
+import { PortfolioPage } from "./pages/PortfolioPage";
+import { AccountsPage } from "./pages/AccountsPage";
 import { BacktestPage } from "./pages/BacktestPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -150,7 +151,8 @@ function AppInner() {
 
   return (
     <Layout route={route} isAdmin={isAdmin} role={role} onLogout={onLogout}>
-      {route === "paper" && <PaperPage />}
+      {route === "accounts" && isAdmin && <AccountsPage />}
+      {route === "portfolio" && <PortfolioPage />}
       {route === "backtest" && isAdmin && <BacktestPage />}
       {route === "reports" && <ReportsPage />}
       {route === "settings" && isAdmin && <SettingsPage isAdmin={isAdmin} role={role} alerts={alerts} setAlerts={setAlerts} />}

@@ -266,6 +266,9 @@ def generate_trade_recap(
     portfolio_payload = _load_json(portfolio_path)
     exit_events = _parse_exit_events(intraday_log_path)
 
+    orders_generated_at = str(orders_payload.get("generated_at") or "")
+    portfolio_generated_at = str(portfolio_payload.get("generated_at") or "")
+
     orders: List[Dict[str, Any]] = list(orders_payload.get("orders") or [])
     positions: List[Dict[str, Any]] = list(portfolio_payload.get("positions") or [])
 
@@ -279,7 +282,7 @@ def generate_trade_recap(
         if filled_at_et.date() != trade_date:
             continue
         status = (o.get("status") or "").lower()
-        if status != "filled":
+        if status not in ("filled", "partially_filled"):
             continue
         filled_qty = _safe_float(o.get("filled_qty"))
         if not filled_qty or filled_qty <= 0:
@@ -454,30 +457,34 @@ def generate_trade_recap(
     <title>Flagship {strategy_version.upper()} 交易复盘（{trade_date.isoformat()}）</title>
     <style>
       :root {{
-        --bg: #0b1020;
-        --panel: rgba(18, 26, 51, 0.78);
-        --border: rgba(255, 255, 255, 0.14);
-        --text: #e8eeff;
-        --muted: #a8b2d6;
-        --ok: #48d07e;
-        --bad: #ff5a6a;
+        /* Match Ops Console (Tailwind-ish light theme) */
+        --bg: #f8fafc;         /* slate-50 */
+        --card: #ffffff;
+        --border: #e2e8f0;     /* slate-200 */
+        --text: #0f172a;       /* slate-900 */
+        --muted: #64748b;      /* slate-500 */
+        --muted2: #94a3b8;     /* slate-400 */
+        --primary: #2563eb;    /* blue-600 */
+        --ok: #16a34a;         /* green-600 */
+        --bad: #dc2626;        /* red-600 */
       }}
       body {{
         margin: 0;
         background: var(--bg);
         color: var(--text);
-        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans";
         line-height: 1.55;
       }}
       .container {{ max-width: 1100px; margin: 28px auto 60px; padding: 0 18px; }}
       h1 {{ margin: 0 0 8px; font-size: 22px; }}
       .sub {{ margin: 4px 0 16px; color: var(--muted); font-size: 13px; }}
       .card {{
-        background: var(--panel);
+        background: var(--card);
         border: 1px solid var(--border);
         border-radius: 16px;
         padding: 16px;
         margin-top: 12px;
+        box-shadow: 0 1px 0 rgba(15, 23, 42, 0.02);
       }}
       h2 {{ margin: 0 0 10px; font-size: 16px; }}
       h3 {{ margin: 12px 0 8px; font-size: 14px; }}
@@ -486,10 +493,20 @@ def generate_trade_recap(
       li {{ margin: 4px 0; }}
       table {{ width: 100%; border-collapse: collapse; margin-top: 6px; }}
       th, td {{ border: 1px solid var(--border); padding: 8px 10px; vertical-align: top; font-size: 13px; }}
-      th {{ text-align: left; color: var(--muted); background: rgba(10, 15, 31, 0.35); }}
-      .pill {{ display: inline-flex; gap: 6px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); font-size: 12px; color: var(--muted); background: rgba(255,255,255,0.05); }}
-      .pill.ok {{ color: var(--ok); border-color: rgba(72,208,126,0.35); }}
-      .pill.bad {{ color: var(--bad); border-color: rgba(255,90,106,0.35); }}
+      th {{ text-align: left; color: var(--muted); background: #f1f5f9; }}
+      .pill {{
+        display: inline-flex;
+        gap: 6px;
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        font-size: 12px;
+        color: var(--muted);
+        background: #ffffff;
+      }}
+      .pill.ok {{ color: var(--ok); border-color: rgba(22, 163, 74, 0.25); background: rgba(22, 163, 74, 0.06); }}
+      .pill.bad {{ color: var(--bad); border-color: rgba(220, 38, 38, 0.25); background: rgba(220, 38, 38, 0.06); }}
+      code {{ color: var(--text); background: #f1f5f9; border: 1px solid var(--border); border-radius: 8px; padding: 1px 6px; }}
       @media print {{
         body {{ background: #fff; color: #111; }}
         .card {{ background: #fff; border-color: #ddd; }}
@@ -504,6 +521,9 @@ def generate_trade_recap(
       <p class="sub">
         数据来源：<span class="pill">{orders_path.name}</span>、<span class="pill">{portfolio_path.name}</span>、
         <span class="pill">{intraday_log_path.name}</span>
+      </p>
+      <p class="sub">
+        快照时间（UTC）：orders=<code>{orders_generated_at or "unknown"}</code> · portfolio=<code>{portfolio_generated_at or "unknown"}</code>
       </p>
 
       <section class="card">

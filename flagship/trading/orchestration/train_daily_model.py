@@ -19,7 +19,7 @@ from vnpy.trader.constant import Interval
 from vnpy.alpha.lab import AlphaLab
 from vnpy.alpha.dataset import Segment
 from flagship.trading.config import (
-    LAB_PATH, LIVE_MODEL_PATH, CURRENT_REGIME_ID
+    LAB_PATH, LIVE_MODEL_PATH, LIVE_LR_MODEL_PATH
 )
 from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
 from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
@@ -32,7 +32,7 @@ def train_daily_model(
     target_date: date | None = None,
     lab_path: Path = LAB_PATH,
     output_model_path: Path = LIVE_MODEL_PATH,
-    regime_id: int = CURRENT_REGIME_ID,
+    output_lr_model_path: Path = LIVE_LR_MODEL_PATH,
     strategy_version: str = "v7"
 ) -> None:
     """
@@ -42,7 +42,7 @@ def train_daily_model(
         target_date: The current trading date. Training will use data before this.
         lab_path: Path to AlphaLab.
         output_model_path: Path to save the new model.
-        regime_id: ID of the regime (for potential parameter lookup).
+        output_lr_model_path: Path to save the Logistic Regression meta model (v7 only).
         strategy_version: "v5" or "v7".
     """
     if target_date is None:
@@ -209,6 +209,71 @@ def train_daily_model(
     history_path = history_dir / f"booster_{target_date.strftime('%Y%m%d')}_{strategy_version}.joblib"
     joblib.dump(booster, history_path)
     logger.info(f"[train_daily_model] History model saved to: {history_path}")
+
+    # 6.5 Train Logistic Regression meta model (v7 only): p_up = P(label_excess_5d > 0)
+    lr_info: dict[str, object] | None = None
+    if strategy_version == "v7":
+        try:
+            from sklearn.linear_model import LogisticRegression  # type: ignore
+            from sklearn.pipeline import Pipeline  # type: ignore
+            from sklearn.preprocessing import StandardScaler  # type: ignore
+            import numpy as np  # type: ignore
+
+            if "label_excess_5d" not in valid_df.columns:
+                raise RuntimeError("valid_df missing label_excess_5d (check v7 dataset post_process)")
+
+            lgb_feature_cols = list(booster.feature_name() or [])
+            if not lgb_feature_cols:
+                lgb_feature_cols = list(feature_cols)
+
+            missing_for_pred = [c for c in lgb_feature_cols if c not in valid_df.columns]
+            if missing_for_pred:
+                raise RuntimeError(f"valid_df missing lgb features: {missing_for_pred[:10]}")
+
+            valid_pd = valid_df.select(["vt_symbol", "label_excess_5d", *lgb_feature_cols]).to_pandas()
+            X_lgb = valid_pd[lgb_feature_cols]
+            lgb_signal = booster.predict(X_lgb)
+            valid_pd["lgb_signal"] = lgb_signal
+
+            # Filter: exclude SPY and rows without labels
+            valid_pd = valid_pd[valid_pd["vt_symbol"] != "SPY.NASDAQ"]
+            valid_pd = valid_pd.replace([np.inf, -np.inf], np.nan)
+
+            lr_feature_cols = ["lgb_signal", *lgb_feature_cols]
+            valid_pd = valid_pd.dropna(subset=["label_excess_5d", *lr_feature_cols])
+            if valid_pd.empty:
+                raise RuntimeError("no valid rows for LR training after dropna")
+
+            y = (valid_pd["label_excess_5d"].astype(float) > 0.0).astype(int).to_numpy()
+            if int(np.min(y)) == int(np.max(y)):
+                raise RuntimeError("LR training requires both classes; got a single class in y")
+
+            X = valid_pd[lr_feature_cols].to_numpy(dtype=float)
+
+            pipe = Pipeline(
+                steps=[
+                    ("scaler", StandardScaler(with_mean=True, with_std=True)),
+                    ("clf", LogisticRegression(max_iter=400, class_weight="balanced")),
+                ]
+            )
+            pipe.fit(X, y)
+
+            # Save artifact
+            output_lr_model_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact = {
+                "pipeline": pipe,
+                "feature_cols": lr_feature_cols,
+                "label": "label_excess_5d>0",
+                "strategy_version": strategy_version,
+                "trained_at": datetime.now().isoformat(),
+                "n_samples": int(len(valid_pd)),
+                "pos_rate": float(np.mean(y)),
+            }
+            joblib.dump(artifact, output_lr_model_path)
+            logger.info(f"[train_daily_model] LR model saved to: {output_lr_model_path}")
+            lr_info = artifact
+        except Exception as exc:
+            logger.warning(f"[train_daily_model] LR meta model skipped/failed: {exc}")
     
     # Save training metrics for app console
     metrics = {
@@ -218,6 +283,7 @@ def train_daily_model(
         "train_period": train_period,
         "valid_period": valid_period,
         "feature_importance": dict(zip(feature_cols, booster.feature_importance().tolist())),
+        "lr_meta_model": lr_info,
         "generated_at": datetime.now().isoformat()
     }
     metrics_path = PROJECT_ROOT / "logs" / "app" / "model_metrics.json"

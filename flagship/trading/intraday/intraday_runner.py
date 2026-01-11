@@ -37,6 +37,7 @@ from flagship.config.polygon_config import get_polygon_api_key
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
 from flagship.trading.execution.broker_alpaca import AlpacaAdapter
 from flagship.trading.config import DAILY_SIGNAL_FILE, LAB_PATH
+from flagship.trading.controls import get_disabled_vt_symbols
 from flagship.trading.realtime.polygon_ws import (
     Market,
     POLYGON_WS_AVAILABLE,
@@ -106,6 +107,17 @@ def _build_watchlist(
     source: str,
     signal_top_n: int,
 ) -> list[WatchedSymbol]:
+    disabled_roots: set[str] = set()
+    try:
+        disabled_vt = get_disabled_vt_symbols()
+        disabled_roots = {str(v).split(".")[0] for v in disabled_vt if str(v).strip()}
+    except Exception:
+        disabled_roots = set()
+
+    positions_roots: set[str] = set()
+    if source in (SymbolsSource.POSITIONS, SymbolsSource.BOTH):
+        positions_roots = set(adapter.get_positions().keys())
+
     root_to_vt: dict[str, str] = {}
     if signal_df is not None:
         df = signal_df
@@ -128,11 +140,14 @@ def _build_watchlist(
         for vt in df["vt_symbol"].to_list():
             vt_str = str(vt)
             root = vt_str.split(".")[0]
+            # Disabled symbols: do not subscribe from signal list, unless it's already held.
+            if root in disabled_roots and root not in positions_roots and vt_str != "SPY.NASDAQ":
+                continue
             root_to_vt[root] = vt_str
 
     roots: set[str] = set()
     if source in (SymbolsSource.POSITIONS, SymbolsSource.BOTH):
-        roots.update(adapter.get_positions().keys())
+        roots.update(positions_roots)
     if signal_df is not None and source in (SymbolsSource.SIGNAL, SymbolsSource.BOTH):
         roots.update(root_to_vt.keys())
 

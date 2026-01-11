@@ -20,6 +20,15 @@ type DailyOpsStatus = {
   log_file?: string;
 };
 
+type ModelTrainStatus = {
+  status?: string;
+  message?: string;
+  progress?: number;
+  updated_at?: string;
+  pid?: number;
+  log_file?: string;
+};
+
 function inferSubdomainUrl(sub: string): string {
   const proto = window.location.protocol || "https:";
   const host = window.location.hostname || "";
@@ -41,6 +50,7 @@ export function SettingsPage(props: {
   const [notifPerm, setNotifPerm] = useState<string>(() => (typeof Notification === "undefined" ? "unsupported" : Notification.permission));
 
   const [dailyOps, setDailyOps] = useState<DailyOpsStatus | null>(null);
+  const [modelTrain, setModelTrain] = useState<ModelTrainStatus | null>(null);
   const [users, setUsers] = useState<UserOut[]>([]);
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -78,6 +88,20 @@ export function SettingsPage(props: {
     void loadDailyOpsStatus();
   }, [loadDailyOpsStatus]);
 
+  const loadModelTrainStatus = useCallback(async () => {
+    if (!isAdmin) return;
+    try {
+      const st = await fetchJson<ModelTrainStatus>("/api/model/train/status", { method: "GET" });
+      setModelTrain(st);
+    } catch (_) {
+      // ignore transient
+    }
+  }, [isAdmin]);
+
+  useEffect(() => {
+    void loadModelTrainStatus();
+  }, [loadModelTrainStatus]);
+
   const runDailyOps = useCallback(async () => {
     if (!isAdmin) return;
     try {
@@ -94,6 +118,22 @@ export function SettingsPage(props: {
     }
   }, [isAdmin, toast, loadDailyOpsStatus]);
 
+  const runModelTrain = useCallback(async () => {
+    if (!isAdmin) return;
+    try {
+      toast.push("Model Training", "Starting model training...", "info", 3000);
+      await fetchJson("/api/model/train", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ strategy: "v7" }),
+      });
+      toast.push("Model Training", "Started", "good", 4000);
+      await loadModelTrainStatus();
+    } catch (e: any) {
+      toast.push("Model Training", String(e?.message || e), "bad", 8000);
+    }
+  }, [isAdmin, toast, loadModelTrainStatus]);
+
   const dailyOpsStatus = useMemo(() => {
     return String(dailyOps?.status || "idle");
   }, [dailyOps]);
@@ -106,6 +146,19 @@ export function SettingsPage(props: {
   }, [dailyOpsStatus]);
 
   const dailyOpsRunning = dailyOpsStatus === "running";
+
+  const modelTrainStatus = useMemo(() => {
+    return String(modelTrain?.status || "idle");
+  }, [modelTrain]);
+
+  const modelTrainBadgeVariant = useMemo(() => {
+    if (modelTrainStatus === "running") return "info" as const;
+    if (modelTrainStatus === "completed") return "good" as const;
+    if (modelTrainStatus === "failed") return "bad" as const;
+    return "outline" as const;
+  }, [modelTrainStatus]);
+
+  const modelTrainRunning = modelTrainStatus === "running";
 
   const enableAlerts = useCallback(async () => {
     setAlerts((prev) => ({ ...prev, enabled: true }));
@@ -217,6 +270,38 @@ export function SettingsPage(props: {
       <Card className="col-span-12">
         <CardHeader>
           <div>
+            <CardTitle>Model Training</CardTitle>
+            <CardDescription>Manual model retrain only (admin only)</CardDescription>
+          </div>
+          <Badge variant={modelTrainBadgeVariant}>
+            {modelTrainStatus}
+            {modelTrain?.updated_at ? ` · ${modelTrain.updated_at}` : ""}
+          </Badge>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button onClick={() => void runModelTrain()} disabled={modelTrainRunning}>
+              {modelTrainRunning ? "Running..." : "Train Model"}
+            </Button>
+            <Button variant="outline" onClick={() => void loadModelTrainStatus()}>
+              Refresh status
+            </Button>
+            {modelTrain?.log_file ? (
+              <a className="text-sm font-medium text-primary hover:underline" href={`/data/${modelTrain.log_file}`} target="_blank" rel="noopener noreferrer">
+                Open log
+              </a>
+            ) : null}
+            <a className="text-sm font-medium text-primary hover:underline" href="/data/model_metrics.json" target="_blank" rel="noopener noreferrer">
+              model_metrics.json
+            </a>
+          </div>
+          {modelTrain?.message ? <div className="mt-3 text-sm text-muted-foreground">{modelTrain.message}</div> : null}
+        </CardContent>
+      </Card>
+
+      <Card className="col-span-12">
+        <CardHeader>
+          <div>
             <CardTitle>Monitoring</CardTitle>
             <CardDescription>Grafana / Prometheus / PGAdmin quick links (admin only)</CardDescription>
           </div>
@@ -263,6 +348,14 @@ export function SettingsPage(props: {
               rel="noopener noreferrer"
             >
               orders.json
+            </a>
+            <a
+              className="inline-flex h-9 items-center rounded-md border border-border bg-background px-3 text-sm font-medium hover:bg-muted/50"
+              href="/data/model_metrics.json"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              model_metrics.json
             </a>
           </div>
 

@@ -6,6 +6,7 @@ Outputs:
 - logs/app/selection.json
 - logs/app/orders.json
 - logs/app/performance.json
+- logs/app/accounts.json
 
 Design:
 - Portfolio is fetched from the single Alpaca account configured in vt_setting.json.
@@ -13,6 +14,7 @@ Design:
   Postgres daily_selection on the same trade_date, sorted by signal desc.
 - Orders: fetched from Alpaca order history.
 - Performance: account equity time series from Alpaca portfolio history.
+- Accounts: best-effort aggregation for Ops Console multi-account UI (single-account compatible).
 """
 
 from __future__ import annotations
@@ -37,7 +39,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from flagship.trading.execution.broker_alpaca import AlpacaAdapter
+from flagship.trading.execution.broker_ibkr import IbkrAdapter, IbkrConnection, IbkrImportError
 from flagship.trading.config import ALPACA_API_KEY, ALPACA_BASE_URL, ALPACA_SECRET_KEY, LAB_PATH, SETTINGS as VT_SETTINGS
+from flagship.trading.config import load_ibkr_accounts
 from flagship.universe.pg_ticker_db import get_pg_connection
 from vnpy.alpha.lab import AlphaLab
 from vnpy.trader.logger import logger
@@ -73,6 +77,220 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def _to_float(v: Any) -> float | None:
+    try:
+        x = float(v)
+        return x if x == x else None
+    except Exception:
+        return None
+
+def _count_open_orders(orders_payload: dict | None) -> int:
+    if not orders_payload:
+        return 0
+    items = orders_payload.get("orders")
+    if not isinstance(items, list):
+        return 0
+    cnt = 0
+    for o in items:
+        if not isinstance(o, dict):
+            continue
+        status = str(o.get("status") or "").lower()
+        if status in ("new", "accepted", "pending_new", "submitted", "held", "partially_filled"):
+            cnt += 1
+    return cnt
+
+def _load_json_file(path: Path) -> dict | None:
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+def snapshot_accounts(output_dir: Path) -> Dict[str, Any]:
+    """
+    Generate logs/app/accounts.json for the Accounts page.
+
+    Convention:
+    - Default account uses output_dir/{portfolio,orders,performance}.json and data_base_path=/data
+    - Additional accounts can be written to output_dir/accounts/<account_id>/*.json and will be included automatically.
+    """
+    default_id = os.getenv("FLAGSHIP_DEFAULT_ACCOUNT_ID") or "alpaca_paper_main"
+    default_name = os.getenv("FLAGSHIP_DEFAULT_ACCOUNT_NAME") or "Alpaca Paper (Main)"
+
+    accounts: list[dict[str, Any]] = []
+
+    # Map IBKR accounts (configured in vt_setting.json) so Accounts page can show broker/name correctly.
+    # NOTE: per-account snapshots for IBKR are generated under logs/app/accounts/<account_id>/ by snapshot_ibkr_account().
+    ibkr_name_by_account_id: dict[str, str] = {}
+    try:
+        for cfg in load_ibkr_accounts():
+            ibkr_name_by_account_id[str(cfg.account_id)] = str(cfg.display_name or cfg.account_id)
+    except Exception:
+        ibkr_name_by_account_id = {}
+
+    def _build_one(account_id: str, display_name: str, broker: str, env: str, base_dir: Path, data_base_path: str) -> dict[str, Any] | None:
+        pf = _load_json_file(base_dir / "portfolio.json") or {}
+        od = _load_json_file(base_dir / "orders.json") or {}
+        pr = _load_json_file(base_dir / "performance.json") or {}
+
+        acct = pf.get("account") if isinstance(pf.get("account"), dict) else {}
+        positions = pf.get("positions") if isinstance(pf.get("positions"), list) else []
+        status = str(acct.get("status") or "unknown") if isinstance(acct, dict) else "unknown"
+        last_sync = pf.get("generated_at") or od.get("generated_at") or pr.get("generated_at")
+
+        equity = _to_float(acct.get("equity") if isinstance(acct, dict) else None)
+        cash = _to_float(acct.get("cash") if isinstance(acct, dict) else None)
+        buying_power = _to_float(acct.get("buying_power") if isinstance(acct, dict) else None)
+
+        today_pnl: float | None = None
+        series = pr.get("equity_series")
+        if isinstance(series, list) and len(series) >= 2:
+            try:
+                last = series[-1]
+                prev = series[-2]
+                if isinstance(last, dict) and isinstance(prev, dict):
+                    last_eq = _to_float(last.get("equity"))
+                    prev_eq = _to_float(prev.get("equity"))
+                    if last_eq is not None and prev_eq is not None:
+                        today_pnl = last_eq - prev_eq
+            except Exception:
+                today_pnl = None
+
+        return {
+            "account_id": account_id,
+            "display_name": display_name,
+            "broker": broker,
+            "env": env,
+            "status": status,
+            "last_sync_utc": str(last_sync) if last_sync else None,
+            "equity_usd": equity,
+            "cash_usd": cash,
+            "buying_power_usd": buying_power,
+            "positions_count": len(positions) if isinstance(positions, list) else 0,
+            "open_orders_count": _count_open_orders(od),
+            "today_pnl_usd": today_pnl,
+            "data_base_path": data_base_path,
+        }
+
+    # Default account
+    one = _build_one(str(default_id), str(default_name), "alpaca", "paper", output_dir, "/data")
+    if one:
+        accounts.append(one)
+
+    # Additional accounts (if present)
+    accounts_root = output_dir / "accounts"
+    if accounts_root.exists() and accounts_root.is_dir():
+        for child in sorted(accounts_root.iterdir()):
+            if not child.is_dir():
+                continue
+            account_id = child.name
+            if account_id == str(default_id):
+                continue
+            is_ibkr = account_id in ibkr_name_by_account_id
+            broker = "ibkr" if is_ibkr else "unknown"
+            display_name = ibkr_name_by_account_id.get(account_id, account_id)
+            one = _build_one(account_id, display_name, broker, "paper", child, f"/data/accounts/{account_id}")
+            if one:
+                accounts.append(one)
+
+    data = {
+        "generated_at": _now_iso(),
+        "accounts": accounts,
+    }
+    target = output_dir / "accounts.json"
+    _atomic_write_json(target, data)
+    logger.info(f"[app_console_snapshot] wrote {target} ({len(accounts)} accounts)")
+    return data
+
+
+def snapshot_ibkr_account(output_dir: Path, *, account_id: str, display_name: str, host: str, port: int, client_id: int) -> Dict[str, Any] | None:
+    """
+    Generate per-account snapshots under:
+      logs/app/accounts/<account_id>/{portfolio,orders,performance}.json
+    """
+    try:
+        adapter = IbkrAdapter(
+            IbkrConnection(
+                host=host,
+                port=int(port),
+                client_id=int(client_id),
+                account_id=account_id,
+                display_name=display_name,
+                paper=True,
+            )
+        )
+    except IbkrImportError as exc:
+        logger.warning(f"[app_console_snapshot] IBKR disabled (missing deps): {exc}")
+        return None
+    except Exception as exc:
+        logger.warning(f"[app_console_snapshot] IBKR connect failed for {account_id}: {exc}")
+        return None
+
+    base = output_dir / "accounts" / account_id
+    base.mkdir(parents=True, exist_ok=True)
+
+    # Portfolio
+    try:
+        info = adapter.get_account_info()
+        positions = []
+        pos = adapter.get_positions()
+        for sym, qty in sorted(pos.items()):
+            positions.append({"symbol": sym, "qty": int(qty)})
+        pf = {
+            "generated_at": _now_iso(),
+            "account": {"cash": float(info.cash), "equity": float(info.equity), "buying_power": float(info.buying_power), "status": "connected"},
+            "positions": positions,
+        }
+        _atomic_write_json(base / "portfolio.json", pf)
+    except Exception as exc:
+        logger.warning(f"[app_console_snapshot] IBKR portfolio failed for {account_id}: {exc}")
+
+    # Orders/Performance: placeholder best-effort (ib_insync order/perf APIs vary by account perms)
+    try:
+        # Open trades/orders
+        orders = []
+        for tr in adapter.ib.trades():
+            try:
+                o = tr.order
+                c = tr.contract
+                orders.append(
+                    {
+                        "id": str(getattr(o, "orderId", "")),
+                        "symbol": getattr(c, "symbol", None),
+                        "side": getattr(o, "action", None),
+                        "qty": float(getattr(o, "totalQuantity", 0) or 0),
+                        "filled_qty": float(getattr(o, "filledQuantity", 0) or 0),
+                        "filled_avg_price": None,
+                        "status": str(getattr(tr, "orderStatus", None) or ""),
+                        "submitted_at": None,
+                        "filled_at": None,
+                        "canceled_at": None,
+                    }
+                )
+            except Exception:
+                continue
+        od = {"generated_at": _now_iso(), "orders": orders}
+        _atomic_write_json(base / "orders.json", od)
+    except Exception as exc:
+        logger.warning(f"[app_console_snapshot] IBKR orders failed for {account_id}: {exc}")
+
+    try:
+        # Performance: we don't have a unified equity history source from IBKR in this repo yet.
+        pr = {"generated_at": _now_iso(), "equity_series": []}
+        _atomic_write_json(base / "performance.json", pr)
+    except Exception:
+        pass
+
+    try:
+        adapter.disconnect()
+    except Exception:
+        pass
+
+    return {"account_id": account_id, "base_dir": str(base)}
 
 
 def _parse_iso_datetime(text: str | None) -> datetime | None:
@@ -580,22 +798,43 @@ def _load_daily_selection(trade_date: date) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     with get_pg_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT vt_symbol, close_price, adv_usd, med_volume, market_cap
-                FROM daily_selection
-                WHERE trade_date = %s
-                """,
-                (trade_date,),
-            )
-            for row in cur.fetchall():
-                vt_symbol, close_price, adv_usd, med_volume, market_cap = row
-                out[str(vt_symbol)] = {
-                    "close_price": float(close_price) if close_price is not None else None,
-                    "adv_usd": float(adv_usd) if adv_usd is not None else None,
-                    "med_volume": int(med_volume) if med_volume is not None else None,
-                    "market_cap": float(market_cap) if market_cap is not None else None,
-                }
+            try:
+                cur.execute(
+                    """
+                    SELECT vt_symbol, close_price, adv_usd, med_volume, market_cap
+                    FROM daily_selection
+                    WHERE trade_date = %s
+                    """,
+                    (trade_date,),
+                )
+                rows = cur.fetchall()
+                for row in rows:
+                    vt_symbol, close_price, adv_usd, med_volume, market_cap = row
+                    out[str(vt_symbol)] = {
+                        "close_price": float(close_price) if close_price is not None else None,
+                        "adv_usd": float(adv_usd) if adv_usd is not None else None,
+                        "med_volume": int(med_volume) if med_volume is not None else None,
+                        "market_cap": float(market_cap) if market_cap is not None else None,
+                    }
+            except Exception:
+                # Backward-compatible schema: daily_selection may not have market_cap column.
+                conn.rollback()
+                cur.execute(
+                    """
+                    SELECT vt_symbol, close_price, adv_usd, med_volume
+                    FROM daily_selection
+                    WHERE trade_date = %s
+                    """,
+                    (trade_date,),
+                )
+                for row in cur.fetchall():
+                    vt_symbol, close_price, adv_usd, med_volume = row
+                    out[str(vt_symbol)] = {
+                        "close_price": float(close_price) if close_price is not None else None,
+                        "adv_usd": float(adv_usd) if adv_usd is not None else None,
+                        "med_volume": int(med_volume) if med_volume is not None else None,
+                        "market_cap": None,
+                    }
     return out
 
 
@@ -812,7 +1051,7 @@ def main() -> None:
     parser.add_argument(
         "mode",
         nargs="+",
-        choices=["portfolio", "selection", "orders", "performance", "market_status", "all"],
+        choices=["portfolio", "selection", "orders", "performance", "market_status", "accounts", "all"],
         help="Snapshot type(s) to generate (can specify multiple)",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output directory for JSON files")
@@ -828,7 +1067,7 @@ def main() -> None:
 
     modes = set(args.mode)
     if "all" in modes:
-        modes = {"portfolio", "selection", "orders", "performance", "market_status"}
+        modes = {"portfolio", "selection", "orders", "performance", "market_status", "accounts"}
 
     if "portfolio" in modes:
         snapshot_portfolio(args.output_dir)
@@ -844,6 +1083,20 @@ def main() -> None:
 
     if "market_status" in modes:
         snapshot_market_status(args.output_dir)
+
+    if "accounts" in modes:
+        # Optional: generate IBKR per-account snapshots first, then aggregate accounts.json.
+        ibkr_cfgs = load_ibkr_accounts()
+        for cfg in ibkr_cfgs:
+            snapshot_ibkr_account(
+                args.output_dir,
+                account_id=cfg.account_id,
+                display_name=cfg.display_name,
+                host=cfg.host,
+                port=int(cfg.port),
+                client_id=int(cfg.client_id),
+            )
+        snapshot_accounts(args.output_dir)
 
 
 if __name__ == "__main__":

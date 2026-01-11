@@ -36,7 +36,7 @@ COPY flagship /app/flagship
 # - vnpy is installed from local source.
 # - flagship code is imported by path (scripts insert PROJECT_ROOT into sys.path).
 RUN python -m pip install --upgrade pip setuptools wheel \
-    && pip install ".[alpha]" \
+    && pip install ".[alpha,ibkr]" \
     && pip install polygon-api-client alpaca-py psycopg2-binary fastapi uvicorn python-jose[cryptography] python-multipart boto3
 
 ENTRYPOINT ["python", "-m", "flagship.scripts.jobs.container_entrypoint"]

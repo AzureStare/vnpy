@@ -18,8 +18,9 @@ from vnpy.trader.constant import Interval
 from vnpy.alpha.lab import AlphaLab
 from vnpy.alpha.dataset import Segment
 from flagship.trading.config import (
-    LAB_PATH, LIVE_MODEL_PATH, DAILY_SIGNAL_FILE, CURRENT_REGIME_ID
+    LAB_PATH, LIVE_MODEL_PATH, LIVE_LR_MODEL_PATH, DAILY_SIGNAL_FILE, CURRENT_REGIME_ID
 )
+from flagship.trading.signal_blend import blend_lgb_with_lr
 from flagship.trading.orchestration.ensure_data_completeness import get_daily_selection_from_postgres
 from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
 from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
@@ -29,6 +30,7 @@ def run_live_inference(
     target_date: date | None = None,
     lab_path: Path = LAB_PATH,
     model_path: Path = LIVE_MODEL_PATH,
+    lr_model_path: Path = LIVE_LR_MODEL_PATH,
     output_file: Path = DAILY_SIGNAL_FILE,
     regime_id: int = CURRENT_REGIME_ID,
     strategy_version: str = "v7"
@@ -60,6 +62,14 @@ def run_live_inference(
     
     logger.info(f"[run_live_inference] Loading model...")
     booster = joblib.load(model_path)
+    lr_artifact = None
+    if lr_model_path.exists():
+        try:
+            lr_artifact = joblib.load(lr_model_path)
+            logger.info(f"[run_live_inference] Loaded LR meta model: {lr_model_path}")
+        except Exception as exc:
+            logger.warning(f"[run_live_inference] Failed to load LR meta model: {exc}")
+            lr_artifact = None
     
     # 2. Prepare Dataset for Inference
     # We need to construct the dataset object to calculate factors.
@@ -144,8 +154,44 @@ def run_live_inference(
     
     logger.info(f"[run_live_inference] Predicting with {len(feature_cols)} features...")
     
+    import numpy as np  # type: ignore
+    
     X = target_df.select(feature_cols).to_pandas()
-    scores = booster.predict(X)
+    lgb_signal = booster.predict(X)
+
+    # Optional: Logistic meta model -> p_up = P(label_excess_5d > 0)
+    p_up: np.ndarray | None = None
+    if isinstance(lr_artifact, dict):
+        pipe = lr_artifact.get("pipeline")
+        lr_cols = lr_artifact.get("feature_cols")
+        if pipe is not None and isinstance(lr_cols, list) and lr_cols:
+            try:
+                import pandas as pd  # type: ignore
+
+                lr_df = X.copy()
+                lr_df.insert(0, "lgb_signal", lgb_signal)
+                missing_lr = [c for c in lr_cols if c not in lr_df.columns]
+                if missing_lr:
+                    raise RuntimeError(f"missing LR features: {missing_lr[:10]}")
+                proba = pipe.predict_proba(lr_df[lr_cols])  # type: ignore[attr-defined]
+                if proba is not None and len(proba) == len(lgb_signal):
+                    p_up = np.asarray(proba)[:, 1].astype(float)
+            except Exception as exc:
+                logger.warning(f"[run_live_inference] LR predict_proba failed, skip: {exc}")
+                p_up = None
+
+    # Final signal: soft blend inside Top-M of lgb_signal
+    final_signal = np.asarray(lgb_signal, dtype=float)
+    if p_up is not None and len(p_up) == len(final_signal):
+        top_n = 5 if strategy_version == "v5" else 8
+        final_signal = blend_lgb_with_lr(
+            final_signal,
+            p_up,
+            top_n=int(top_n),
+            top_m_multiplier=5,
+            alpha=0.5,
+            std_floor=1e-6,
+        )
     
     # 5. Export Signal
     # We need to include 'atr_14' and other cols for the strategy
@@ -157,9 +203,18 @@ def run_live_inference(
         if col in target_df.columns:
             select_cols.append(col)
             
-    signal_df = (
-        target_df.select(select_cols)
-        .with_columns(pl.Series(name="signal", values=scores)) 
+    p_up_list: list[float | None]
+    if p_up is None:
+        p_up_list = [None for _ in range(len(final_signal))]
+    else:
+        p_up_list = [float(x) if np.isfinite(x) else None for x in p_up.tolist()]
+
+    signal_df = target_df.select(select_cols).with_columns(
+        [
+            pl.Series(name="lgb_signal", values=[float(x) for x in lgb_signal.tolist()]),
+            pl.Series(name="p_up", values=p_up_list),
+            pl.Series(name="signal", values=[float(x) for x in final_signal.tolist()]),
+        ]
     )
     
     # Save to parquet

@@ -35,10 +35,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
 from flagship.config.polygon_config import get_polygon_api_key
 from flagship.trading.execution.broker_alpaca import AlpacaAdapter
+from flagship.trading.execution.broker_ibkr import IbkrAdapter, IbkrConnection, IbkrImportError
 from flagship.trading.config import DAILY_SIGNAL_FILE, LAB_PATH
+from flagship.trading.config import load_ibkr_accounts
 from flagship.trading.calendar import infer_data_date_from_lab
 from flagship.trading.orchestration.check_lab_freshness import check_lab_freshness
 from flagship.trading.execution.open_rebalance import StrategyRunner, execute_rebalance
+from flagship.trading.controls import get_buy_exposure_multiplier, get_disabled_vt_symbols
 from flagship.trading.realtime.polygon_ws import PolygonTradePriceCache
 
 
@@ -221,8 +224,44 @@ def run_daemon(
     dry_run: bool,
     use_polygon_ws: bool,
 ) -> None:
-    adapter = AlpacaAdapter()
-    runner = StrategyRunner(adapter, strategy_version=strategy_version)
+    # Use Alpaca clock as the canonical market-open signal (also used for Alpaca account trading).
+    clock_adapter = AlpacaAdapter()
+
+    # Build account adapters:
+    # - Always include Alpaca (existing behavior)
+    # - Add IBKR accounts if configured (paper) and dependency is installed
+    account_adapters: list[object] = [clock_adapter]
+    ibkr_cfgs = load_ibkr_accounts()
+    if ibkr_cfgs:
+        for cfg in ibkr_cfgs:
+            try:
+                account_adapters.append(
+                    IbkrAdapter(
+                        IbkrConnection(
+                            host=cfg.host,
+                            port=int(cfg.port),
+                            client_id=int(cfg.client_id),
+                            account_id=cfg.account_id,
+                            display_name=cfg.display_name,
+                            paper=True,
+                        )
+                    )
+                )
+            except IbkrImportError as exc:
+                logger.warning(f"[ExecutorDaemon] IBKR disabled (missing deps): {exc}")
+                break
+            except Exception as exc:
+                logger.warning(f"[ExecutorDaemon] IBKR connect failed for {cfg.account_id}: {exc}")
+                continue
+
+    # One runner per account (positions/cash differ)
+    runners: dict[str, StrategyRunner] = {}
+    for a in account_adapters:
+        try:
+            acct_id = getattr(a, "get_account_id")()
+            runners[str(acct_id)] = StrategyRunner(a, strategy_version=strategy_version)  # type: ignore[arg-type]
+        except Exception:
+            continue
 
     state = _load_state(state_path)
     metrics_writer = TextfileMetricsWriter("flagship_executor_daemon.prom")
@@ -234,7 +273,7 @@ def run_daemon(
 
     while True:
         try:
-            clock = adapter.client.get_clock()
+            clock = clock_adapter.client.get_clock()
             now_utc = _clock_now_utc(clock)
             now_et = now_utc.astimezone(EASTERN)
             trade_date = now_et.date()
@@ -265,22 +304,76 @@ def run_daemon(
                     time.sleep(max(10, int(poll_seconds)))
                     continue
 
-                # Refresh signals right before computing targets (daemon may have run overnight)
-                runner.inject_signal(DAILY_SIGNAL_FILE)
-                targets = runner.run_daily_logic()
-                if not targets:
-                    logger.warning("[ExecutorDaemon] no targets generated, skip.")
-                    state.last_rebalance_trade_date = trade_date.isoformat()
-                    state.last_rebalance_timestamp = float(time.time())
-                    state.last_signal_date = expected_signal_date.isoformat()
-                    _save_state(state_path, state)
-                    continue
+                # For each account: compute targets + execute. Use per-account idempotency inside state map.
+                per_account_key = f"last_rebalance_trade_date_by_account"
+                raw_map = {}
+                try:
+                    raw = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+                    if isinstance(raw, dict) and isinstance(raw.get(per_account_key), dict):
+                        raw_map = raw.get(per_account_key)
+                except Exception:
+                    raw_map = {}
+
+                last_by_account: dict[str, str] = {str(k): str(v) for k, v in (raw_map or {}).items()}
+                buy_exposure_multiplier = float(get_buy_exposure_multiplier())
+
+                for acct_id, runner in runners.items():
+                    if last_by_account.get(acct_id) == trade_date.isoformat():
+                        continue
+
+                    # Refresh signals right before computing targets (per account, but same file)
+                    runner.inject_signal(DAILY_SIGNAL_FILE)
+                    targets = runner.run_daily_logic()
+                    if not targets:
+                        logger.warning(f"[ExecutorDaemon] no targets generated, skip account={acct_id}")
+                        last_by_account[acct_id] = trade_date.isoformat()
+                        continue
+
+                    adapter = runner.adapter  # type: ignore[attr-defined]
+                    if cancel_open_orders:
+                        try:
+                            adapter.cancel_all_open_orders()
+                        except Exception:
+                            pass
+
+                    try:
+                        info = adapter.get_account_info()
+                        logger.info(
+                            f"[ExecutorDaemon] Pre-trade Account={acct_id}: cash={info.cash:.2f}, equity={info.equity:.2f}, buying_power={info.buying_power:.2f}"
+                        )
+                    except Exception:
+                        pass
+
+                    if dry_run:
+                        logger.warning(f"[ExecutorDaemon] DRY RUN: would execute rebalance account={acct_id} targets={len(targets)}")
+                    else:
+                        execute_rebalance(adapter, targets, buy_exposure_multiplier=buy_exposure_multiplier)
+
+                    last_by_account[acct_id] = trade_date.isoformat()
 
                 # Optional Polygon WS for monitoring (not required for order placement)
                 if use_polygon_ws and ws_cache is None:
                     try:
-                        sig_df = runner.engine.signal_df
-                        roots = sorted({str(v).split(".")[0] for v in sig_df["vt_symbol"].to_list()})
+                        # Use any runner's signal df for WS universe
+                        any_runner = next(iter(runners.values()))
+                        sig_df = any_runner.engine.signal_df
+                        sig_roots = {str(v).split(".")[0] for v in sig_df["vt_symbol"].to_list()}
+                        pos_roots: set[str] = set()
+                        for r in runners.values():
+                            try:
+                                pos_roots |= set(r.adapter.get_positions().keys())  # type: ignore[attr-defined]
+                            except Exception:
+                                continue
+
+                        disabled_vt = get_disabled_vt_symbols()
+                        disabled_roots = {str(v).split(".")[0] for v in disabled_vt if str(v).strip()}
+
+                        roots = sorted((sig_roots - disabled_roots) | pos_roots)
+                        if disabled_roots:
+                            logger.info(
+                                f"[ExecutorDaemon] polygon ws roots={len(roots)} "
+                                f"(excluded_disabled={len(sig_roots & disabled_roots)})"
+                            )
                         ws_cache = PolygonTradePriceCache(get_polygon_api_key(), roots)
                         ws_cache.start()
                     except Exception as exc:
@@ -288,22 +381,25 @@ def run_daemon(
                         ws_cache = None
 
                 if cancel_open_orders:
-                    adapter.cancel_all_open_orders()
-
-                info = adapter.get_account_info()
-                logger.info(
-                    f"[ExecutorDaemon] Pre-trade Account: cash={info.cash:.2f}, equity={info.equity:.2f}, buying_power={info.buying_power:.2f}"
-                )
-
-                if dry_run:
-                    logger.warning(f"[ExecutorDaemon] DRY RUN: would execute rebalance for {len(targets)} targets.")
-                else:
-                    execute_rebalance(adapter, targets)
+                    clock_adapter.cancel_all_open_orders()
 
                 state.last_rebalance_trade_date = trade_date.isoformat()
                 state.last_rebalance_timestamp = float(time.time())
                 state.last_signal_date = expected_signal_date.isoformat()
-                _save_state(state_path, state)
+                # Persist per-account idempotency alongside legacy top-level fields.
+                try:
+                    payload = {
+                        "last_rebalance_trade_date": state.last_rebalance_trade_date,
+                        "last_rebalance_timestamp": state.last_rebalance_timestamp,
+                        "last_signal_date": state.last_signal_date,
+                        per_account_key: last_by_account,
+                    }
+                    state_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = state_path.with_suffix(state_path.suffix + ".tmp")
+                    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    tmp.replace(state_path)
+                except Exception:
+                    _save_state(state_path, state)
 
                 logger.info(
                     f"[ExecutorDaemon] rebalance done. trade_date={trade_date} signal_date={expected_signal_date}"

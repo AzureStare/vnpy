@@ -107,6 +107,13 @@ class TextfileMetricsWriter:
                 f.write(content)
                 f.flush()
             tmp_path.replace(target)
+            try:
+                # IMPORTANT:
+                # node_exporter textfile collector may run as non-root, and will skip unreadable files.
+                # Ensure metrics are world-readable to avoid "No data" in Grafana.
+                target.chmod(0o644)
+            except Exception:
+                pass
         except Exception as exc:
             logger.warning(f"[metrics] failed to write {target}: {exc}")
             try:

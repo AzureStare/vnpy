@@ -16,22 +16,16 @@ from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide as AlpacaOrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
 from vnpy.trader.logger import logger
 
 from flagship.trading.config import ALPACA_API_KEY, ALPACA_PAPER, ALPACA_SECRET_KEY
+from flagship.trading.execution.broker_base import AccountInfo, BrokerAdapter, OrderSide
 
 
-@dataclass(frozen=True)
-class AccountInfo:
-    cash: float
-    equity: float
-    buying_power: float
-
-
-class AlpacaAdapter:
+class AlpacaAdapter(BrokerAdapter):
     """Wrapper for Alpaca API interaction"""
 
     def __init__(self) -> None:
@@ -42,6 +36,19 @@ class AlpacaAdapter:
             f"[Alpaca] Connected. Status: {account.status}, Equity: {account.equity}, "
             f"Cash: {account.cash}, Buying Power: {account.buying_power}"
         )
+
+    def get_account_id(self) -> str:
+        # Alpaca doesn't expose a human-friendly account_id in our current UI; keep stable label.
+        return "alpaca_paper_main" if ALPACA_PAPER else "alpaca_live_main"
+
+    def get_display_name(self) -> str:
+        return "Alpaca Paper (Main)" if ALPACA_PAPER else "Alpaca Live (Main)"
+
+    def get_broker_name(self) -> str:
+        return "alpaca"
+
+    def get_env_name(self) -> str:
+        return "paper" if ALPACA_PAPER else "live"
 
     def get_account_info(self) -> AccountInfo:
         acct = self.client.get_account()
@@ -135,15 +142,16 @@ class AlpacaAdapter:
         if qty <= 0:
             return
 
+        alpaca_side = AlpacaOrderSide.BUY if side == OrderSide.BUY else AlpacaOrderSide.SELL
         req = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
-            side=side,
+            side=alpaca_side,
             time_in_force=TimeInForce.DAY,
         )
         try:
             self.client.submit_order(order_data=req)
-            logger.info(f"[Alpaca] Submitted {side} order for {qty} shares of {symbol}")
+            logger.info(f"[Alpaca] Submitted {side.value} order for {qty} shares of {symbol}")
         except APIError as exc:
             logger.error(f"[Alpaca] Order failed for {symbol}: {exc}")
 

@@ -341,14 +341,14 @@ def _generate_html_report(
                 points.append(f"{x},{y}")
 
             chart_html = f"""
-            <div style="margin: 20px 0;">
-                <h3>Equity Curve</h3>
-                <svg width="800" height="300" style="border: 1px solid #ddd; background: #f8f9fa;">
-                    <polyline points="{' '.join(points)}" fill="none" stroke="#0d6efd" stroke-width="2"/>
-                    <text x="400" y="290" text-anchor="middle" font-size="12" fill="#666">Date</text>
-                    <text x="20" y="150" text-anchor="middle" font-size="12" fill="#666" transform="rotate(-90 20 150)">Equity</text>
+            <section class="card">
+                <h2>Equity Curve</h2>
+                <svg width="800" height="300" class="chart">
+                    <polyline points="{' '.join(points)}" fill="none" stroke="var(--primary)" stroke-width="2"/>
+                    <text x="400" y="290" text-anchor="middle" font-size="12" fill="var(--muted)">Date</text>
+                    <text x="20" y="150" text-anchor="middle" font-size="12" fill="var(--muted)" transform="rotate(-90 20 150)">Equity</text>
                 </svg>
-            </div>
+            </section>
             """
 
     # Orders summary table
@@ -374,22 +374,24 @@ def _generate_html_report(
             </tr>
             """
         orders_html = f"""
-        <h3>Recent Orders (Top 50)</h3>
-        <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-            <thead>
-                <tr style="background: #f8f9fa;">
-                    <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Time</th>
-                    <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Symbol</th>
-                    <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Side</th>
-                    <th style="padding: 8px; border: 1px solid #ddd; text-align: right;">Qty</th>
-                    <th style="padding: 8px; border: 1px solid #ddd; text-align: right;">Filled</th>
-                    <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Status</th>
-                </tr>
-            </thead>
-            <tbody>
-                {orders_rows}
-            </tbody>
-        </table>
+        <section class="card">
+            <h2>Recent Orders (Top 50)</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Symbol</th>
+                        <th>Side</th>
+                        <th class="tr">Qty</th>
+                        <th class="tr">Filled</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {orders_rows}
+                </tbody>
+            </table>
+        </section>
         """
 
     html_content = f"""<!DOCTYPE html>
@@ -399,138 +401,194 @@ def _generate_html_report(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Flagship Ops Console - Performance Report</title>
     <style>
+        :root {{
+            --bg: #f8fafc;         /* slate-50 */
+            --card: #ffffff;
+            --border: #e2e8f0;     /* slate-200 */
+            --text: #0f172a;       /* slate-900 */
+            --muted: #64748b;      /* slate-500 */
+            --muted2: #94a3b8;     /* slate-400 */
+            --primary: #2563eb;    /* blue-600 */
+            --ok: #16a34a;         /* green-600 */
+            --bad: #dc2626;        /* red-600 */
+            --radius: 14px;
+        }}
+
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            line-height: 1.6;
-            color: #212529;
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-            background: #ffffff;
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans";
+            line-height: 1.55;
         }}
+
+        .container {{
+            max-width: 1100px;
+            margin: 28px auto 60px;
+            padding: 0 18px;
+        }}
+
+        .header {{
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+        }}
+
         h1 {{
-            color: #0d6efd;
-            border-bottom: 2px solid #0d6efd;
-            padding-bottom: 10px;
+            margin: 0;
+            font-size: 22px;
         }}
+
         h2 {{
-            color: #495057;
-            margin-top: 30px;
+            margin: 0 0 10px;
+            font-size: 16px;
         }}
-        h3 {{
-            color: #6c757d;
-            margin-top: 20px;
+
+        .meta {{
+            color: var(--muted);
+            font-size: 13px;
+            margin: 0;
+            line-height: 1.6;
         }}
+
+        .card {{
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px;
+            margin-top: 12px;
+            box-shadow: 0 1px 0 rgba(15, 23, 42, 0.02);
+        }}
+
         .kpi-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 16px;
-            margin: 20px 0;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
         }}
         .kpi-card {{
-            background: #f8f9fa;
-            border: 1px solid #dee2e6;
-            border-radius: 6px;
-            padding: 16px;
+            background: rgba(241, 245, 249, 0.6);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px;
         }}
         .kpi-label {{
             font-size: 12px;
-            color: #6c757d;
-            margin-bottom: 8px;
+            color: var(--muted);
         }}
         .kpi-value {{
-            font-size: 24px;
+            font-size: 20px;
             font-weight: 600;
-            font-family: ui-monospace, monospace;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            margin-top: 6px;
         }}
         .summary-box {{
-            background: #e7f3ff;
-            border-left: 4px solid #0d6efd;
-            padding: 16px;
-            margin: 20px 0;
+            background: rgba(37, 99, 235, 0.06);
+            border: 1px solid rgba(37, 99, 235, 0.25);
+            border-radius: 12px;
+            padding: 14px;
         }}
         table {{
             width: 100%;
             border-collapse: collapse;
-            margin: 20px 0;
+            margin-top: 10px;
         }}
         th, td {{
-            padding: 10px;
-            border: 1px solid #dee2e6;
+            padding: 8px 10px;
+            border: 1px solid var(--border);
             text-align: left;
+            font-size: 13px;
         }}
         th {{
-            background: #f8f9fa;
+            background: #f1f5f9;
+            color: var(--muted);
             font-weight: 600;
         }}
-        .meta {{
-            color: #6c757d;
-            font-size: 14px;
-            margin: 10px 0;
+
+        .tr {{
+            text-align: right;
+        }}
+
+        .chart {{
+            border: 1px solid var(--border);
+            background: var(--card);
+            border-radius: 12px;
+            width: 100%;
+            height: auto;
         }}
     </style>
 </head>
 <body>
-    <h1>Flagship Ops Console - Performance Report</h1>
-    <div class="meta">
-        Generated: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}<br>
-        Period: {kpis.get('start_date', 'N/A')} to {kpis.get('end_date', 'N/A')}
+    <div class="container">
+        <div class="header">
+            <h1>Flagship Ops Console - Performance Report</h1>
+            <p class="meta">
+                Generated: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}<br>
+                Period: {kpis.get('start_date', 'N/A')} to {kpis.get('end_date', 'N/A')}
+            </p>
+        </div>
+
+        <section class="card">
+            <h2>Performance Metrics</h2>
+            <div class="kpi-grid">
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Return</div>
+                    <div class="kpi-value" style="color: {'var(--ok)' if (kpis.get('total_return', 0) or 0) >= 0 else 'var(--bad)'}">
+                        {fmt_pct(kpis.get('total_return'))}
+                    </div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Max Drawdown</div>
+                    <div class="kpi-value" style="color: var(--bad)">
+                        {fmt_pct(kpis.get('max_drawdown'))}
+                    </div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Sharpe Ratio</div>
+                    <div class="kpi-value">
+                        {fmt_num(kpis.get('sharpe_ratio'))}
+                    </div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Win Rate</div>
+                    <div class="kpi-value">
+                        {fmt_pct(kpis.get('win_rate'))}
+                    </div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Trades</div>
+                    <div class="kpi-value">
+                        {kpis.get('total_trades', 0)}
+                    </div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Start Equity</div>
+                    <div class="kpi-value">
+                        ${fmt_num(kpis.get('start_equity'))}
+                    </div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">End Equity</div>
+                    <div class="kpi-value">
+                        ${fmt_num(kpis.get('end_equity'))}
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Summary</h2>
+            <div class="summary-box">
+                {_escape_html(gpt_summary).replace(chr(10), '<br>')}
+            </div>
+        </section>
+
+        {chart_html}
+
+        {orders_html}
     </div>
-
-    <h2>Performance Metrics</h2>
-    <div class="kpi-grid">
-        <div class="kpi-card">
-            <div class="kpi-label">Total Return</div>
-            <div class="kpi-value" style="color: {'#198754' if (kpis.get('total_return', 0) or 0) >= 0 else '#dc3545'}">
-                {fmt_pct(kpis.get('total_return'))}
-            </div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Max Drawdown</div>
-            <div class="kpi-value" style="color: #dc3545">
-                {fmt_pct(kpis.get('max_drawdown'))}
-            </div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Sharpe Ratio</div>
-            <div class="kpi-value">
-                {fmt_num(kpis.get('sharpe_ratio'))}
-            </div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Win Rate</div>
-            <div class="kpi-value">
-                {fmt_pct(kpis.get('win_rate'))}
-            </div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Total Trades</div>
-            <div class="kpi-value">
-                {kpis.get('total_trades', 0)}
-            </div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">Start Equity</div>
-            <div class="kpi-value">
-                ${fmt_num(kpis.get('start_equity'))}
-            </div>
-        </div>
-        <div class="kpi-card">
-            <div class="kpi-label">End Equity</div>
-            <div class="kpi-value">
-                ${fmt_num(kpis.get('end_equity'))}
-            </div>
-        </div>
-    </div>
-
-    <h2>Summary</h2>
-    <div class="summary-box">
-        {_escape_html(gpt_summary).replace(chr(10), '<br>')}
-    </div>
-
-    {chart_html}
-
-    {orders_html}
 </body>
 </html>"""
 

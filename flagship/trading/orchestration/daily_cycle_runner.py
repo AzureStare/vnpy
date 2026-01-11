@@ -40,7 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
-from flagship.trading.config import LAB_PATH, LIVE_MODEL_PATH, DAILY_SIGNAL_FILE
+from flagship.trading.config import LAB_PATH, LIVE_MODEL_PATH, LIVE_LR_MODEL_PATH, DAILY_SIGNAL_FILE
 from flagship.trading.calendar import (
     describe_trading_date,
     infer_data_date_from_lab,
@@ -266,7 +266,8 @@ def run_daily_cycle(
             check_lab_freshness(lab_path=lab_path, expected_date=data_date, fix=True)
 
         # 5) Train model (weekly on Mondays, or if missing)
-        should_train = (not LIVE_MODEL_PATH.exists()) or (trading_date.weekday() == 0)
+        # Also train when LR meta model is missing, to ensure inference can produce p_up/final_signal.
+        should_train = (not LIVE_MODEL_PATH.exists()) or (not LIVE_LR_MODEL_PATH.exists()) or (trading_date.weekday() == 0)
         if should_train:
             with _step(metrics, "5_train_model"):
                 train_daily_model(

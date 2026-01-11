@@ -418,6 +418,7 @@ def cmd_sync_code(args: argparse.Namespace) -> None:
         ".git/",
         ".venv/",
         "lab/",
+        "logs/",
         "__pycache__/",
         ".pytest_cache/",
         ".mypy_cache/",

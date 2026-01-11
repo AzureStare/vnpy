@@ -106,12 +106,28 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
         
         # 2. 计算相对强度 (RS) 和 Beta (需要 SPY 数据)
         # 假设 df 中包含 SPY 数据
-        spy_df = df.filter(pl.col("vt_symbol") == self.spy_symbol).select([
-            "datetime", "close_price"
-        ]).rename({"close_price": "spy_close"})
+        spy_df = (
+            df.filter(pl.col("vt_symbol") == self.spy_symbol)
+            .select(["datetime", "close_price"])
+            .rename({"close_price": "spy_close"})
+            .sort("datetime")
+            .with_columns(
+                [
+                    # Forward 5d return for SPY (used for excess-return labels).
+                    (pl.col("spy_close").shift(-5) / (pl.col("spy_close") + eps) - 1).alias("spy_ret_5d")
+                ]
+            )
+        )
         
         if not spy_df.is_empty():
             df = df.join(spy_df, on="datetime", how="left")
+            
+            # label_excess_5d: forward 5d return minus SPY forward 5d return
+            # Prefer ret_5d if present, else fallback to label.
+            ret_base = "ret_5d" if "ret_5d" in df.columns else ("label" if "label" in df.columns else None)
+            if ret_base is not None:
+                df = df.with_columns([(pl.col(ret_base) - pl.col("spy_ret_5d")).alias("label_excess_5d")])
+
             # rs_score: (P / P_60) / (SPY / SPY_60) - 1
             df = df.with_columns([
                 (
@@ -139,7 +155,8 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
             # Fallback if SPY missing
             df = df.with_columns([
                 pl.lit(0.0).alias("rs_score"),
-                pl.lit(1.0).alias("beta")
+                pl.lit(1.0).alias("beta"),
+                pl.lit(None).cast(pl.Float64).alias("label_excess_5d"),
             ])
 
         # 3. 计算 V5 的核心因子 (alpha_mom, alpha_vwap, alpha_trend)
@@ -185,6 +202,6 @@ class FlagshipAlphaMomentumV7Dataset(FlagshipAlphaMomentumV5Dataset):
         # 我们这里已经是 DataFrame 形式，直接返回即可
         
         # 清理临时列
-        drop_cols = [c for c in ["ret_i", "ret_spy", "spy_close", "ema_distance"] if c in df.columns]
+        drop_cols = [c for c in ["ret_i", "ret_spy", "spy_close", "spy_ret_5d", "ema_distance"] if c in df.columns]
         return df.drop(drop_cols)
 

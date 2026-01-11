@@ -1,6 +1,8 @@
 from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
 from jose import JWTError, jwt
 import subprocess
 import os
@@ -21,13 +23,26 @@ if str(PROJECT_ROOT) not in sys.path:
 from flagship.universe.pg_ticker_db import (
     create_users_table, add_user, get_user, list_users, delete_user
 )
+from flagship.trading.controls import (
+    create_trading_controls_tables,
+    get_trading_controls_snapshot,
+    set_buy_exposure_multiplier,
+    set_disabled_vt_symbol,
+)
 
 # Configuration
 SECRET_KEY = "flagship-ecc-style-secret-key" # In production use env
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    create_users_table()
+    create_trading_controls_tables()
+    add_user("admin", get_password_hash("admin@123"), "admin")
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # Security
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
@@ -59,6 +74,57 @@ class DailyOpsRequest(BaseModel):
     trading_date: Optional[str] = None  # YYYY-MM-DD (ET)
     strategy: str = "v7"
 
+class ModelTrainRequest(BaseModel):
+    """
+    Manual trigger for model training only (train_daily_model).
+    """
+    trading_date: Optional[str] = None  # YYYY-MM-DD (ET)
+    strategy: str = "v7"
+
+class TradeRecapRegenerateRequest(BaseModel):
+    """
+    Manual regenerate trade recap HTML for a given ET trade_date.
+    """
+    trade_date: str  # YYYY-MM-DD (ET)
+    strategy: str = "v7"
+
+class TradingControlsResponse(BaseModel):
+    disabled_vt_symbols: List[str]
+    buy_exposure_multiplier: float
+
+class TradingDisableRequest(BaseModel):
+    vt_symbol: str
+    disabled: bool = True
+
+class TradingExposureRequest(BaseModel):
+    multiplier: float
+
+class AccountSummary(BaseModel):
+    account_id: str
+    display_name: str
+    broker: str
+    env: str
+    status: str
+    last_sync_utc: Optional[str] = None
+    equity_usd: Optional[float] = None
+    cash_usd: Optional[float] = None
+    buying_power_usd: Optional[float] = None
+    positions_count: int = 0
+    open_orders_count: int = 0
+    today_pnl_usd: Optional[float] = None
+    data_base_path: str
+
+class AccountsResponse(BaseModel):
+    generated_at: str
+    accounts: List[AccountSummary]
+
+class AccountSnapshotResponse(BaseModel):
+    account_id: str
+    data_base_path: str
+    portfolio: dict
+    orders: dict
+    performance: dict
+
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
@@ -74,9 +140,21 @@ STATUS_FILE = LOG_DIR / "status.json"
 APP_DATA_DIR = PROJECT_ROOT / "logs" / "app"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+SITE_DIR = PROJECT_ROOT / "flagship" / "app_console" / "site"
+
 DAILY_OPS_DIR = APP_DATA_DIR / "daily_ops"
 DAILY_OPS_DIR.mkdir(parents=True, exist_ok=True)
 DAILY_OPS_STATUS_FILE = DAILY_OPS_DIR / "status.json"
+
+MODEL_TRAIN_DIR = APP_DATA_DIR / "model_train"
+MODEL_TRAIN_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_TRAIN_STATUS_FILE = MODEL_TRAIN_DIR / "status.json"
+
+REPORTING_DIR = APP_DATA_DIR / "reporting"
+REPORTING_DIR.mkdir(parents=True, exist_ok=True)
+TRADE_RECAP_REGEN_DIR = REPORTING_DIR / "trade_recap"
+TRADE_RECAP_REGEN_DIR.mkdir(parents=True, exist_ok=True)
+TRADE_RECAP_REGEN_STATUS_FILE = TRADE_RECAP_REGEN_DIR / "status.json"
 
 # Utility
 def get_password_hash(password: str) -> str:
@@ -119,6 +197,124 @@ def _is_pid_running(pid: int) -> bool:
     except Exception:
         return False
 
+def _load_json_file(path: Path) -> dict | None:
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        return None
+    except Exception:
+        return None
+
+def _to_float(v: object) -> float | None:
+    try:
+        x = float(v)  # type: ignore[arg-type]
+        return x if x == x else None
+    except Exception:
+        return None
+
+def _count_open_orders(orders_payload: dict | None) -> int:
+    if not orders_payload:
+        return 0
+    items = orders_payload.get("orders")
+    if not isinstance(items, list):
+        return 0
+    cnt = 0
+    for o in items:
+        if not isinstance(o, dict):
+            continue
+        status = str(o.get("status") or "").lower()
+        if status in ("new", "accepted", "pending_new", "submitted", "held", "partially_filled"):
+            cnt += 1
+    return cnt
+
+def _build_account_summary(account_id: str, display_name: str, broker: str, env: str, base_dir: Path, data_base_path: str) -> AccountSummary | None:
+    pf = _load_json_file(base_dir / "portfolio.json") or {}
+    od = _load_json_file(base_dir / "orders.json") or {}
+    pr = _load_json_file(base_dir / "performance.json") or {}
+
+    acct = pf.get("account") if isinstance(pf.get("account"), dict) else {}
+    positions = pf.get("positions") if isinstance(pf.get("positions"), list) else []
+    last_sync = pf.get("generated_at") or od.get("generated_at") or pr.get("generated_at")
+    status = str(acct.get("status") or "unknown") if isinstance(acct, dict) else "unknown"
+
+    equity = _to_float(acct.get("equity") if isinstance(acct, dict) else None)
+    cash = _to_float(acct.get("cash") if isinstance(acct, dict) else None)
+    buying_power = _to_float(acct.get("buying_power") if isinstance(acct, dict) else None)
+
+    # Best-effort: infer today's PnL from performance (last - prev)
+    today_pnl: float | None = None
+    series = pr.get("equity_series")
+    if isinstance(series, list) and len(series) >= 2:
+        try:
+            last = series[-1]
+            prev = series[-2]
+            if isinstance(last, dict) and isinstance(prev, dict):
+                last_eq = _to_float(last.get("equity"))
+                prev_eq = _to_float(prev.get("equity"))
+                if last_eq is not None and prev_eq is not None:
+                    today_pnl = last_eq - prev_eq
+        except Exception:
+            today_pnl = None
+
+    return AccountSummary(
+        account_id=account_id,
+        display_name=display_name,
+        broker=broker,
+        env=env,
+        status=status,
+        last_sync_utc=str(last_sync) if last_sync else None,
+        equity_usd=equity,
+        cash_usd=cash,
+        buying_power_usd=buying_power,
+        positions_count=len(positions) if isinstance(positions, list) else 0,
+        open_orders_count=_count_open_orders(od),
+        today_pnl_usd=today_pnl,
+        data_base_path=data_base_path,
+    )
+
+def _load_accounts_snapshot() -> AccountsResponse:
+    # Preferred: precomputed accounts.json (generated by app_console_snapshot.py)
+    accounts_path = APP_DATA_DIR / "accounts.json"
+    raw = _load_json_file(accounts_path)
+    if raw and isinstance(raw.get("accounts"), list):
+        items: list[AccountSummary] = []
+        for it in raw.get("accounts", []):
+            if not isinstance(it, dict):
+                continue
+            try:
+                items.append(AccountSummary(**it))
+            except Exception:
+                continue
+        gen = str(raw.get("generated_at") or datetime.utcnow().isoformat())
+        if items:
+            return AccountsResponse(generated_at=gen, accounts=items)
+
+    # Fallback: build from default single-account snapshots (existing behavior)
+    default_id = os.getenv("FLAGSHIP_DEFAULT_ACCOUNT_ID") or "alpaca_paper_main"
+    default_name = os.getenv("FLAGSHIP_DEFAULT_ACCOUNT_NAME") or "Alpaca Paper (Main)"
+    summary = _build_account_summary(
+        account_id=str(default_id),
+        display_name=str(default_name),
+        broker="alpaca",
+        env="paper",
+        base_dir=APP_DATA_DIR,
+        data_base_path="/data",
+    )
+    return AccountsResponse(
+        generated_at=datetime.utcnow().isoformat(),
+        accounts=[summary] if summary else [],
+    )
+
+def _load_account_dir(account_id: str) -> tuple[Path, str]:
+    if account_id == (os.getenv("FLAGSHIP_DEFAULT_ACCOUNT_ID") or "alpaca_paper_main"):
+        return APP_DATA_DIR, "/data"
+    # Multi-account convention: logs/app/accounts/<account_id>/
+    return APP_DATA_DIR / "accounts" / account_id, f"/data/accounts/{account_id}"
+
 # Auth Endpoints
 @app.post("/api/auth/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -146,6 +342,55 @@ async def remove_user(username: str, admin = Depends(check_admin)):
     if delete_user(username):
         return {"status": "success"}
     raise HTTPException(status_code=400, detail="Failed to delete user")
+
+# Trading Controls (login required)
+@app.get("/api/trading/controls", response_model=TradingControlsResponse)
+async def get_trading_controls(user = Depends(get_current_user)):
+    snap = get_trading_controls_snapshot()
+    return {
+        "disabled_vt_symbols": list(snap.disabled_vt_symbols),
+        "buy_exposure_multiplier": float(snap.buy_exposure_multiplier),
+    }
+
+@app.post("/api/trading/controls/disabled")
+async def set_trading_disabled(req: TradingDisableRequest, user = Depends(get_current_user)):
+    updated_by = str(user.get("sub") or "")
+    try:
+        set_disabled_vt_symbol(vt_symbol=req.vt_symbol, disabled=bool(req.disabled), updated_by=updated_by or None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "success"}
+
+@app.post("/api/trading/controls/exposure")
+async def set_trading_exposure(req: TradingExposureRequest, user = Depends(get_current_user)):
+    updated_by = str(user.get("sub") or "")
+    try:
+        m = set_buy_exposure_multiplier(multiplier=float(req.multiplier), updated_by=updated_by or None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "success", "buy_exposure_multiplier": float(m)}
+
+# Accounts (login required)
+@app.get("/api/accounts", response_model=AccountsResponse)
+async def get_accounts(user = Depends(get_current_user)):
+    return _load_accounts_snapshot()
+
+@app.get("/api/accounts/{account_id}/snapshot", response_model=AccountSnapshotResponse)
+async def get_account_snapshot(account_id: str, user = Depends(get_current_user)):
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        raise HTTPException(status_code=400, detail="account_id is required")
+    base_dir, base_path = _load_account_dir(account_id)
+    pf = _load_json_file(base_dir / "portfolio.json") or {}
+    od = _load_json_file(base_dir / "orders.json") or {}
+    pr = _load_json_file(base_dir / "performance.json") or {}
+    return {
+        "account_id": account_id,
+        "data_base_path": base_path,
+        "portfolio": pf,
+        "orders": od,
+        "performance": pr,
+    }
 
 # Backtest Endpoints
 def _update_status(
@@ -186,6 +431,49 @@ def _update_daily_ops_status(
             payload["pid"] = int(pid)
         if log_file is not None:
             payload["log_file"] = str(log_file)
+        json.dump(payload, f)
+
+def _update_model_train_status(
+    status: str,
+    message: str = "",
+    progress: float = 0,
+    pid: int | None = None,
+    log_file: str | None = None,
+):
+    with open(MODEL_TRAIN_STATUS_FILE, "w") as f:
+        payload = {
+            "status": status,
+            "message": message,
+            "progress": progress,
+            "updated_at": datetime.now().isoformat(),
+        }
+        if pid is not None:
+            payload["pid"] = int(pid)
+        if log_file is not None:
+            payload["log_file"] = str(log_file)
+        json.dump(payload, f)
+
+def _update_trade_recap_regen_status(
+    status: str,
+    message: str = "",
+    progress: float = 0,
+    pid: int | None = None,
+    log_file: str | None = None,
+    trade_date: str | None = None,
+):
+    with open(TRADE_RECAP_REGEN_STATUS_FILE, "w") as f:
+        payload = {
+            "status": status,
+            "message": message,
+            "progress": progress,
+            "updated_at": datetime.now().isoformat(),
+        }
+        if pid is not None:
+            payload["pid"] = int(pid)
+        if log_file is not None:
+            payload["log_file"] = str(log_file)
+        if trade_date is not None:
+            payload["trade_date"] = str(trade_date)
         json.dump(payload, f)
 
 def run_daily_ops_task(strategy: str = "v7", trading_date: str | None = None):
@@ -235,6 +523,141 @@ def run_daily_ops_task(strategy: str = "v7", trading_date: str | None = None):
             _update_daily_ops_status("failed", f"Daily ops failed (code {rc}). See {log_rel}", 1.0, log_file=log_rel)
     except Exception as e:
         _update_daily_ops_status("failed", str(e), 1.0, log_file=log_rel)
+        try:
+            if log_fp is not None:
+                log_fp.write(f"[{datetime.now().isoformat()}] ERROR: {e}\n")
+                log_fp.flush()
+        except Exception:
+            pass
+    finally:
+        try:
+            if log_fp is not None:
+                log_fp.close()
+        except Exception:
+            pass
+
+def run_model_train_task(strategy: str = "v7", trading_date: str | None = None):
+    """
+    Run train_daily_model as a background task, writing logs into logs/app/model_train/.
+    """
+    log_path: Path | None = None
+    log_fp = None
+    log_rel: str | None = None
+    try:
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = MODEL_TRAIN_DIR / f"train_model_{run_ts}.log"
+        log_fp = open(log_path, "w", encoding="utf-8")
+        log_rel = f"model_train/{log_path.name}"
+        log_fp.write(
+            f"[{datetime.now().isoformat()}] Model train start: strategy={strategy} trading_date={trading_date or 'default'}\n"
+        )
+        log_fp.flush()
+
+        cmd: list[str] = [
+            sys.executable,
+            "-m",
+            "flagship.trading.orchestration.train_daily_model",
+            "--strategy",
+            str(strategy),
+        ]
+        if trading_date:
+            cmd += ["--date", str(trading_date)]
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=PROJECT_ROOT,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        _update_model_train_status(
+            "running",
+            "Model training running...",
+            0.1,
+            pid=proc.pid,
+            log_file=log_rel,
+        )
+
+        rc = proc.wait()
+        if rc == 0:
+            _update_model_train_status("completed", "Model training completed.", 1.0, log_file=log_rel)
+        else:
+            _update_model_train_status("failed", f"Model training failed (code {rc}). See {log_rel}", 1.0, log_file=log_rel)
+    except Exception as e:
+        _update_model_train_status("failed", str(e), 1.0, log_file=log_rel)
+        try:
+            if log_fp is not None:
+                log_fp.write(f"[{datetime.now().isoformat()}] ERROR: {e}\n")
+                log_fp.flush()
+        except Exception:
+            pass
+    finally:
+        try:
+            if log_fp is not None:
+                log_fp.close()
+        except Exception:
+            pass
+
+def run_trade_recap_regen_task(*, strategy: str, trade_date: str):
+    """
+    Regenerate trade recap HTML for a given ET trade_date, writing logs into logs/app/reporting/trade_recap/.
+    """
+    log_path: Path | None = None
+    log_fp = None
+    log_rel: str | None = None
+    try:
+        run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_date = re.sub(r"[^0-9]", "", str(trade_date))[:8] or "unknown"
+        log_path = TRADE_RECAP_REGEN_DIR / f"trade_recap_{safe_date}_{run_ts}.log"
+        log_fp = open(log_path, "w", encoding="utf-8")
+        log_rel = f"reporting/trade_recap/{log_path.name}"
+        log_fp.write(f"[{datetime.now().isoformat()}] Trade recap regen start: strategy={strategy} trade_date={trade_date}\n")
+        log_fp.flush()
+
+        cmd: list[str] = [
+            sys.executable,
+            "-m",
+            "flagship.ops.reporting.daily_trade_recap",
+            "--trade-date",
+            str(trade_date),
+            "--output-dir",
+            str(APP_DATA_DIR),
+            "--log-dir",
+            str(PROJECT_ROOT / "logs"),
+            "--strategy",
+            str(strategy),
+        ]
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=PROJECT_ROOT,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        _update_trade_recap_regen_status(
+            "running",
+            "Trade recap regeneration running...",
+            0.1,
+            pid=proc.pid,
+            log_file=log_rel,
+            trade_date=trade_date,
+        )
+
+        rc = proc.wait()
+        if rc == 0:
+            _update_trade_recap_regen_status("completed", "Trade recap regeneration completed.", 1.0, log_file=log_rel, trade_date=trade_date)
+        else:
+            _update_trade_recap_regen_status(
+                "failed",
+                f"Trade recap regeneration failed (code {rc}). See {log_rel}",
+                1.0,
+                log_file=log_rel,
+                trade_date=trade_date,
+            )
+    except Exception as e:
+        _update_trade_recap_regen_status("failed", str(e), 1.0, log_file=log_rel, trade_date=trade_date)
         try:
             if log_fp is not None:
                 log_fp.write(f"[{datetime.now().isoformat()}] ERROR: {e}\n")
@@ -494,6 +917,64 @@ async def trigger_daily_ops(req: DailyOpsRequest, background_tasks: BackgroundTa
     background_tasks.add_task(run_daily_ops_task, strategy, trading_date)
     return {"status": "success", "message": "Daily ops started."}
 
+@app.post("/api/model/train")
+async def trigger_model_train(req: ModelTrainRequest, background_tasks: BackgroundTasks, admin = Depends(check_admin)):
+    strategy = (req.strategy or "v7").strip()
+    if strategy not in ("v5", "v7"):
+        raise HTTPException(status_code=400, detail="Invalid strategy (must be v5 or v7)")
+
+    trading_date = (req.trading_date or "").strip() or None
+    if trading_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", trading_date):
+        raise HTTPException(status_code=400, detail="Invalid trading_date format (expected YYYY-MM-DD)")
+
+    # Concurrency guard
+    if MODEL_TRAIN_STATUS_FILE.exists():
+        try:
+            with open(MODEL_TRAIN_STATUS_FILE, "r") as f:
+                data = json.load(f)
+            if data.get("status") == "running":
+                pid = data.get("pid")
+                if pid is not None:
+                    try:
+                        if _is_pid_running(int(pid)):
+                            return {"status": "error", "message": "Model training already running"}
+                    except Exception:
+                        return {"status": "error", "message": "Model training already running"}
+        except Exception:
+            pass
+
+    background_tasks.add_task(run_model_train_task, strategy, trading_date)
+    return {"status": "success", "message": "Model training started."}
+
+@app.post("/api/reports/trade_recap/regenerate")
+async def regenerate_trade_recap(req: TradeRecapRegenerateRequest, background_tasks: BackgroundTasks, admin = Depends(check_admin)):
+    strategy = (req.strategy or "v7").strip()
+    if strategy not in ("v5", "v7"):
+        raise HTTPException(status_code=400, detail="Invalid strategy (must be v5 or v7)")
+
+    trade_date = str(req.trade_date or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", trade_date):
+        raise HTTPException(status_code=400, detail="Invalid trade_date format (expected YYYY-MM-DD)")
+
+    # Concurrency guard
+    if TRADE_RECAP_REGEN_STATUS_FILE.exists():
+        try:
+            with open(TRADE_RECAP_REGEN_STATUS_FILE, "r") as f:
+                data = json.load(f)
+            if data.get("status") == "running":
+                pid = data.get("pid")
+                if pid is not None:
+                    try:
+                        if _is_pid_running(int(pid)):
+                            return {"status": "error", "message": "Trade recap regeneration already running"}
+                    except Exception:
+                        return {"status": "error", "message": "Trade recap regeneration already running"}
+        except Exception:
+            pass
+
+    background_tasks.add_task(run_trade_recap_regen_task, strategy=strategy, trade_date=trade_date)
+    return {"status": "success", "message": "Trade recap regeneration started."}
+
 @app.get("/api/backtest/status")
 async def get_status(user = Depends(get_current_user)):
     if not STATUS_FILE.exists():
@@ -545,10 +1026,51 @@ async def get_daily_ops_status(user = Depends(get_current_user)):
 
     return data
 
-@app.on_event("startup")
-async def startup_event():
-    create_users_table()
-    add_user("admin", get_password_hash("admin@123"), "admin")
+@app.get("/api/model/train/status")
+async def get_model_train_status(admin = Depends(check_admin)):
+    if not MODEL_TRAIN_STATUS_FILE.exists():
+        return {"status": "idle"}
+    with open(MODEL_TRAIN_STATUS_FILE, "r") as f:
+        data = json.load(f)
+
+    if data.get("status") == "running":
+        pid = data.get("pid")
+        if pid is not None:
+            try:
+                if not _is_pid_running(int(pid)):
+                    _update_model_train_status("idle", "Stale status reset (process not running).", 0.0)
+                    return {"status": "idle"}
+            except Exception:
+                pass
+
+    return data
+
+@app.get("/api/reports/trade_recap/status")
+async def get_trade_recap_regen_status(admin = Depends(check_admin)):
+    if not TRADE_RECAP_REGEN_STATUS_FILE.exists():
+        return {"status": "idle"}
+    with open(TRADE_RECAP_REGEN_STATUS_FILE, "r") as f:
+        data = json.load(f)
+
+    if data.get("status") == "running":
+        pid = data.get("pid")
+        if pid is not None:
+            try:
+                if not _is_pid_running(int(pid)):
+                    _update_trade_recap_regen_status("idle", "Stale status reset (process not running).", 0.0)
+                    return {"status": "idle"}
+            except Exception:
+                pass
+
+    return data
+
+# Static assets (local-friendly):
+# - /data/* serves logs/app snapshots (same as Caddy in prod)
+# - / serves built React site + login.html
+if APP_DATA_DIR.exists():
+    app.mount("/data", StaticFiles(directory=str(APP_DATA_DIR), html=False), name="data")
+if SITE_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(SITE_DIR), html=True), name="site")
 
 if __name__ == "__main__":
     import uvicorn

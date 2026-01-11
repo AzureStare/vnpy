@@ -467,8 +467,21 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
         index_symbols = {"SPY.NASDAQ", "VIX.CBOE", "VIX3M.CBOE"}
         held_symbols = [s for s, p in self.pos_data.items() if p > 0 and s not in index_symbols]
 
+        # Trading controls: disabled symbols (block new entries only).
+        # This list is injected by live runner; backtests may leave it empty.
+        disabled_symbols: set[str] = set()
+        try:
+            raw = getattr(self, "disabled_vt_symbols", None)
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, (list, tuple, set)):
+                disabled_symbols = {str(s).strip() for s in raw if str(s).strip()}
+        except Exception:
+            disabled_symbols = set()
+
         # Candidate list: Top 50 by model signal, excluding holdings
-        candidate_df = self._build_candidate_df(tradable_df, exclude_symbols=set(held_symbols), top_k=50)
+        exclude_for_candidates = set(held_symbols) | set(disabled_symbols)
+        candidate_df = self._build_candidate_df(tradable_df, exclude_symbols=exclude_for_candidates, top_k=50)
 
         # Add new positions up to top_n
         slots = max(0, int(self.top_n) - len(held_symbols))

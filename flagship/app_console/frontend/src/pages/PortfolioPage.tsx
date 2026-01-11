@@ -7,13 +7,6 @@ import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table";
 
-type MarketStatus = Record<string, unknown> & {
-  generated_at?: string;
-  market?: string;
-  next_open?: string;
-  seconds_to_open?: number;
-};
-
 type PortfolioSnapshot = Record<string, unknown> & {
   generated_at?: string;
   account?: { cash?: number; equity?: number; buying_power?: number; status?: string };
@@ -59,6 +52,16 @@ type PerformanceSnapshot = Record<string, unknown> & {
 type TradingControls = Record<string, unknown> & {
   disabled_vt_symbols?: string[];
   buy_exposure_multiplier?: number;
+};
+
+type AccountSummary = {
+  account_id: string;
+  display_name: string;
+  data_base_path: string;
+};
+
+type AccountsResponse = {
+  accounts?: AccountSummary[];
 };
 
 function safeNumber(v: unknown): number | null {
@@ -118,10 +121,12 @@ function buildSparklinePath(values: number[], width: number, height: number): st
   return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(2)} ${p.y.toFixed(2)}`).join(" ");
 }
 
-export function PaperPage() {
+export function PortfolioPage() {
   const toast = useToast();
 
-  const [market, setMarket] = useState<MarketStatus | null>(null);
+  const [accounts, setAccounts] = useState<AccountSummary[]>([]);
+  const [selectedAccountId, setSelectedAccountId] = useState<string>("");
+
   const [portfolio, setPortfolio] = useState<PortfolioSnapshot | null>(null);
   const [selection, setSelection] = useState<SelectionSnapshot | null>(null);
   const [orders, setOrders] = useState<OrdersSnapshot | null>(null);
@@ -142,16 +147,55 @@ export function PaperPage() {
     return Math.min(1.0, Math.max(0.0, m));
   }, [controls]);
 
+  const [draftExposurePct, setDraftExposurePct] = useState<number>(() => Math.round(buyExposure * 100));
+  const [exposureDirty, setExposureDirty] = useState<boolean>(false);
+  const [savingExposure, setSavingExposure] = useState<boolean>(false);
+
+  useEffect(() => {
+    const currentPct = Math.round(buyExposure * 100);
+    if (!exposureDirty) {
+      setDraftExposurePct(currentPct);
+      return;
+    }
+    if (draftExposurePct === currentPct) {
+      setExposureDirty(false);
+    }
+  }, [buyExposure, exposureDirty, draftExposurePct]);
+
+  const selectedAccount = useMemo(() => {
+    if (!selectedAccountId) return null;
+    return accounts.find((a) => a.account_id === selectedAccountId) || null;
+  }, [accounts, selectedAccountId]);
+
+  const dataBase = useMemo(() => {
+    // Default behavior: use /data/* (existing single-account snapshots)
+    const p = String(selectedAccount?.data_base_path || "/data").trim();
+    return p || "/data";
+  }, [selectedAccount]);
+
+  const loadAccounts = useCallback(async () => {
+    try {
+      const data = await fetchJson<AccountsResponse>("/api/accounts", { method: "GET" });
+      const xs = Array.isArray(data?.accounts) ? data.accounts : [];
+      setAccounts(xs);
+      if (!selectedAccountId) {
+        // Prefer the first account from backend; fallback to an empty string (use /data).
+        setSelectedAccountId(xs[0]?.account_id || "");
+      }
+    } catch (_) {
+      setAccounts([]);
+      if (!selectedAccountId) setSelectedAccountId("");
+    }
+  }, [selectedAccountId]);
+
   const loadAll = useCallback(async () => {
     try {
-      const [ms, pf, sel, od, pr] = await Promise.all([
-        fetchJson<MarketStatus>("/data/market_status.json"),
-        fetchJson<PortfolioSnapshot>("/data/portfolio.json"),
+      const [pf, sel, od, pr] = await Promise.all([
+        fetchJson<PortfolioSnapshot>(`${dataBase}/portfolio.json`),
         fetchJson<SelectionSnapshot>("/data/selection.json"),
-        fetchJson<OrdersSnapshot>("/data/orders.json"),
-        fetchJson<PerformanceSnapshot>("/data/performance.json"),
+        fetchJson<OrdersSnapshot>(`${dataBase}/orders.json`),
+        fetchJson<PerformanceSnapshot>(`${dataBase}/performance.json`),
       ]);
-      setMarket(ms);
       setPortfolio(pf);
       setSelection(sel);
       setOrders(od);
@@ -180,9 +224,9 @@ export function PaperPage() {
       prevRankRef.current = next;
       setRankDeltaBySymbol(deltas);
     } catch (e: any) {
-      toast.push("Paper", String(e?.message || e), "bad");
+      toast.push("Portfolio", String(e?.message || e), "bad");
     }
-  }, [toast]);
+  }, [toast, dataBase]);
 
   const refreshControls = useCallback(async () => {
     try {
@@ -233,16 +277,17 @@ export function PaperPage() {
 
   const loadOrdersOnly = useCallback(async () => {
     try {
-      const od = await fetchJson<OrdersSnapshot>("/data/orders.json");
+      const od = await fetchJson<OrdersSnapshot>(`${dataBase}/orders.json`);
       setOrders(od);
     } catch (_) {
       // ignore transient
     }
-  }, []);
+  }, [dataBase]);
 
   useEffect(() => {
+    void loadAccounts();
     loadAll();
-  }, [loadAll]);
+  }, [loadAccounts, loadAll]);
 
   // Regular refresh
   useInterval(() => {
@@ -253,11 +298,6 @@ export function PaperPage() {
   useInterval(() => {
     loadOrdersOnly();
   }, 10_000);
-
-  const isMarketOpen = useMemo(() => {
-    const mk = String(market?.market || "").toLowerCase();
-    return mk === "open" || mk === "regular";
-  }, [market]);
 
   const positions = portfolio?.positions || [];
 
@@ -284,7 +324,12 @@ export function PaperPage() {
         const filledPx = safeNumber(o.filled_avg_price);
         const filledAt = o.filled_at;
         const status = String(o.status || "").toLowerCase();
-        return filledQty > 0 && filledPx !== null && Boolean(filledAt) && (status === "filled" || status === "partially_filled");
+        return (
+          filledQty > 0 &&
+          filledPx !== null &&
+          Boolean(filledAt) &&
+          (status === "filled" || status === "partially_filled")
+        );
       })
       .map((o) => {
         const filledQty = safeNumber(o.filled_qty) ?? 0;
@@ -359,6 +404,21 @@ export function PaperPage() {
     return sumNumbers(positions.map((p) => safeNumber(p.unrealized_pnl)));
   }, [positions]);
 
+  const currentExposurePct = useMemo(() => Math.round(buyExposure * 100), [buyExposure]);
+
+  const saveExposure = useCallback(async () => {
+    if (!exposureDirty) return;
+    const pct = Number(draftExposurePct);
+    if (!Number.isFinite(pct)) return;
+    const m = Math.min(100, Math.max(0, pct)) / 100;
+    setSavingExposure(true);
+    try {
+      await setExposure(m);
+    } finally {
+      setSavingExposure(false);
+    }
+  }, [draftExposurePct, exposureDirty, setExposure]);
+
   const sparklinePath = useMemo(() => {
     return buildSparklinePath(perfSummary.points, 240, 64);
   }, [perfSummary.points]);
@@ -367,19 +427,22 @@ export function PaperPage() {
     <div>
       <div className="mb-6 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <div className="text-xl font-semibold tracking-tight">Paper Dashboard</div>
-          <div className="mt-1 text-sm text-muted-foreground">Leaderboard, portfolio and daily performance</div>
+          <div className="text-xl font-semibold tracking-tight">Portfolio</div>
+          <div className="mt-1 text-sm text-muted-foreground">Leaderboard, positions and daily performance</div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Badge variant={isMarketOpen ? "good" : "outline"}>Market {String(market?.market || "-")}</Badge>
-          <Badge variant="outline">Next open: {market?.next_open ? fmtUtcTs(market.next_open) : "-"}</Badge>
-          <Badge variant="outline">Exposure {(buyExposure * 100).toFixed(0)}%</Badge>
-          <Button variant={buyExposure === 0.5 ? "default" : "outline"} size="sm" onClick={() => void setExposure(0.5)}>
-            50%
-          </Button>
-          <Button variant={buyExposure === 1.0 ? "default" : "outline"} size="sm" onClick={() => void setExposure(1.0)}>
-            100%
-          </Button>
+          <select
+            value={selectedAccountId || ""}
+            onChange={(e) => setSelectedAccountId(e.target.value)}
+            className="h-9 rounded-md border border-border bg-background px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {(accounts || []).map((a) => (
+              <option key={a.account_id} value={a.account_id}>
+                {a.display_name}
+              </option>
+            ))}
+            {!accounts.length ? <option value="">Default</option> : null}
+          </select>
           <Button variant="outline" size="sm" onClick={() => void loadAll()}>
             Refresh
           </Button>
@@ -430,7 +493,9 @@ export function PaperPage() {
                           </div>
                         </TableCell>
                         <TableCell className="text-right tabular-nums">{fmtNumber(r.signal, 4)}</TableCell>
-                        <TableCell className="text-right tabular-nums">{r.close_price ? fmtMoney(r.close_price, 2) : "-"}</TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {r.close_price ? fmtMoney(r.close_price, 2) : "-"}
+                        </TableCell>
                         <TableCell className="text-right tabular-nums">{r.adv_usd ? fmtMoney(r.adv_usd, 0) : "-"}</TableCell>
                         <TableCell className="text-right">
                           <Button
@@ -457,88 +522,138 @@ export function PaperPage() {
           </CardContent>
         </Card>
 
-        {/* Portfolio */}
-        <Card className="col-span-12 lg:col-span-5">
-          <CardHeader>
-            <div>
-              <CardTitle>Portfolio</CardTitle>
-              <CardDescription>Real-time positions + key metrics</CardDescription>
-            </div>
-            <Badge variant="outline">{fmtUtcTs(portfolio?.generated_at)}</Badge>
-          </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="rounded-lg bg-muted/40 p-4">
-                <div className="text-xs text-muted-foreground">Equity</div>
-                <div className="mt-1 text-lg font-semibold tabular-nums">{fmtMoney(portfolio?.account?.equity)}</div>
+        {/* Right column: trading controls + portfolio snapshot */}
+        <div className="col-span-12 flex flex-col gap-6 lg:col-span-5">
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>Exposure</CardTitle>
+                <CardDescription>Buy-side multiplier (adjust then Save)</CardDescription>
               </div>
-              <div className="rounded-lg bg-muted/40 p-4">
-                <div className="text-xs text-muted-foreground">Cash</div>
-                <div className="mt-1 text-lg font-semibold tabular-nums">{fmtMoney(portfolio?.account?.cash)}</div>
-              </div>
-              <div className="rounded-lg bg-muted/40 p-4">
-                <div className="text-xs text-muted-foreground">Buying power</div>
-                <div className="mt-1 text-lg font-semibold tabular-nums">{fmtMoney(portfolio?.account?.buying_power)}</div>
-              </div>
-              <div className="rounded-lg bg-muted/40 p-4">
-                <div className="text-xs text-muted-foreground">Unrealized PnL</div>
-                <div
-                  className={[
-                    "mt-1 text-lg font-semibold tabular-nums",
-                    unrealizedPnl > 0 ? "text-emerald-700" : unrealizedPnl < 0 ? "text-rose-700" : "text-foreground",
-                  ].join(" ")}
-                >
-                  {fmtMoney(unrealizedPnl)}
+              <Badge variant="outline">Current {currentExposurePct}%</Badge>
+            </CardHeader>
+            <CardContent className="pt-2">
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-[34px] text-right text-xs text-muted-foreground tabular-nums">0%</div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={draftExposurePct}
+                    onChange={(e) => {
+                      const v = Number(e.currentTarget.value);
+                      setDraftExposurePct(v);
+                      setExposureDirty(v !== currentExposurePct);
+                    }}
+                    className="h-2 w-full cursor-pointer accent-primary"
+                    disabled={savingExposure}
+                  />
+                  <div className="w-[52px] text-right text-xs font-medium tabular-nums">{draftExposurePct}%</div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2">
+                  {exposureDirty ? (
+                    <span className="text-xs text-muted-foreground">Unsaved</span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground">Saved</span>
+                  )}
+                  <Button
+                    variant={exposureDirty ? "default" : "outline"}
+                    size="sm"
+                    onClick={() => void saveExposure()}
+                    disabled={!exposureDirty || savingExposure}
+                  >
+                    {savingExposure ? "Saving..." : "Save"}
+                  </Button>
                 </div>
               </div>
-            </div>
+            </CardContent>
+          </Card>
 
-            <div className="mt-5 flex items-center justify-between">
-              <div className="text-sm font-medium">Holdings</div>
-              <Badge variant="outline">{positions.length} positions</Badge>
-            </div>
+          <Card>
+            <CardHeader>
+              <div>
+                <CardTitle>Portfolio</CardTitle>
+                <CardDescription>Real-time positions + key metrics</CardDescription>
+              </div>
+              <Badge variant="outline">{fmtUtcTs(portfolio?.generated_at)}</Badge>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="rounded-lg bg-muted/40 p-4">
+                  <div className="text-xs text-muted-foreground">Equity</div>
+                  <div className="mt-1 text-lg font-semibold tabular-nums">{fmtMoney(portfolio?.account?.equity)}</div>
+                </div>
+                <div className="rounded-lg bg-muted/40 p-4">
+                  <div className="text-xs text-muted-foreground">Cash</div>
+                  <div className="mt-1 text-lg font-semibold tabular-nums">{fmtMoney(portfolio?.account?.cash)}</div>
+                </div>
+                <div className="rounded-lg bg-muted/40 p-4">
+                  <div className="text-xs text-muted-foreground">Buying power</div>
+                  <div className="mt-1 text-lg font-semibold tabular-nums">{fmtMoney(portfolio?.account?.buying_power)}</div>
+                </div>
+                <div className="rounded-lg bg-muted/40 p-4">
+                  <div className="text-xs text-muted-foreground">Unrealized PnL</div>
+                  <div
+                    className={[
+                      "mt-1 text-lg font-semibold tabular-nums",
+                      unrealizedPnl > 0 ? "text-emerald-700" : unrealizedPnl < 0 ? "text-rose-700" : "text-foreground",
+                    ].join(" ")}
+                  >
+                    {fmtMoney(unrealizedPnl)}
+                  </div>
+                </div>
+              </div>
 
-            <div className="mt-3 overflow-hidden rounded-lg ring-1 ring-border/60">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Symbol</TableHead>
-                    <TableHead className="text-right">Qty</TableHead>
-                    <TableHead className="text-right">Mkt value</TableHead>
-                    <TableHead className="text-right">uPnL</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {positions.slice(0, 10).map((p) => {
-                    const upnl = safeNumber(p.unrealized_pnl) ?? 0;
-                    return (
-                      <TableRow key={p.symbol}>
-                        <TableCell className="font-medium">{p.symbol}</TableCell>
-                        <TableCell className="text-right tabular-nums">{fmtNumber(p.qty, 0)}</TableCell>
-                        <TableCell className="text-right tabular-nums">{fmtMoney(p.market_value, 0)}</TableCell>
-                        <TableCell
-                          className={[
-                            "text-right tabular-nums",
-                            upnl > 0 ? "text-emerald-700" : upnl < 0 ? "text-rose-700" : "text-foreground",
-                          ].join(" ")}
-                        >
-                          {fmtMoney(upnl, 0)}
+              <div className="mt-5 flex items-center justify-between">
+                <div className="text-sm font-medium">Holdings</div>
+                <Badge variant="outline">{positions.length} positions</Badge>
+              </div>
+
+              <div className="mt-3 overflow-hidden rounded-lg ring-1 ring-border/60">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Symbol</TableHead>
+                      <TableHead className="text-right">Qty</TableHead>
+                      <TableHead className="text-right">Mkt value</TableHead>
+                      <TableHead className="text-right">uPnL</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {positions.slice(0, 10).map((p) => {
+                      const upnl = safeNumber(p.unrealized_pnl) ?? 0;
+                      return (
+                        <TableRow key={p.symbol}>
+                          <TableCell className="font-medium">{p.symbol}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtNumber(p.qty, 0)}</TableCell>
+                          <TableCell className="text-right tabular-nums">{fmtMoney(p.market_value, 0)}</TableCell>
+                          <TableCell
+                            className={[
+                              "text-right tabular-nums",
+                              upnl > 0 ? "text-emerald-700" : upnl < 0 ? "text-rose-700" : "text-foreground",
+                            ].join(" ")}
+                          >
+                            {fmtMoney(upnl, 0)}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
+                    {!positions.length && (
+                      <TableRow>
+                        <TableCell colSpan={4} className="text-sm text-muted-foreground">
+                          No positions
                         </TableCell>
                       </TableRow>
-                    );
-                  })}
-                  {!positions.length && (
-                    <TableRow>
-                      <TableCell colSpan={4} className="text-sm text-muted-foreground">
-                        No positions
-                      </TableCell>
-                    </TableRow>
-                  )}
-                </TableBody>
-              </Table>
-            </div>
-          </CardContent>
-        </Card>
+                    )}
+                  </TableBody>
+                </Table>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
 
         {/* Performance */}
         <Card className="col-span-12 lg:col-span-7">
@@ -560,7 +675,11 @@ export function PaperPage() {
                 <div
                   className={[
                     "mt-1 text-lg font-semibold tabular-nums",
-                    (perfSummary.d1 || 0) > 0 ? "text-emerald-700" : (perfSummary.d1 || 0) < 0 ? "text-rose-700" : "text-foreground",
+                    (perfSummary.d1 || 0) > 0
+                      ? "text-emerald-700"
+                      : (perfSummary.d1 || 0) < 0
+                        ? "text-rose-700"
+                        : "text-foreground",
                   ].join(" ")}
                 >
                   {fmtMoney(perfSummary.d1)}{" "}
@@ -572,7 +691,11 @@ export function PaperPage() {
                 <div
                   className={[
                     "mt-1 text-lg font-semibold tabular-nums",
-                    (perfSummary.d7 || 0) > 0 ? "text-emerald-700" : (perfSummary.d7 || 0) < 0 ? "text-rose-700" : "text-foreground",
+                    (perfSummary.d7 || 0) > 0
+                      ? "text-emerald-700"
+                      : (perfSummary.d7 || 0) < 0
+                        ? "text-rose-700"
+                        : "text-foreground",
                   ].join(" ")}
                 >
                   {fmtMoney(perfSummary.d7)}{" "}
@@ -630,7 +753,12 @@ export function PaperPage() {
             <div className="mt-3 flex items-center justify-between">
               <div className="text-xs text-muted-foreground">Page size: {BUY_PAGE_SIZE}</div>
               <div className="flex items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => setBuyPage((p) => Math.max(0, p - 1))} disabled={buyPage <= 0}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setBuyPage((p) => Math.max(0, p - 1))}
+                  disabled={buyPage <= 0}
+                >
                   Prev
                 </Button>
                 <Button
