@@ -432,7 +432,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "flagship_lab_expected_date_timestamp_seconds",
+          "expr": "flagship_lab_expected_date_timestamp_seconds * 1000",
           "refId": "A"
         }
       ],
