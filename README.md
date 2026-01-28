@@ -18,6 +18,44 @@ VeighNa是一套基于Python的开源量化交易系统开发框架，在开源�
 
 在使用VeighNa进行二次开发（策略、模块等）的过程中有任何疑问，请查看[**VeighNa项目文档**](https://www.vnpy.com/docs/cn/index.html)，如果无法解决请前往[**官方社区论坛**](https://www.vnpy.com/forum/)的【提问求助】板块寻求帮助，也欢迎在【经验分享】板块分享你的使用心得！
 
+## Flagship 回测（Alpha-Momentum）
+
+前置条件：
+
+- `lab/flagship_alpha_momentum/` 已有 `daily/` 与 `minute/` K 线数据
+- Postgres 已初始化，`daily_selection` 可用（可用 CSV 导入）
+
+初始化数据库：
+
+```
+python -m flagship.scripts.tools.init_db
+```
+
+导入 daily_selection（已有 CSV）：
+
+```
+python -m flagship.scripts.tools.import_daily_selection_csv --csv-path /path/to/daily_selection.csv --recreate
+```
+
+端到端回测（使用已导入的 daily_selection）：
+
+```
+python -m flagship.scripts.run_lgb_pipeline \
+  --start 2024-01-02 \
+  --end 2024-04-12 \
+  --run-backtest \
+  --skip-selection
+```
+
+如需自动构建 daily_selection（依赖日线与 ref_tickers）：
+
+```
+python -m flagship.scripts.run_lgb_pipeline \
+  --start 2024-01-02 \
+  --end 2024-04-12 \
+  --run-backtest
+```
+
 **想要获取更多关于VeighNa的资讯信息？** 请扫描下方二维码添加小助手加入【VeighNa社区交流微信群】：
 
 <p align="center">
