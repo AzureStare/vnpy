@@ -1,10 +1,9 @@
 import shutil
 import os
-from pathlib import Path
 from datetime import datetime
 from vnpy.trader.logger import logger
+from flagship.config import PROJECT_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 BACKTEST_MODEL_DIR = PROJECT_ROOT / "flagship" / "models" / "backtest_v7_rolling"
 LIVE_MODEL_DIR = PROJECT_ROOT / "lab" / "flagship_alpha_momentum" / "model"
 LIVE_MODEL_PATH = LIVE_MODEL_DIR / "live_model.joblib"

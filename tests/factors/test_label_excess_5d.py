@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 import polars as pl
 
-from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
+from flagship.factors.alpha_momentum.v7_dataset import FlagshipAlphaMomentumV7Dataset
 
 
 def _forward_ret_5d(closes: list[float]) -> list[float | None]:

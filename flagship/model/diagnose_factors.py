@@ -14,15 +14,9 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import sys
 from typing import Any
 
 import polars as pl
-
-# 动态注入项目根路径（保证 pickle 反序列化时能找到旗舰项目模块）
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from vnpy.alpha import AlphaLab
 from vnpy.alpha.dataset import Segment

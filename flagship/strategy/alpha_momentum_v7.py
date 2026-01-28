@@ -7,7 +7,6 @@ Flagship Alpha-Momentum 策略实现。
 - 止盈机制：Profit Ladder (阶梯止盈)
 - 杠杆模式：大盘走强时允许 130%-160% 杠杆
 """
-
 from __future__ import annotations
 
 from collections import defaultdict
@@ -26,10 +25,10 @@ from vnpy.trader.logger import logger
 from vnpy.alpha.strategy import AlphaStrategy
 
 
-class FlagshipAlphaMomentumStrategy(AlphaStrategy):
+class AlphaMomentumV7(AlphaStrategy):
     """
     Flagship Alpha-Momentum V7.0 Aggressive 策略实现类。
-    
+
     策略特性：
     - 选股机制：Top 50 候选，配合 Setup A/B 结构过滤
     - 持仓集中：5-8 只
@@ -37,6 +36,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
     - 杠杆模式：大盘走强时允许 130%-160% 杠杆
     """
 
+    STRATEGY_VERSION = "v7"
     top_n: int = 8
     min_score_threshold: float = 0.0  # V7 以后主要靠排名和结构，Score 只作为初选
     min_quantile_threshold: float = 90.0
@@ -48,17 +48,23 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
     close_rate: float = 0.0015
     min_commission: int = 1
     price_add: float = 0.0005
-    
+
     # 风险管理参数
     hard_stop_loss_pct: float = 0.07  # 硬止损 7%
     stop_loss_atr_multiplier: float = 2.5  # ATR 止损倍数
     max_daily_drawdown: float = 0.05
-    
+
     # 阶梯止盈阈值
     profit_threshold_trend: float = 0.05  # 5% 进入趋势阶段
     profit_threshold_win: float = 0.15    # 15% 进入获利丰厚阶段
     spike_threshold: float = 0.10         # 10% 暴涨日阈值
-    
+
+    # 趋势阶段止盈线（分钟级）：支持线性加权（默认纯 EMA20）
+    trend_exit_ema_period: int = 20
+    trend_exit_boll_mid_period: int = 5  # 5分钟布林带中轨（等价于 SMA(5)）
+    trend_exit_weight_ema: float = 1.0
+    trend_exit_weight_boll_mid: float = 0.0
+
     # 仓位控制
     base_pos_size: float = 0.15  # 基础仓位 15%
     max_leverage: float = 1.6
@@ -69,30 +75,30 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
         self.entry_prices: dict[str, float] = {}
         self.entry_highs: dict[str, float] = {}
         self.previous_net_value: float = 0.0
-        
+
         # 记录当日最低价（用于 Spike Check）
         self.daily_lows: dict[str, float] = {}
         # 记录当日是否触发过暴涨（10%+）
         self.spike_triggered: dict[str, bool] = defaultdict(bool)
-        
+
         self.bar_managers: dict[str, ArrayManager] = {}
         for vt_symbol in self.vt_symbols:
             self.bar_managers[vt_symbol] = ArrayManager(size=100)
-        
+
         # 大盘指标
         self.spy_ema10: float | None = None
         self.spy_ema20: float | None = None
-        
+
         self.trade_entry_reasons: dict[str, str] = {}
         self.trade_exit_reasons: dict[str, str] = {}
         self.trade_entry_reasons_by_tradeid: dict[str, str] = {}
         self.trade_exit_reasons_by_tradeid: dict[str, str] = {}
-        
+
         self.daily_indicators: dict[str, dict[str, float]] = {}  # 缓存信号文件中的指标 (ema, atr etc)
-        
+
         self.current_trade_date: date | None = None
         self.daily_rebalance_done: bool = False
-        
+
         self.write_log("Flagship Alpha-Momentum V7.0 Strategy initialized (Intraday Exit Mode)")
 
     def on_trade(self, trade: TradeData) -> None:
@@ -119,11 +125,11 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
         """K线切片回调"""
         if not bars:
             return
-            
+
         first_bar = next(iter(bars.values()))
         current_datetime = first_bar.datetime.replace(tzinfo=None)
         current_date = current_datetime.date()
-        
+
         is_new_trading_day = False
         if self.current_trade_date != current_date:
             is_new_trading_day = True
@@ -137,7 +143,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
 
         # 1. 更新基础数据
         self._update_bar_managers(bars)
-        
+
         # 更新入场后最高价和当日最低价
         for vt_symbol, bar in bars.items():
             if self.get_pos(vt_symbol) > 0:
@@ -150,7 +156,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
 
         # 2. 止盈止损检查 (每分钟)
         self._check_profit_ladder_exit(bars)
-        
+
         # 3. 每日调仓 (开盘第一个K线)
         if is_new_trading_day and not self.daily_rebalance_done:
             self._run_daily_rebalance(bars)
@@ -164,7 +170,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             if vt_symbol in self.bar_managers:
                 am = self.bar_managers[vt_symbol]
                 am.update_bar(bar)
-                
+
                 # 特殊处理 SPY 指标
                 if vt_symbol == "SPY.NASDAQ" and am.inited:
                     self.spy_ema10 = am.ema(10)
@@ -176,33 +182,53 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             pos = self.get_pos(vt_symbol)
             if pos <= 0:
                 continue
-                
+
             entry_price = self.entry_prices.get(vt_symbol)
             entry_high = self.entry_highs.get(vt_symbol)
             if not entry_price or not entry_high:
                 continue
-                
+
             # 获取日级指标 (来自信号文件)
             indicators = self.daily_indicators.get(vt_symbol, {})
             atr = indicators.get("atr_14")
-            
+
             # 使用 ArrayManager 计算实时 EMA (更灵敏)
             am = self.bar_managers.get(vt_symbol)
             ema5 = am.ema(5) if am and am.inited else indicators.get("ema5")
-            ema10 = am.ema(10) if am and am.inited else indicators.get("ema10")
-            
+            ema20 = am.ema(int(self.trend_exit_ema_period)) if am and am.inited else indicators.get("ema20")
+            boll_mid_5 = am.sma(int(self.trend_exit_boll_mid_period)) if am and am.inited else None
+
+            # 线性加权趋势止盈线（缺失时自动降级）
+            w_ema = float(self.trend_exit_weight_ema)
+            w_mid = float(self.trend_exit_weight_boll_mid)
+            if w_ema < 0:
+                w_ema = 0.0
+            if w_mid < 0:
+                w_mid = 0.0
+
+            trend_line = None
+            w_sum = 0.0
+            if ema20 is not None and w_ema > 0:
+                trend_line = float(ema20) * w_ema
+                w_sum += w_ema
+            if boll_mid_5 is not None and w_mid > 0:
+                trend_line = (float(trend_line or 0.0) + float(boll_mid_5) * w_mid)
+                w_sum += w_mid
+            if trend_line is not None and w_sum > 0:
+                trend_line = float(trend_line) / float(w_sum)
+
             # 计算当前浮盈 (基于分钟价)
             profit_pct = (bar.close_price / entry_price) - 1
             days = self.holding_days.get(vt_symbol, 0)
-            
+
             exit_reason = None
-            
+
             # 0. 暴涨日实时保护 (Intraday Spike Guard)
             # 如果盘中涨幅超过 10%，记录触发
             day_return = (bar.close_price / bar.open_price - 1) if bar.open_price > 0 else 0
             if day_return > self.spike_threshold:
                 self.spike_triggered[vt_symbol] = True
-            
+
             if self.spike_triggered[vt_symbol]:
                 # 触发暴涨后，若价格回落跌破当日最低价（收盘价附近的快速回落），立即锁定
                 if bar.close_price <= self.daily_lows.get(vt_symbol, 0):
@@ -213,7 +239,7 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
             spy_bar = bars.get("SPY.NASDAQ")
             if spy_bar and self.spy_ema10 and spy_bar.close_price < self.spy_ema10:
                 quick_brake = True
-            
+
             # 2. 阶梯止盈逻辑 (Profit Ladder)
             if not exit_reason:
                 if profit_pct < self.profit_threshold_trend and days < 3:
@@ -223,22 +249,24 @@ class FlagshipAlphaMomentumStrategy(AlphaStrategy):
                         hard_stop = min(hard_stop, entry_price - self.stop_loss_atr_multiplier * atr)
                     if bar.close_price < hard_stop:
                         exit_reason = f"早期硬止损 (Price < {hard_stop:.2f})"
-                
+
                 elif (self.profit_threshold_trend <= profit_pct < self.profit_threshold_win) and not quick_brake:
-                    # B. 趋势阶段：跌破 EMA10
-                    if ema10 and bar.close_price < ema10:
-                        exit_reason = "EMA10 趋势止盈"
-                
+                    # B. 趋势阶段：跌破趋势止盈线（默认 EMA20）
+                    if trend_line and bar.close_price < float(trend_line):
+                        if self.trend_exit_weight_boll_mid > 0:
+                            exit_reason = f"趋势止盈(加权线) (Price < {float(trend_line):.2f})"
+                        else:
+                            exit_reason = "EMA20 趋势止盈"
                 else:
                     # C. 获利丰厚阶段 (>15%) 或 大盘刹车模式：使用 EMA5 或 10% 回撤
                     trailing_stop = entry_high * 0.90
                     stop_line = trailing_stop
                     if ema5:
                         stop_line = max(ema5, trailing_stop)
-                        
+
                     if bar.close_price < stop_line:
                         exit_reason = f"利润锁定/大盘避险 (Price < {stop_line:.2f})"
-            
+
             if exit_reason:
                 self.write_log(f"{vt_symbol} 盘中离场: {exit_reason}, 当前收益: {profit_pct:.2%}")
                 self.trade_exit_reasons[vt_symbol] = exit_reason

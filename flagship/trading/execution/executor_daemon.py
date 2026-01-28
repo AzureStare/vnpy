@@ -16,10 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -27,12 +26,8 @@ import polars as pl
 
 from vnpy.trader.logger import logger
 
-# Ensure project root importable under docker/cron
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
+from flagship.config import PROJECT_ROOT
 from flagship.config.polygon_config import get_polygon_api_key
 from flagship.trading.execution.broker_alpaca import AlpacaAdapter
 from flagship.trading.execution.broker_ibkr import IbkrAdapter, IbkrConnection, IbkrImportError
@@ -223,6 +218,7 @@ def run_daemon(
     cancel_open_orders: bool,
     dry_run: bool,
     use_polygon_ws: bool,
+    execution_delay_seconds: int,
 ) -> None:
     # Use Alpaca clock as the canonical market-open signal (also used for Alpaca account trading).
     clock_adapter = AlpacaAdapter()
@@ -295,6 +291,16 @@ def run_daemon(
             )
 
             if is_open:
+                # 0) Execution Delay: Wait for spreads to settle (e.g. 60s after 9:30 ET)
+                market_open_et = datetime.combine(trade_date, datetime_time(9, 30), tzinfo=EASTERN)
+                time_since_open = (now_et - market_open_et).total_seconds()
+                if time_since_open < execution_delay_seconds:
+                    logger.info(
+                        f"[ExecutorDaemon] waiting for execution delay: {time_since_open:.1f}s < {execution_delay_seconds}s"
+                    )
+                    time.sleep(5)
+                    continue
+
                 if state.last_rebalance_trade_date == trade_date.isoformat():
                     time.sleep(max(5, int(poll_seconds)))
                     continue
@@ -380,9 +386,6 @@ def run_daemon(
                         logger.warning(f"[ExecutorDaemon] polygon ws start failed: {exc}")
                         ws_cache = None
 
-                if cancel_open_orders:
-                    clock_adapter.cancel_all_open_orders()
-
                 state.last_rebalance_trade_date = trade_date.isoformat()
                 state.last_rebalance_timestamp = float(time.time())
                 state.last_signal_date = expected_signal_date.isoformat()
@@ -447,6 +450,12 @@ def main() -> None:
         default=True,
         help="Subscribe Polygon WS for monitoring (default: true).",
     )
+    parser.add_argument(
+        "--execution-delay-seconds",
+        type=int,
+        default=60,
+        help="Seconds to wait after market open before executing orders (default: 60).",
+    )
     args = parser.parse_args()
 
     state_file = args.state_file
@@ -460,6 +469,7 @@ def main() -> None:
         cancel_open_orders=bool(args.cancel_open_orders),
         dry_run=bool(args.dry_run),
         use_polygon_ws=bool(args.use_polygon_ws),
+        execution_delay_seconds=int(args.execution_delay_seconds),
     )
 
 

@@ -1,7 +1,7 @@
 """
 Flagship Alpha-Momentum v5.0 因子计算模块。
 
-基于策略文档v5.0实现：
+基于策略文档 v5.0 实现：
 - 因子A：波动率调整突破（ATR标准化）
 - 因子B：VWAP确认强度
 - 因子C：趋势强度（EMA多周期，v5.0新增）
@@ -21,17 +21,17 @@ from vnpy.alpha import AlphaDataset
 class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
     """
     Flagship Alpha-Momentum v5.0 数据集
-    
+
     因子体系：
     - 因子A：波动率调整突破 alpha_mom = (P_t - max(H_{t-20:t-1})) / ATR_14
     - 因子B：VWAP确认强度 alpha_vwap = (P_t - VWAP_t) / σ_intra * ln(1 + RelVol_t)
     - 因子C：趋势强度 alpha_trend = (P_t - EMA_20) / ATR_14 * I[EMA_5 > EMA_20] (v5.0新增)
-    
+
     过滤条件：
     - MA50趋势过滤：P_t > MA_50
     - EMA短期趋势过滤：P_t > EMA_5 且 EMA_5 > EMA_20 (v5.0新增)
     - 相对强度过滤：R_{t-10:t} > R_{SPY, t-10:t}
-    
+
     因子合成：
     - 分层回归：以alpha_mom为主轴，对alpha_vwap回归取残差
     - 加权合成：Score = w1 * Z(alpha_mom) + w2 * Z(residual_vwap) + w3 * Z(alpha_trend)
@@ -53,7 +53,7 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
             test_period=test_period,
             process_type=process_type,
         )
-        
+
         self.spy_symbol = spy_symbol
         eps: float = 1e-8
 
@@ -67,23 +67,23 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
         # ========== 因子B：VWAP确认强度 ==========
         # alpha_vwap = (P_t - VWAP_t) / σ_intra * ln(1 + RelVol_t)
         # 将所有表达式内联到一个特征中，避免依赖其他因子（因为因子计算是并行的）
-        
+
         # 检查是否有turnover列
         has_turnover = "turnover" in df.columns
-        
+
         if has_turnover:
             # 使用真实的VWAP = turnover / volume
             vwap_expr = f"(turnover / (volume + {eps}))"
         else:
             # 使用典型价格作为VWAP的近似
             vwap_expr = f"((high + low + close) / 3)"
-        
+
         # 内联所有计算
         atr_expr = f"ta_atr(high, low, close, 14)"
         sigma_intra_expr = f"{atr_expr} / (close + {eps})"
         rel_vol_expr = f"volume / (ts_mean(ts_delay(volume, 1), 20) + {eps})"
         vwap_divergence_expr = f"(close - {vwap_expr}) / ({sigma_intra_expr} * close + {eps})"
-        
+
         self.add_feature(
             "alpha_vwap",
             f"{vwap_divergence_expr} * ts_log({rel_vol_expr} + 1)",
@@ -93,10 +93,10 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
         # alpha_trend = (P_t - EMA_20) / ATR_14 * I[EMA_5 > EMA_20]
         # EMA/ema_distance 将在后处理阶段用 polars ewm_mean 计算，
         # 避免依赖 vnpy 表达式层新增 ta_ema（遵守“不改 vnpy/ 框架库代码”的仓库约束）。
-        
+
         # 日级ATR特征（用于策略中的止盈止损计算）
         self.add_feature("atr_14", f"ta_atr(high, low, close, 14)")
-        
+
         # 注意：trend_state 和 alpha_trend 将在后处理阶段计算
         # 因为需要用到逻辑操作符（&），这在DataProxy表达式中不支持
 
@@ -106,13 +106,13 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
             "close_price",
             "close",
         )
-        
+
         # MA50趋势过滤（在后处理阶段应用，这里只计算MA50）
         self.add_feature(
             "ma50",
             f"ts_mean(close, 50)",
         )
-        
+
         # 相对强度过滤（需要SPY数据）
         # 先计算10日收益率
         self.add_feature(
@@ -129,7 +129,7 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
     def _post_process(self, df: pl.DataFrame) -> pl.DataFrame:
         """
         后处理：三重过滤 + 分层回归 + 综合Score
-        
+
         步骤：
         1. 应用三重过滤（MA50 + EMA短期趋势 + RS）
         2. 分层回归：alpha_vwap = β * alpha_mom + ε
@@ -149,47 +149,57 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
             df = df.sort(["vt_symbol", "datetime"])
 
             if "ema5" not in df.columns:
-                df = df.with_columns([
-                    pl.col("close_price").ewm_mean(span=5, adjust=False, min_samples=1).over("vt_symbol").alias("ema5"),
-                    pl.col("close_price").ewm_mean(span=20, adjust=False, min_samples=1).over("vt_symbol").alias("ema20"),
-                    pl.col("close_price").ewm_mean(span=50, adjust=False, min_samples=1).over("vt_symbol").alias("ema50"),
-                ])
+                df = df.with_columns(
+                    [
+                        pl.col("close_price").ewm_mean(span=5, adjust=False, min_samples=1).over("vt_symbol").alias("ema5"),
+                        pl.col("close_price").ewm_mean(span=20, adjust=False, min_samples=1).over("vt_symbol").alias("ema20"),
+                        pl.col("close_price").ewm_mean(span=50, adjust=False, min_samples=1).over("vt_symbol").alias("ema50"),
+                    ]
+                )
 
             if "atr_14" in df.columns and "ema20" in df.columns and "ema_distance" not in df.columns:
-                df = df.with_columns([
-                    ((pl.col("close_price") - pl.col("ema20")) / (pl.col("atr_14") + eps)).alias("ema_distance")
-                ])
+                df = df.with_columns(
+                    [
+                        ((pl.col("close_price") - pl.col("ema20")) / (pl.col("atr_14") + eps)).alias("ema_distance")
+                    ]
+                )
 
         # 趋势状态：多头排列（EMA5 > EMA20 > EMA50）
         if "ema5" in df.columns and "ema20" in df.columns and "ema50" in df.columns:
-            df = df.with_columns([
-                (
-                    (pl.col("ema5") > pl.col("ema20")) &
-                    (pl.col("ema20") > pl.col("ema50"))
-                ).cast(pl.Int32).alias("trend_state")
-            ])
-        
+            df = df.with_columns(
+                [
+                    (
+                        (pl.col("ema5") > pl.col("ema20"))
+                        & (pl.col("ema20") > pl.col("ema50"))
+                    ).cast(pl.Int32).alias("trend_state")
+                ]
+            )
+
         # 趋势强度因子：只有当EMA5 > EMA20时，因子值才为正
         # alpha_trend = ema_distance * I[EMA5 > EMA20]
         if "ema_distance" in df.columns and "ema5" in df.columns and "ema20" in df.columns:
-            df = df.with_columns([
-                (
-                    pl.col("ema_distance") *
-                    (pl.col("ema5") > pl.col("ema20")).cast(pl.Float64)
-                ).alias("alpha_trend")
-            ])
+            df = df.with_columns(
+                [
+                    (
+                        pl.col("ema_distance")
+                        * (pl.col("ema5") > pl.col("ema20")).cast(pl.Float64)
+                    ).alias("alpha_trend")
+                ]
+            )
         elif "ema20" in df.columns and "ema5" in df.columns and "close_price" in df.columns:
             # 如果没有ema_distance，使用close_price和ema20计算
             # 需要ATR，但这里简化处理：使用close_price的滚动标准差作为ATR的近似
             # 注意：这只是一个fallback，正常情况下应该使用ema_distance
-            df = df.with_columns([
-                (
-                    (pl.col("close_price") - pl.col("ema20")) / 
-                    (pl.col("close_price").std().over(["vt_symbol", "datetime"]) + eps) *
-                    (pl.col("ema5") > pl.col("ema20")).cast(pl.Float64)
-                ).alias("alpha_trend")
-            ])
-        
+            df = df.with_columns(
+                [
+                    (
+                        (pl.col("close_price") - pl.col("ema20"))
+                        / (pl.col("close_price").std().over(["vt_symbol", "datetime"]) + eps)
+                        * (pl.col("ema5") > pl.col("ema20")).cast(pl.Float64)
+                    ).alias("alpha_trend")
+                ]
+            )
+
         # 如果alpha_trend仍未计算出来，设置为0
         if "alpha_trend" not in df.columns:
             df = df.with_columns([pl.lit(0.0).alias("alpha_trend")])
@@ -198,18 +208,18 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
         # MA50过滤
         if "ma50" in df.columns and "close_price" in df.columns:
             df = df.filter(pl.col("close_price") > pl.col("ma50"))
-        
+
         # EMA短期趋势过滤（v5.0新增）
         if "ema5" in df.columns and "ema20" in df.columns and "close_price" in df.columns:
             df = df.filter(
-                (pl.col("close_price") > pl.col("ema5")) &
-                (pl.col("ema5") > pl.col("ema20"))
+                (pl.col("close_price") > pl.col("ema5"))
+                & (pl.col("ema5") > pl.col("ema20"))
             )
-        
+
         # 相对强度过滤（需要SPY数据）
         # 这里先跳过RS过滤，因为需要合并SPY数据
         # TODO: 在prepare_data阶段合并SPY数据并计算RS
-        
+
         if df.is_empty():
             return df
 
@@ -217,34 +227,42 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
         # 对每个日期，将alpha_vwap对alpha_mom回归，取残差
         # alpha_vwap = β * alpha_mom + ε
         # residual_vwap = ε
-        
+
         # 计算回归系数β（截面回归）
-        df = df.with_columns([
-            # 计算协方差和方差
-            (pl.col("alpha_mom") * pl.col("alpha_vwap")).mean().over("datetime").alias("cov_mom_vwap"),
-            (pl.col("alpha_mom") * pl.col("alpha_mom")).mean().over("datetime").alias("var_mom"),
-        ])
-        
+        df = df.with_columns(
+            [
+                # 计算协方差和方差
+                (pl.col("alpha_mom") * pl.col("alpha_vwap")).mean().over("datetime").alias("cov_mom_vwap"),
+                (pl.col("alpha_mom") * pl.col("alpha_mom")).mean().over("datetime").alias("var_mom"),
+            ]
+        )
+
         # β = cov(alpha_mom, alpha_vwap) / var(alpha_mom)
-        df = df.with_columns([
-            (pl.col("cov_mom_vwap") / (pl.col("var_mom") + eps)).alias("beta")
-        ])
-        
+        df = df.with_columns(
+            [
+                (pl.col("cov_mom_vwap") / (pl.col("var_mom") + eps)).alias("beta")
+            ]
+        )
+
         # 残差 = alpha_vwap - β * alpha_mom
-        df = df.with_columns([
-            (pl.col("alpha_vwap") - pl.col("beta") * pl.col("alpha_mom")).alias("residual_vwap")
-        ])
+        df = df.with_columns(
+            [
+                (pl.col("alpha_vwap") - pl.col("beta") * pl.col("alpha_mom")).alias("residual_vwap")
+            ]
+        )
 
         # ========== 步骤3：Winsorization + Z-Score ==========
         # 对alpha_mom、residual_vwap和alpha_trend做截面Winsorization
         quantile_exprs: list[pl.Expr] = []
         processed_factors = ["alpha_mom", "residual_vwap", "alpha_trend"]
-        
+
         for col in processed_factors:
-            quantile_exprs.extend([
-                pl.col(col).quantile(0.01).over("datetime").alias(f"{col}_q01"),
-                pl.col(col).quantile(0.99).over("datetime").alias(f"{col}_q99"),
-            ])
+            quantile_exprs.extend(
+                [
+                    pl.col(col).quantile(0.01).over("datetime").alias(f"{col}_q01"),
+                    pl.col(col).quantile(0.99).over("datetime").alias(f"{col}_q99"),
+                ]
+            )
 
         df_q = df.with_columns(quantile_exprs)
 
@@ -318,11 +336,13 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
             ic_daily = (
                 df_z_for_ic
                 .group_by("datetime")
-                .agg([
-                    pl.corr("z_mom", "label").alias("ic_mom"),
-                    pl.corr("z_vwap_residual", "label").alias("ic_vwap"),
-                    pl.corr("z_trend", "label").alias("ic_trend"),
-                ])
+                .agg(
+                    [
+                        pl.corr("z_mom", "label").alias("ic_mom"),
+                        pl.corr("z_vwap_residual", "label").alias("ic_vwap"),
+                        pl.corr("z_trend", "label").alias("ic_trend"),
+                    ]
+                )
                 .sort("datetime")
             )
 
@@ -433,4 +453,3 @@ class FlagshipAlphaMomentumV5Dataset(AlphaDataset):
             + ["cov_mom_vwap", "var_mom", "beta"]
         )
         return df_z.drop(drop_cols)
-

@@ -32,14 +32,13 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from flagship.config import PROJECT_ROOT
 
 
 def _print_cmd(argv: list[str]) -> None:

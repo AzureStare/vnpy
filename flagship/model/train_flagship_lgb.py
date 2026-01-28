@@ -12,16 +12,11 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import sys
 from typing import Iterable
 
 import polars as pl
 import pandas as pd
 import lightgbm as lgb
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from vnpy.alpha import AlphaLab
 from vnpy.alpha.dataset import Segment, AlphaDataset
@@ -79,11 +74,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="rank_5d",
         help="用作排序的標籤列（默認 rank_5d，若不存在將回退到 label_excess_5d 或 label）",
-    )
-    parser.add_argument(
-        "--regime-id",
-        type=int,
-        help="Regime编号（1-10），用于信号文件命名",
     )
     parser.add_argument(
         "--ndcg-at",
@@ -338,12 +328,7 @@ def main() -> None:
 
     if not args.no_signal:
         segment = Segment[args.signal_segment.upper()]
-        # 如果指定了regime_id，使用regime命名
-        if args.regime_id:
-            signal_name = f"flagship_alpha_mom_regime{args.regime_id:02d}_lgb_signal"
-        else:
-            signal_name = args.signal_name
-        export_signal(lab, dataset, booster, segment, signal_name, label_col)
+        export_signal(lab, dataset, booster, segment, args.signal_name, label_col)
 
 
 if __name__ == "__main__":

@@ -5,10 +5,9 @@ from pathlib import Path
 from datetime import date
 from typing import Any, Optional
 
-# Project root
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# 仅在“直接运行脚本”（python file.py）时注入项目根路径；以 `python -m` 运行则无需处理
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from flagship.config import VT_SETTING_PATH
 from flagship.universe.pg_ticker_db import upsert_ref_ticker, upsert_ticker_detail, get_ref_tickers

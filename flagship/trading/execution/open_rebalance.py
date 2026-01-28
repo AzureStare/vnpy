@@ -30,10 +30,7 @@ from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
 from flagship.trading.config import LAB_PATH
 from flagship.trading.controls import get_disabled_vt_symbols
 from flagship.trading.execution.broker_base import BrokerAdapter, OrderSide
-from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy
-from flagship.strategy.flagship_alpha_momentum_strategy_v7 import (
-    FlagshipAlphaMomentumStrategy as FlagshipAlphaMomentumStrategyV7,
-)
+from flagship.strategy.registry import build_strategy_instance
 
 class _MockEngine:
     """
@@ -110,22 +107,11 @@ class StrategyRunner:
         self.engine = _MockEngine(adapter)
         self.lab = AlphaLab(str(lab_path))
 
-        if strategy_version == "v5":
-            StrategyClass = FlagshipAlphaMomentumStrategy
-            strategy_name = "Live_Flagship_V5"
-            settings = {"top_n": 5}
-        else:
-            StrategyClass = FlagshipAlphaMomentumStrategyV7
-            strategy_name = "Live_Flagship_V7_Aggressive"
-            settings = {"top_n": 8}
-
-        self.strategy = StrategyClass(
-            strategy_engine=self.engine,  # type: ignore[arg-type]
-            strategy_name=strategy_name,
+        self.strategy = build_strategy_instance(
+            strategy_version,
+            engine=self.engine,
             vt_symbols=[],
-            setting=settings,
         )
-        self.strategy.on_init()
 
     def inject_signal(self, signal_path: Path) -> None:
         if not signal_path.exists():
@@ -233,16 +219,22 @@ def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_
             sell_qty = int(current_qty - target_qty)
             if sell_qty > 0:
                 logger.info(f"[OpenRebalance] selling {sell_qty} of {symbol}")
-                adapter.place_order(symbol, sell_qty, OrderSide.SELL)
-                sell_orders_submitted += 1
+                try:
+                    adapter.place_order(symbol, sell_qty, OrderSide.SELL)
+                    sell_orders_submitted += 1
+                except Exception as exc:
+                    logger.error(f"[OpenRebalance] sell order failed {symbol} qty={sell_qty}: {exc}")
 
     # Liquidate positions not in targets
     target_roots = {vt.split(".")[0] for vt in targets.keys()}
     for symbol, current_qty in current_positions.items():
         if symbol not in target_roots and current_qty > 0:
             logger.info(f"[OpenRebalance] liquidating {current_qty} of {symbol} (not in targets)")
-            adapter.place_order(symbol, int(current_qty), OrderSide.SELL)
-            sell_orders_submitted += 1
+            try:
+                adapter.place_order(symbol, int(current_qty), OrderSide.SELL)
+                sell_orders_submitted += 1
+            except Exception as exc:
+                logger.error(f"[OpenRebalance] liquidation sell failed {symbol} qty={int(current_qty)}: {exc}")
 
     time.sleep(2.0)
 
@@ -292,18 +284,55 @@ def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_
     else:
         logger.info(f"[OpenRebalance] total_estimated_cost {total_estimated_cost:.2f} within budget {budget:.2f}")
 
-    # 4) Execute buys
+    # 4) Execute buys (TWAP: 3 steps over 2 minutes)
+    twap_steps = 3
+    twap_interval_s = 60
+    
+    # Pre-calculate slices
+    # symbol -> list of qtys [q1, q2, q3]
+    buy_map: dict[str, list[int]] = {}
+    
+    orders_to_fill = []
     for order in buy_orders:
-        qty = int(order["qty"])
         symbol = str(order["symbol"])
+        qty = int(order["qty"])
         if qty <= 0:
             continue
-        logger.info(
-            f"[OpenRebalance] buying {qty} of {symbol} @ ~{float(order['price']):.2f} "
-            f"(est_cost={float(order['cost']):.2f})"
-        )
-        adapter.place_order(symbol, qty, OrderSide.BUY)
-        buy_orders_submitted += 1
+        orders_to_fill.append(symbol)
+        
+        base = qty // twap_steps
+        rem = qty % twap_steps
+        slices = [base] * twap_steps
+        for i in range(rem):
+            slices[i] += 1
+        buy_map[symbol] = slices
+
+    if not orders_to_fill:
+        return
+
+    logger.info(
+        f"[OpenRebalance] Starting TWAP execution: {len(orders_to_fill)} symbols, "
+        f"{twap_steps} steps, {twap_interval_s}s interval."
+    )
+
+    for step in range(twap_steps):
+        is_last_step = (step == twap_steps - 1)
+        logger.info(f"[OpenRebalance] TWAP Batch {step + 1}/{twap_steps}")
+        
+        for symbol in orders_to_fill:
+            qty_slice = buy_map[symbol][step]
+            if qty_slice > 0:
+                logger.info(
+                    f"[OpenRebalance] buying {qty_slice} of {symbol} (TWAP {step + 1}/{twap_steps})"
+                )
+                try:
+                    adapter.place_order(symbol, qty_slice, OrderSide.BUY)
+                    buy_orders_submitted += 1
+                except Exception as exc:
+                    logger.error(f"[OpenRebalance] failed to place order {symbol}: {exc}")
+        
+        if not is_last_step:
+            time.sleep(twap_interval_s)
 
     metrics_writer.write(
         samples=[

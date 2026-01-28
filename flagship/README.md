@@ -4,7 +4,7 @@
 - 数据准备与增量更新（Polygon → AlphaLab parquet）
 - 因子建模与训练（LightGBM）
 - 信号生成与报告输出（HTML）
-- 纸面交易（Alpaca Paper）日常自动化 + 盘中分钟级退出守护
+- 模拟交易（Alpaca Paper）日常自动化 + 盘中分钟级退出守护
 
 ## 快速开始（本地）
 
@@ -58,40 +58,69 @@ python -m pip install alpaca-py polygon-api-client psycopg2-binary
 ## 目录结构（以仓库根目录为工作目录）
 
 - `flagship/`：策略项目代码
-  - `flagship/scripts/`：数据准备、增量更新、pipeline、EC2 部署脚本
+  - `flagship/scripts/`：数据准备、增量更新、pipeline、部署脚本
   - `flagship/model/`：训练/评估/因子诊断
-  - `flagship/backtest/`：回测入口（默认 minute + RTH-only）
+  - `flagship/factors/`：因子与数据集定义（V5/V7）
+  - `flagship/backtest/`：统一回测入口
+  - `flagship/strategy/`：策略类实现（`alpha_momentum_v5.py` / `alpha_momentum_v7.py`）
   - `flagship/trading/`：交易域包（orchestration/execution/intraday/realtime）
-  - `flagship/strategy/`：策略类实现（`FlagshipAlphaMomentumStrategy`）
-  - `flagship/docs/`：策略与部署文档（本地/服务器侧文件可能被 `.gitignore` 忽略）
+  - `flagship/docs/`：策略与部署文档
 - `lab/flagship_alpha_momentum/`：AlphaLab 输出目录（数据/模型/信号/报告）
-  - `daily/`、`minute/`、`dataset/`、`model/`、`signal/`、`report/`、`logs/`
+  - `daily/`、`minute/`：K 线
+  - `dataset/`：AlphaDataset 输出
+  - `model/`：训练模型
+  - `signal/`：模型信号（用于回测/实盘）
+  - `report/`、`logs/`：回测与诊断输出
 
 ## 常用入口（最常用 6 个命令）
 
-### 1) Regime 训练 +（可选）回测 Pipeline
+### 1) 训练 +（可选）回测 Pipeline
 
 ```bash
-python -m flagship.scripts.research.run_lgb_pipeline --regime-id 1 --run-backtest
+python -m flagship.scripts.run_lgb_pipeline \
+  --start 2024-01-02 \
+  --end 2024-04-12 \
+  --run-backtest
 ```
 
-### 2) 回测入口（分钟线 RTH-only 默认启用）
+### 2) 回测入口（统一脚本）
 
+前置条件：
+- `lab/flagship_alpha_momentum` 下必须有 **daily/minute bars**，否则无法生成占位信号。
+- 若显式传 `--signal-name`，需要先生成对应信号文件（`lab/flagship_alpha_momentum/signal/<name>.parquet`）。
+
+常用方式（推荐）：
+1) 先跑 pipeline 生成数据/模型/信号：
 ```bash
-python flagship/backtest/flagship_alpha_momentum_backtest.py \
+python -m flagship.scripts.run_lgb_pipeline \
+  --start 2024-01-02 \
+  --end 2024-04-12 \
+  --run-backtest
+```
+
+2) 直接回测（已有信号或可用占位信号）：
+```bash
+python -m flagship.backtest.flagship_alpha_momentum_backtest \
   --start 2024-01-02 \
   --end 2024-04-12 \
   --interval minute \
-  --rth-only
+  --rth-only \
+  --strategy v7 \
+  --no-postgres-selection
 ```
+
+说明：
+- `--strategy v5|v7`：策略版本
+- `--signal-name`：指定信号文件名（不指定则使用默认名）
+- `--no-postgres-selection`：不依赖 Postgres 选股
 
 ### 3) 因子诊断报告（相关性/重要性/可选 LLM 总结）
 
 ```bash
 python flagship/model/diagnose_factors.py \
-  --dataset-name flagship_alpha_mom_regime01_lgb \
-  --model-name flagship_alpha_mom_regime01_lgb \
-  --output-path lab/flagship_alpha_momentum/report/20240102_20240412_regime01/model_diagnostics.html \
+  --dataset-name flagship_alpha_momentum_20240102_20240412_lgb \
+  --model-name flagship_alpha_momentum_20240102_20240412_lgb \
+  --output-path lab/flagship_alpha_momentum/report/20240102_20240412_backtest/model_diagnostics.html \
   --llm-summary --llm-model gpt-5.2
 ```
 

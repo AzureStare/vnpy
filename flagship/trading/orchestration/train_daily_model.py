@@ -2,17 +2,11 @@
 Script to retrain the LightGBM model daily for paper trading.
 Uses the latest available data to train a fresh model.
 """
-import sys
 import argparse
 import joblib
 import polars as pl
 from datetime import date, datetime, timedelta
 from pathlib import Path
-
-# Add project root to path
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from vnpy.trader.logger import logger
 from vnpy.trader.constant import Interval
@@ -21,8 +15,9 @@ from vnpy.alpha.dataset import Segment
 from flagship.trading.config import (
     LAB_PATH, LIVE_MODEL_PATH, LIVE_LR_MODEL_PATH
 )
-from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
-from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
+from flagship.config import PROJECT_ROOT
+from flagship.factors.alpha_momentum.v7_dataset import FlagshipAlphaMomentumV7Dataset
+from flagship.factors.alpha_momentum.v5_dataset import FlagshipAlphaMomentumV5Dataset
 from flagship.universe.pg_ticker_db import get_selected_symbols_in_range
 from flagship.model.train_flagship_lgb import build_lgb_dataset, log_feature_importance
 
@@ -271,7 +266,17 @@ def train_daily_model(
             }
             joblib.dump(artifact, output_lr_model_path)
             logger.info(f"[train_daily_model] LR model saved to: {output_lr_model_path}")
-            lr_info = artifact
+            # NOTE:
+            # We store the full sklearn pipeline in the joblib artifact, but NOT in JSON metrics
+            # (Pipeline is not JSON serializable).
+            lr_info = {
+                "feature_cols": lr_feature_cols,
+                "label": "label_excess_5d>0",
+                "strategy_version": strategy_version,
+                "trained_at": artifact["trained_at"],
+                "n_samples": artifact["n_samples"],
+                "pos_rate": artifact["pos_rate"],
+            }
         except Exception as exc:
             logger.warning(f"[train_daily_model] LR meta model skipped/failed: {exc}")
     

@@ -20,13 +20,6 @@ from typing import Iterable, Literal
 
 import polars as pl
 
-import sys
-
-# 动态注入项目根路径（确保 `import flagship` 可用）
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from vnpy.alpha import AlphaLab
 from vnpy.trader.constant import Interval
 from vnpy.trader.logger import logger

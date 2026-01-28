@@ -9,15 +9,9 @@ Core logic lives in:
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 from vnpy.trader.logger import logger
-
-# Ensure project root importable under docker/cron
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from flagship.config.polygon_config import get_polygon_api_key
 from flagship.trading.execution.broker_alpaca import AlpacaAdapter

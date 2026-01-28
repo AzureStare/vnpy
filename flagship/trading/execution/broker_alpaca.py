@@ -8,6 +8,7 @@ Keep all Alpaca client wiring in one place to reduce duplication across:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict
@@ -113,7 +114,22 @@ class AlpacaAdapter(BrokerAdapter):
         try:
             alpaca_positions = self.client.get_all_positions()
             for pos in alpaca_positions:
-                positions[pos.symbol] = int(pos.qty)
+                symbol = str(getattr(pos, "symbol", "") or "").strip()
+                if not symbol:
+                    continue
+                raw_qty = getattr(pos, "qty", None)
+                try:
+                    qty_f = float(raw_qty)  # Alpaca may return str qty, sometimes fractional
+                    if not math.isfinite(qty_f):
+                        continue
+                    qty_i = int(math.trunc(qty_f))  # integer-share trading semantics: truncate toward 0
+                    if qty_i == 0 and abs(qty_f) > 0:
+                        # Fractional shares detected; keep safe behavior (avoid oversell) by truncating to 0.
+                        logger.warning(f"[Alpaca] Fractional position detected: {symbol} qty={raw_qty} (truncated to 0)")
+                    positions[symbol] = qty_i
+                except Exception as exc:
+                    logger.warning(f"[Alpaca] Bad position qty for {symbol}: qty={raw_qty} err={exc}")
+                    continue
         except Exception as exc:
             logger.error(f"[Alpaca] Error fetching positions: {exc}")
         return positions
@@ -153,6 +169,25 @@ class AlpacaAdapter(BrokerAdapter):
             self.client.submit_order(order_data=req)
             logger.info(f"[Alpaca] Submitted {side.value} order for {qty} shares of {symbol}")
         except APIError as exc:
+            # Critical: surface failure to caller so execution layer won't count it as submitted.
             logger.error(f"[Alpaca] Order failed for {symbol}: {exc}")
+            raise
+        except Exception as exc:
+            logger.error(f"[Alpaca] Order failed for {symbol}: {exc}")
+            raise
+
+
+def _parse_position_qty_to_int(raw_qty: object) -> int:
+    """
+    Pure helper for unit tests.
+    Alpaca position qty is often a string and may be fractional.
+    """
+    try:
+        qty_f = float(raw_qty)
+        if not math.isfinite(qty_f):
+            return 0
+        return int(math.trunc(qty_f))
+    except Exception:
+        return 0
 
 

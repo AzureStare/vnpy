@@ -13,7 +13,6 @@ import argparse
 import asyncio
 import contextlib
 import os
-import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta, timezone
@@ -23,15 +22,11 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-# Ensure project root on sys.path so `import flagship` works even when running as a script path.
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from vnpy.alpha.lab import AlphaLab
 from vnpy.trader.constant import Direction, Exchange, Interval, Offset
 from vnpy.trader.logger import logger
 from vnpy.trader.object import BarData
+from vnpy.alpha.strategy import AlphaStrategy
 
 from flagship.config.polygon_config import get_polygon_api_key
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
@@ -45,7 +40,7 @@ from flagship.trading.realtime.polygon_ws import (
     polygon_ws_import_error,
 )
 from flagship.trading.calendar import get_holiday_info, is_market_closed_day
-from flagship.strategy.flagship_alpha_momentum_strategy_v7 import FlagshipAlphaMomentumStrategy
+from flagship.strategy.registry import STRATEGY_REGISTRY, build_strategy_instance
 
 try:
     # alpaca-py
@@ -57,6 +52,8 @@ except Exception:  # pragma: no cover
 EASTERN = ZoneInfo("America/New_York")
 RTH_OPEN = dtime(9, 30)
 RTH_CLOSE = dtime(16, 0)
+EXIT_ORDER_COOLDOWN_SECONDS = int(os.getenv("FLAGSHIP_INTRADAY_EXIT_COOLDOWN_SECONDS", "300"))
+OPEN_ORDERS_CACHE_SECONDS = int(os.getenv("FLAGSHIP_INTRADAY_OPEN_ORDERS_CACHE_SECONDS", "5"))
 
 
 class SymbolsSource(str):
@@ -162,9 +159,9 @@ def _build_watchlist(
 
 class LiveEngine:
     """
-    Minimal strategy engine for intraday execution.
-    - get_signal(): returns full signal_df (daily snapshot)
-    - send_order(): sends orders to Alpaca (exit-only by default)
+    盘中执行使用的最小策略引擎：
+    - get_signal(): 返回完整 signal_df（每日快照）
+    - send_order(): 发送 Alpaca 订单（默认 exit-only）
     """
 
     def __init__(
@@ -179,6 +176,10 @@ class LiveEngine:
         self.root_close: dict[str, float] = {}
         self.orders: dict[str, Any] = {}
         self._order_count = 0
+        self.pending_exit_roots: dict[str, datetime] = {}
+        self.open_sell_roots_cache: set[str] = set()
+        self.open_sell_roots_cache_ts: datetime | None = None
+        self.open_orders_warned = False
 
     def get_signal(self) -> pl.DataFrame:
         return self.signal_df
@@ -211,7 +212,7 @@ class LiveEngine:
 
     def send_order(
         self,
-        strategy: FlagshipAlphaMomentumStrategy,
+        strategy: AlphaStrategy,
         vt_symbol: str,
         direction: Direction,
         offset: Offset,
@@ -219,11 +220,11 @@ class LiveEngine:
         volume: float,
     ) -> list[str]:
         """
-        Translate vnpy order into Alpaca order.
+        将 vnpy 订单转换为 Alpaca 下单。
 
-        Safety:
-        - exit-only mode will ignore OPEN orders.
-        - for CLOSE orders, clamp volume to current Alpaca position.
+        安全策略：
+        - exit-only 模式忽略 OPEN 订单。
+        - CLOSE 订单按 Alpaca 当前持仓量做截断，避免超卖。
         """
         self._order_count += 1
         oid = f"intraday_{self._order_count}"
@@ -245,8 +246,19 @@ class LiveEngine:
 
         root = vt_symbol.split(".")[0]
         current_qty = self.adapter.get_positions().get(root, 0)
+        now = datetime.now(timezone.utc)
 
-        # CLOSE long -> Alpaca SELL
+        # 已有未完成卖单或处于冷却期时，跳过重复离场
+        last_exit_at = self.pending_exit_roots.get(root)
+        if last_exit_at and (now - last_exit_at).total_seconds() < EXIT_ORDER_COOLDOWN_SECONDS:
+            logger.info(f"[IntradayRunner] {root} 离场冷却中，跳过重复卖单")
+            return []
+        if root in self._get_open_sell_roots():
+            logger.info(f"[IntradayRunner] {root} 已有未完成卖单，跳过重复卖单")
+            self.pending_exit_roots.setdefault(root, now)
+            return []
+
+        # 平多仓 -> Alpaca SELL
         if offset == Offset.CLOSE and direction == Direction.SHORT:
             sell_qty = min(int(volume), int(current_qty))
             if sell_qty <= 0:
@@ -255,9 +267,10 @@ class LiveEngine:
                 logger.error("[IntradayRunner] alpaca-py OrderSide not available, cannot send orders.")
                 return []
             self.adapter.place_order(root, sell_qty, OrderSide.SELL)
+            self.pending_exit_roots[root] = now
             return []
 
-        # CLOSE short -> Alpaca BUY (not expected in this strategy)
+        # 平空仓 -> Alpaca BUY（本策略不期望出现）
         if offset == Offset.CLOSE and direction == Direction.LONG:
             buy_qty = int(volume)
             if buy_qty <= 0:
@@ -268,7 +281,7 @@ class LiveEngine:
             self.adapter.place_order(root, buy_qty, OrderSide.BUY)
             return []
 
-        # OPEN orders in full mode: allow market entries
+        # full 模式允许开仓下单
         if offset == Offset.OPEN and direction == Direction.LONG:
             buy_qty = int(volume)
             if buy_qty <= 0:
@@ -280,11 +293,69 @@ class LiveEngine:
             return []
 
         if offset == Offset.OPEN and direction == Direction.SHORT:
-            # Not supported
+            # 不支持
             logger.warning(f"[IntradayRunner] ignore SHORT OPEN {vt_symbol} volume={volume}")
             return []
 
         return []
+
+    def _get_open_sell_roots(self) -> set[str]:
+        now = datetime.now(timezone.utc)
+        if self.open_sell_roots_cache_ts and (now - self.open_sell_roots_cache_ts).total_seconds() < OPEN_ORDERS_CACHE_SECONDS:
+            return self.open_sell_roots_cache
+
+        client = getattr(self.adapter, "client", None)
+        if client is None:
+            return set()
+
+        orders = None
+        if hasattr(client, "get_orders"):
+            try:
+                orders = client.get_orders(status="open")
+            except TypeError:
+                try:
+                    orders = client.get_orders()
+                except Exception:
+                    orders = None
+            except Exception:
+                orders = None
+        elif hasattr(client, "list_orders"):
+            try:
+                orders = client.list_orders(status="open")
+            except TypeError:
+                try:
+                    orders = client.list_orders()
+                except Exception:
+                    orders = None
+            except Exception:
+                orders = None
+        else:
+            if not self.open_orders_warned:
+                logger.warning("[IntradayRunner] Alpaca client 无法获取 open orders，可能导致重复离场下单。")
+                self.open_orders_warned = True
+            return set()
+
+        roots: set[str] = set()
+        terminal_status = {"filled", "canceled", "cancelled", "rejected", "expired"}
+        if orders:
+            for order in orders:
+                symbol = str(getattr(order, "symbol", "") or "").strip()
+                if not symbol:
+                    continue
+                side = str(getattr(order, "side", "") or "").lower()
+                status = str(getattr(order, "status", "") or "").lower()
+                if side != "sell":
+                    continue
+                if status in terminal_status:
+                    continue
+                roots.add(symbol)
+
+        self.open_sell_roots_cache = roots
+        self.open_sell_roots_cache_ts = now
+        return roots
+
+    def clear_pending_exit(self, root: str) -> None:
+        self.pending_exit_roots.pop(root, None)
 
     def cancel_order(self, strategy, order_id: str) -> None:
         # not implemented for now
@@ -296,7 +367,7 @@ class LiveEngine:
 
 
 def _init_strategy_state_from_alpaca(
-    strategy: FlagshipAlphaMomentumStrategy,
+    strategy: AlphaStrategy,
     adapter: AlpacaAdapter,
     watched: list[WatchedSymbol],
     last_prices: dict[str, float],
@@ -398,72 +469,83 @@ def _load_index_close(lab: AlphaLab, vt_symbol: str, d: date) -> float | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Intraday runner for Flagship Alpha-Momentum (Plan B).")
+    parser = argparse.ArgumentParser(description="Flagship Alpha-Momentum 盘中执行器（Plan B）。")
     parser.add_argument(
         "--mode",
         choices=["exit-only", "full"],
         default="exit-only",
-        help="exit-only: only allow SELL exits; full: allow entries too (not recommended).",
+        help="exit-only: 仅允许卖出离场；full: 允许盘中开仓（不推荐）。",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=sorted(STRATEGY_REGISTRY.keys()),
+        default="v7",
+        help="策略版本（例如 v5/v7），默认 v7。",
+    )
+    parser.add_argument(
+        "--strategy-name",
+        default="IntradayRunner",
+        help="策略实例名称（用于日志标识）。",
     )
     parser.add_argument(
         "--use-polygon-ws",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use Polygon WebSocket minute aggregates (default: true).",
+        help="使用 Polygon WS 分钟聚合（默认 true）。",
     )
     parser.add_argument(
         "--symbols-source",
         choices=[SymbolsSource.POSITIONS, SymbolsSource.SIGNAL, SymbolsSource.BOTH],
         default=SymbolsSource.BOTH,
-        help="Which universe to subscribe/track.",
+        help="订阅/跟踪的标的来源。",
     )
     parser.add_argument(
         "--signal-top-n",
         type=int,
         default=int(os.getenv("FLAGSHIP_INTRADAY_SIGNAL_TOPN", "10")),
-        help="Limit signal-based WS watchlist to Top-N symbols by score (default: 10). Positions are always included.",
+        help="信号订阅限制为 Top-N（默认 10），持仓标的始终包含。",
     )
     parser.add_argument(
         "--rth-only",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Only process bars and trade during RTH (09:30-16:00 ET).",
+        help="仅在 RTH（09:30-16:00 ET）处理与交易。",
     )
     parser.add_argument(
         "--poll-seconds",
         type=int,
         default=0,
-        help="If >0, poll every N seconds as fallback (Alpaca latest trade price).",
+        help=">0 时启用轮询兜底（按 N 秒轮询最新成交价）。",
     )
     parser.add_argument(
         "--stop-after-close",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Exit after market close/early-close to avoid hanging overnight (default: true).",
+        help="收盘/提前收盘后退出，避免隔夜挂起（默认 true）。",
     )
     parser.add_argument(
         "--close-grace-seconds",
         type=int,
         default=300,
-        help="Grace period after close before exiting (default: 300).",
+        help="收盘后延迟退出秒数（默认 300）。",
     )
     parser.add_argument(
         "--ws-reconnect",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Auto-reconnect Polygon WS on disconnect/errors (default: true).",
+        help="WS 断开/报错时自动重连（默认 true）。",
     )
     parser.add_argument(
         "--ws-max-backoff",
         type=int,
         default=30,
-        help="Max reconnect backoff seconds (default: 30).",
+        help="重连最大退避秒数（默认 30）。",
     )
     parser.add_argument(
         "--ws-max-errors-before-poll",
         type=int,
         default=3,
-        help="If --poll-seconds>0, fallback to polling after N consecutive WS errors (default: 3).",
+        help="当连续 WS 错误达到 N 次时改用轮询（默认 3）。",
     )
     args = parser.parse_args()
 
@@ -474,7 +556,7 @@ def main() -> None:
     adapter = AlpacaAdapter()
     lab = AlphaLab(str(LAB_PATH))
 
-    # Load daily signal (snapshot) if present
+    # 读取每日信号快照（若不存在则继续运行）
     signal_df: pl.DataFrame | None = None
     try:
         signal_df = _load_signal_df(Path(DAILY_SIGNAL_FILE))
@@ -500,7 +582,7 @@ def main() -> None:
     except Exception:
         pass
 
-    # Need a signal df for strategy; if missing, use empty DF (exits will rely on fallback ATR/price drop)
+    # 信号缺失时，用空 DF 保底（依赖 ATR/价格回落的退出逻辑）
     engine = LiveEngine(
         adapter=adapter,
         signal_df=signal_df if signal_df is not None else pl.DataFrame(),
@@ -508,13 +590,12 @@ def main() -> None:
     )
     engine.root_close.update(last_prices)
 
-    strategy = FlagshipAlphaMomentumStrategy(
-        strategy_engine=engine,  # type: ignore[arg-type]
-        strategy_name="IntradayRunner",
+    strategy = build_strategy_instance(
+        args.strategy,
+        engine=engine,
         vt_symbols=[w.vt_symbol for w in watched],
-        setting={},
+        strategy_name_override=args.strategy_name,
     )
-    strategy.on_init()
 
     today_et = datetime.now(EASTERN).date()
     if args.rth_only and is_market_closed_day(today_et):
@@ -638,7 +719,7 @@ def main() -> None:
         # Run strategy (exit-only paths will return early)
         strategy.on_bars(bars)
 
-        # Refresh actual positions to keep pos_data aligned and avoid repeated sells
+        # 刷新实际持仓，保持策略状态同步，避免重复离场
         pos = adapter.get_positions()
         root_to_vt = {w.root: w.vt_symbol for w in watched}
         for w in watched:
@@ -647,6 +728,7 @@ def main() -> None:
             strategy.pos_data[vt] = qty
             strategy.target_data[vt] = qty
             if qty <= 0:
+                engine.clear_pending_exit(w.root)
                 strategy.entry_prices.pop(vt, None)
                 strategy.entry_highs.pop(vt, None)
 

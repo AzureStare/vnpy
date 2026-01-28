@@ -19,7 +19,6 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timezone
@@ -28,12 +27,8 @@ from zoneinfo import ZoneInfo
 
 from vnpy.trader.logger import logger
 
-# Ensure project root importable under docker/cron
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
+from flagship.config import PROJECT_ROOT
 from flagship.trading.execution.broker_alpaca import AlpacaAdapter
 
 

@@ -7,7 +7,8 @@ from jose import JWTError, jwt
 import subprocess
 import os
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+import statistics
 import json
 import re
 from pydantic import BaseModel
@@ -15,13 +16,9 @@ from typing import Optional, List
 import hashlib
 
 # Project imports
-import sys
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
+from flagship.config import PROJECT_ROOT
 from flagship.universe.pg_ticker_db import (
-    create_users_table, add_user, get_user, list_users, delete_user
+    create_users_table, add_user, get_user, list_users, delete_user, get_pg_connection
 )
 from flagship.trading.controls import (
     create_trading_controls_tables,
@@ -29,6 +26,7 @@ from flagship.trading.controls import (
     set_buy_exposure_multiplier,
     set_disabled_vt_symbol,
 )
+from flagship.universe.daily_ranking_returns import ensure_daily_ranking_returns_table
 
 # Configuration
 SECRET_KEY = "flagship-ecc-style-secret-key" # In production use env
@@ -39,6 +37,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 # 1 day
 async def lifespan(app: FastAPI):
     create_users_table()
     create_trading_controls_tables()
+    ensure_daily_ranking_returns_table()
     add_user("admin", get_password_hash("admin@123"), "admin")
     yield
 
@@ -390,6 +389,205 @@ async def get_account_snapshot(account_id: str, user = Depends(get_current_user)
         "portfolio": pf,
         "orders": od,
         "performance": pr,
+    }
+
+
+# Monitor (admin-only)
+def _parse_date_param(raw: str, field: str) -> date:
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{field} must be YYYY-MM-DD")
+
+def _get_ranking_returns_available_range() -> tuple[date | None, date | None]:
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("select min(trade_date), max(trade_date) from daily_ranking_returns")
+            row = cur.fetchone()
+    if not row:
+        return (None, None)
+    a, b = row
+    return (a, b)
+
+def _get_latest_ranking_returns_date() -> date | None:
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("select max(trade_date) from daily_ranking_returns")
+            row = cur.fetchone()
+    if not row:
+        return None
+    return row[0]
+
+
+def _fetch_ranking_returns_day(trade_date: date) -> dict:
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trade_date, vt_symbol, rank_pos, signal_score, horizon_d, ret_type,
+                       ret, excess_ret, close_t, spy_close_t
+                FROM daily_ranking_returns
+                WHERE trade_date = %s
+                ORDER BY rank_pos ASC, vt_symbol ASC
+                """,
+                (trade_date,),
+            )
+            rows = cur.fetchall()
+
+    by_symbol: dict[str, dict] = {}
+    windows: set[int] = set()
+    for (
+        _trade_date,
+        vt_symbol,
+        rank_pos,
+        signal_score,
+        horizon_d,
+        ret_type,
+        ret,
+        excess_ret,
+        close_t,
+        spy_close_t,
+    ) in rows:
+        sym = str(vt_symbol)
+        windows.add(int(horizon_d))
+        slot = by_symbol.setdefault(
+            sym,
+            {
+                "vt_symbol": sym,
+                "rank_pos": rank_pos,
+                "signal_score": signal_score,
+                "close_t": close_t,
+                "spy_close_t": spy_close_t,
+            },
+        )
+        key_ret = f"{ret_type}_ret_{int(horizon_d)}d"
+        key_excess = f"{ret_type}_excess_{int(horizon_d)}d"
+        slot[key_ret] = ret
+        slot[key_excess] = excess_ret
+
+    return {
+        "trade_date": trade_date.isoformat(),
+        "windows": sorted(windows),
+        "rows": list(by_symbol.values()),
+    }
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(sum(values) / float(len(values)))
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(statistics.median(values))
+
+
+@app.get("/api/monitor/ranking_returns/day")
+async def get_ranking_returns_day(trade_date: str | None = None, admin = Depends(check_admin)):
+    if trade_date is None or not str(trade_date).strip():
+        latest = _get_latest_ranking_returns_date()
+        if latest is None:
+            a, b = _get_ranking_returns_available_range()
+            return {"trade_date": None, "windows": [], "rows": [], "available_start": a, "available_end": b}
+        payload = _fetch_ranking_returns_day(latest)
+        a, b = _get_ranking_returns_available_range()
+        payload["available_start"] = a.isoformat() if a else None
+        payload["available_end"] = b.isoformat() if b else None
+        return payload
+
+    dt = _parse_date_param(str(trade_date), "trade_date")
+    payload = _fetch_ranking_returns_day(dt)
+    a, b = _get_ranking_returns_available_range()
+    payload["available_start"] = a.isoformat() if a else None
+    payload["available_end"] = b.isoformat() if b else None
+    return payload
+
+
+@app.get("/api/monitor/ranking_returns/range")
+async def get_ranking_returns_range(
+    start: str | None = None,
+    end: str | None = None,
+    bucket: int = 10,
+    admin = Depends(check_admin),
+):
+    if start is None or not str(start).strip() or end is None or not str(end).strip():
+        a, b = _get_ranking_returns_available_range()
+        if a is None or b is None:
+            return {"start": None, "end": None, "bucket_size": max(1, int(bucket)), "windows": [], "rows": [], "available_start": None, "available_end": None}
+        start_dt = a
+        end_dt = b
+    else:
+        start_dt = _parse_date_param(str(start), "start")
+        end_dt = _parse_date_param(str(end), "end")
+    bucket_size = max(1, int(bucket))
+
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trade_date, vt_symbol, rank_pos, horizon_d, ret_type, ret, excess_ret
+                FROM daily_ranking_returns
+                WHERE trade_date BETWEEN %s AND %s
+                  AND rank_pos IS NOT NULL
+                """,
+                (start_dt, end_dt),
+            )
+            rows = cur.fetchall()
+
+    grouped: dict[tuple[str, int, str, str], list[float]] = {}
+    stats_map: dict[tuple[str, int, str, str], dict[str, int]] = {}
+    windows: set[int] = set()
+
+    for _trade_date, _vt_symbol, rank_pos, horizon_d, ret_type, ret, excess_ret in rows:
+        if rank_pos is None:
+            continue
+        horizon = int(horizon_d)
+        windows.add(horizon)
+        bucket_idx = (int(rank_pos) - 1) // bucket_size
+        bucket_label = f"{bucket_idx * bucket_size + 1}-{(bucket_idx + 1) * bucket_size}"
+
+        for metric_name, value in (("ret", ret), ("excess", excess_ret)):
+            key = (bucket_label, horizon, str(ret_type), metric_name)
+            if value is None:
+                continue
+            grouped.setdefault(key, []).append(float(value))
+            stats_map.setdefault(key, {"n": 0, "pos": 0})
+            stats_map[key]["n"] += 1
+            if float(value) > 0:
+                stats_map[key]["pos"] += 1
+
+    out_rows: list[dict] = []
+    for key, values in grouped.items():
+        bucket_label, horizon, ret_type, metric_name = key
+        meta = stats_map.get(key) or {"n": 0, "pos": 0}
+        n = int(meta["n"])
+        pos = int(meta["pos"])
+        win_rate = float(pos / n) if n else None
+        out_rows.append(
+            {
+                "bucket": bucket_label,
+                "horizon_d": horizon,
+                "ret_type": ret_type,
+                "metric": metric_name,
+                "mean": _mean(values),
+                "p50": _median(values),
+                "win_rate": win_rate,
+                "n": n,
+            }
+        )
+
+    out_rows.sort(key=lambda r: (int(str(r["bucket"]).split("-")[0]), int(r["horizon_d"]), str(r["ret_type"]), str(r["metric"])))
+
+    return {
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "bucket_size": bucket_size,
+        "windows": sorted(windows),
+        "rows": out_rows,
+        "available_start": _get_ranking_returns_available_range()[0].isoformat() if _get_ranking_returns_available_range()[0] else None,
+        "available_end": _get_ranking_returns_available_range()[1].isoformat() if _get_ranking_returns_available_range()[1] else None,
     }
 
 # Backtest Endpoints

@@ -28,9 +28,8 @@ from typing import Any, Dict, Iterable, List
 from zoneinfo import ZoneInfo
 
 from vnpy.trader.logger import logger
+from flagship.config import PROJECT_ROOT
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "logs" / "app"
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
 EASTERN = ZoneInfo("America/New_York")

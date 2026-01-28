@@ -22,7 +22,7 @@ NOTE:
 from __future__ import annotations
 
 import argparse
-import sys
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,11 +34,7 @@ from vnpy.alpha.lab import AlphaLab
 from vnpy.trader.constant import Interval
 from vnpy.trader.logger import logger
 
-# Ensure project root importable under cron
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
+from flagship.config import PROJECT_ROOT
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
 from flagship.trading.config import LAB_PATH, LIVE_MODEL_PATH, LIVE_LR_MODEL_PATH, DAILY_SIGNAL_FILE
 from flagship.trading.calendar import (
@@ -53,6 +49,8 @@ from flagship.trading.orchestration.ensure_data_completeness import check_and_ba
 from flagship.trading.orchestration.check_lab_freshness import check_lab_freshness
 from flagship.trading.orchestration.train_daily_model import train_daily_model
 from flagship.trading.orchestration.run_live_inference import run_live_inference
+from flagship.monitoring.backfill_daily_ranking_returns import backfill_daily_ranking_returns
+from flagship.trading.gpt_advisor.rerank import AdvisorConfig, generate_gpt_advisor
 from flagship.monitoring.app_console_snapshot import (
     DEFAULT_OUTPUT_DIR as SNAPSHOT_OUTPUT_DIR,
     DEFAULT_SELECTION_TOP_N,
@@ -64,9 +62,27 @@ from flagship.monitoring.app_console_snapshot import (
 )
 from flagship.monitoring.app_console_report import generate_report
 from flagship.ops.reporting.daily_trade_recap import generate_trade_recap
+from flagship.ops.analysis.entry_efficiency import EntryConfig, run_analysis as run_entry_efficiency_analysis
+from flagship.ops.analysis.exit_rule_backtest import run_analysis as run_exit_rule_backtest
 
 
 EASTERN = ZoneInfo("America/New_York")
+
+DEFAULT_ENTRY_EFFICIENCY_LOOKBACK = int(os.getenv("FLAGSHIP_ENTRY_EFFICIENCY_LOOKBACK_DAYS", "60"))
+DEFAULT_ENTRY_EFFICIENCY_TOP_N = int(os.getenv("FLAGSHIP_ENTRY_EFFICIENCY_TOPN", "8"))
+DEFAULT_ENTRY_EFFICIENCY_HOLD_MINUTES = int(os.getenv("FLAGSHIP_ENTRY_EFFICIENCY_HOLD_MINUTES", "2"))
+DEFAULT_ENTRY_EFFICIENCY_CUTOFF_HHMM = os.getenv("FLAGSHIP_ENTRY_EFFICIENCY_CUTOFF_ET", "10:30")
+DEFAULT_ENTRY_EFFICIENCY_TOE_IN_RATIO = float(os.getenv("FLAGSHIP_ENTRY_EFFICIENCY_TOE_IN_RATIO", "0.20"))
+DEFAULT_ENTRY_EFFICIENCY_STRICT = os.getenv("FLAGSHIP_ENTRY_EFFICIENCY_STRICT", "1") == "1"
+DEFAULT_ENTRY_EFFICIENCY_ENABLED = os.getenv("FLAGSHIP_ENTRY_EFFICIENCY_ENABLED", "1") == "1"
+
+DEFAULT_EXIT_RULE_LOOKBACK_DAYS = int(os.getenv("FLAGSHIP_EXIT_RULE_LOOKBACK_DAYS", "15"))
+DEFAULT_EXIT_RULE_TOP_N = int(os.getenv("FLAGSHIP_EXIT_RULE_TOPN", "50"))
+DEFAULT_EXIT_RULE_HOLD_MINUTES = int(os.getenv("FLAGSHIP_EXIT_RULE_HOLD_MINUTES", "2"))
+DEFAULT_EXIT_RULE_CUTOFF_HHMM = os.getenv("FLAGSHIP_EXIT_RULE_CUTOFF_ET", "10:30")
+DEFAULT_EXIT_RULE_TOE_IN_RATIO = float(os.getenv("FLAGSHIP_EXIT_RULE_TOE_IN_RATIO", "0.20"))
+DEFAULT_EXIT_RULE_MAX_HOLDING_DAYS = int(os.getenv("FLAGSHIP_EXIT_RULE_MAX_HOLDING_DAYS", "10"))
+DEFAULT_EXIT_RULE_ENABLED = os.getenv("FLAGSHIP_EXIT_RULE_ENABLED", "0") == "1"
 
 
 @dataclass
@@ -181,6 +197,15 @@ def _step(metrics: DailyCycleMetrics, step_name: str):
 def _parse_date(text: str) -> date:
     return datetime.strptime(text, "%Y-%m-%d").date()
 
+def _parse_time(text: str) -> datetime.time:
+    s = str(text or "").strip()
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).time()
+        except Exception:
+            continue
+    raise ValueError(f"invalid time string: {text}")
+
 
 def _default_trading_date_et() -> date:
     return datetime.now(EASTERN).date()
@@ -287,6 +312,35 @@ def run_daily_cycle(
                 strategy_version=strategy_version,
             )
 
+        # 6.1) GPT Advisor rerank (non-blocking fallback)
+        # Produces logs/app/gpt_advisor_latest.json (for UI) and optionally daily_signal_gpt.parquet (later).
+        with _step(metrics, "6_1_gpt_advisor"):
+            try:
+                generate_gpt_advisor(
+                    project_root=PROJECT_ROOT,
+                    lab_path=lab_path,
+                    signal_path=DAILY_SIGNAL_FILE,
+                    output_dir=output_dir,
+                    signal_date=data_date,
+                    cfg=AdvisorConfig(model=os.getenv("FLAGSHIP_GPT_ADVISOR_MODEL", "gpt-5.2")),
+                )
+            except Exception as exc:
+                logger.warning(f"[DailyCycle] gpt advisor failed (non-blocking): {exc}")
+
+        # 6.2) Update Monitor ranking returns table (daily_ranking_returns)
+        # Monitor UI reads daily_ranking_returns (derived from daily_ranking_history).
+        with _step(metrics, "6_2_update_ranking_returns"):
+            try:
+                backfill_daily_ranking_returns(
+                    start=data_date.isoformat(),
+                    end=data_date.isoformat(),
+                    horizons=[1, 3, 5],
+                    top_n=50,
+                    lab_path=lab_path,
+                )
+            except Exception as exc:
+                logger.warning(f"[DailyCycle] ranking returns update failed (non-blocking): {exc}")
+
         # 6.5) Re-check freshness (signals + model; skip datasets)
         with _step(metrics, "6_5_recheck_lab_freshness"):
             check_lab_freshness(
@@ -335,6 +389,47 @@ def run_daily_cycle(
                 )
             except Exception as exc:
                 logger.warning(f"[DailyCycle] trade recap generation failed (non-blocking): {exc}")
+
+        # 8.8) Entry efficiency analysis (non-blocking)
+        with _step(metrics, "8_8_entry_efficiency"):
+            if DEFAULT_ENTRY_EFFICIENCY_ENABLED:
+                try:
+                    entry_config = EntryConfig(
+                        hold_minutes=int(DEFAULT_ENTRY_EFFICIENCY_HOLD_MINUTES),
+                        cutoff_time=_parse_time(DEFAULT_ENTRY_EFFICIENCY_CUTOFF_HHMM),
+                        require_below_before_reclaim=bool(DEFAULT_ENTRY_EFFICIENCY_STRICT),
+                        toe_in_ratio=float(DEFAULT_ENTRY_EFFICIENCY_TOE_IN_RATIO),
+                    )
+                    run_entry_efficiency_analysis(
+                        lab_path=lab_path,
+                        output_dir=output_dir,
+                        lookback=int(DEFAULT_ENTRY_EFFICIENCY_LOOKBACK),
+                        top_n=int(DEFAULT_ENTRY_EFFICIENCY_TOP_N),
+                        entry_config=entry_config,
+                    )
+                except Exception as exc:
+                    logger.warning(f"[DailyCycle] entry efficiency failed (non-blocking): {exc}")
+
+        # 8.9) Exit rule backtest analysis (non-blocking)
+        with _step(metrics, "8_9_exit_rule_backtest"):
+            if DEFAULT_EXIT_RULE_ENABLED:
+                try:
+                    entry_config = EntryConfig(
+                        hold_minutes=int(DEFAULT_EXIT_RULE_HOLD_MINUTES),
+                        cutoff_time=_parse_time(DEFAULT_EXIT_RULE_CUTOFF_HHMM),
+                        require_below_before_reclaim=True,
+                        toe_in_ratio=float(DEFAULT_EXIT_RULE_TOE_IN_RATIO),
+                    )
+                    run_exit_rule_backtest(
+                        lab_path=lab_path,
+                        output_dir=output_dir,
+                        lookback=int(DEFAULT_EXIT_RULE_LOOKBACK_DAYS),
+                        top_n=int(DEFAULT_EXIT_RULE_TOP_N),
+                        entry_config=entry_config,
+                        max_holding_days=int(DEFAULT_EXIT_RULE_MAX_HOLDING_DAYS),
+                    )
+                except Exception as exc:
+                    logger.warning(f"[DailyCycle] exit rule backtest failed (non-blocking): {exc}")
 
         metrics.mark_done()
     except Exception:

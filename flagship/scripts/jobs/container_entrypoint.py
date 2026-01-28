@@ -141,7 +141,16 @@ def _start_daemons() -> None:
     if enable_executor == "1":
         poll_seconds = _env("FLAGSHIP_EXECUTOR_DAEMON_POLL_SECONDS", "30")
         dry_run = _env("FLAGSHIP_EXECUTOR_DAEMON_DRY_RUN", "0") == "1"
-        argv = [sys.executable, "-m", "flagship.trading.execution.executor_daemon", "--poll-seconds", poll_seconds]
+        delay_seconds = _env("FLAGSHIP_EXECUTOR_DELAY_SECONDS", "300")  # Default 5 min delay
+        argv = [
+            sys.executable,
+            "-m",
+            "flagship.trading.execution.executor_daemon",
+            "--poll-seconds",
+            poll_seconds,
+            "--execution-delay-seconds",
+            delay_seconds,
+        ]
         if dry_run:
             argv.append("--dry-run")
         print("[container_entrypoint] Starting ExecutorDaemon (background)...", flush=True)

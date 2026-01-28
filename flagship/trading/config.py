@@ -5,10 +5,9 @@ Reads credentials from vt_setting.json.
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-from flagship.config import VT_SETTING_PATH
+from flagship.config import PROJECT_ROOT, VT_SETTING_PATH
 
 # Load settings from vt_setting.json
 SETTINGS = {}
@@ -95,10 +94,6 @@ def load_ibkr_accounts() -> list[IbkrAccountConfig]:
     return out
 
 # --- Strategy Configuration ---
-# Current Regime ID for model selection (e.g., 10 for "2025 Autumn High Volatility Drop")
-# Update this as market conditions change
-CURRENT_REGIME_ID = 10
-
 # Top N stocks to hold (should match strategy logic)
 TOP_N = 5
 
@@ -109,13 +104,12 @@ MIN_SCORE_THRESHOLD = 0.5
 CASH_RATIO = 0.95
 
 # --- Paths ---
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LAB_PATH = PROJECT_ROOT / "lab" / "flagship_alpha_momentum"
 MODEL_DIR = LAB_PATH / "model"
 SIGNAL_DIR = LAB_PATH / "signal"
 
 # The static model file (backtest)
-MODEL_FILE = f"flagship_alpha_mom_regime{CURRENT_REGIME_ID:02d}_lgb.pkl"
+MODEL_FILE = "flagship_alpha_momentum_lgb.pkl"
 MODEL_PATH = MODEL_DIR / MODEL_FILE
 
 # The live retrained model file
@@ -128,6 +122,9 @@ LIVE_LR_MODEL_PATH = MODEL_DIR / LIVE_LR_MODEL_FILE
 
 # Output path for daily signals
 DAILY_SIGNAL_FILE = SIGNAL_DIR / "daily_signal.parquet"
+
+# Output path for GPT-adjusted daily signals (optional; executor can prefer this if present)
+DAILY_SIGNAL_GPT_FILE = SIGNAL_DIR / "daily_signal_gpt.parquet"
 
 # --- Universe ---
 # Path to the static universe file if used, or None for dynamic

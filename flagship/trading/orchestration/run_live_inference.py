@@ -1,30 +1,23 @@
 """
 Script to generate trading signals for the current day using the pre-trained LightGBM model.
 """
-import sys
 import argparse
 import joblib
 import polars as pl
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-# Add project root to path
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from vnpy.trader.logger import logger
 from vnpy.trader.constant import Interval
 from vnpy.alpha.lab import AlphaLab
 from vnpy.alpha.dataset import Segment
 from flagship.trading.config import (
-    LAB_PATH, LIVE_MODEL_PATH, LIVE_LR_MODEL_PATH, DAILY_SIGNAL_FILE, CURRENT_REGIME_ID
+    LAB_PATH, LIVE_MODEL_PATH, LIVE_LR_MODEL_PATH, DAILY_SIGNAL_FILE
 )
 from flagship.trading.signal_blend import blend_lgb_with_lr
 from flagship.trading.orchestration.ensure_data_completeness import get_daily_selection_from_postgres
-from flagship.factors.flagship_alpha_momentum_v7 import FlagshipAlphaMomentumV7Dataset
-from flagship.factors.flagship_alpha_momentum_v5 import FlagshipAlphaMomentumV5Dataset
-from flagship.backtest.index_regime_windows import get_regime_window
+from flagship.factors.alpha_momentum.v7_dataset import FlagshipAlphaMomentumV7Dataset
+from flagship.factors.alpha_momentum.v5_dataset import FlagshipAlphaMomentumV5Dataset
 
 def run_live_inference(
     target_date: date | None = None,
@@ -32,7 +25,6 @@ def run_live_inference(
     model_path: Path = LIVE_MODEL_PATH,
     lr_model_path: Path = LIVE_LR_MODEL_PATH,
     output_file: Path = DAILY_SIGNAL_FILE,
-    regime_id: int = CURRENT_REGIME_ID,
     strategy_version: str = "v7"
 ) -> None:
     """
@@ -44,7 +36,6 @@ def run_live_inference(
         lab_path: Path to AlphaLab.
         model_path: Path to the trained .pkl model.
         output_file: Path to save the resulting signal parquet.
-        regime_id: ID of the regime to use for config/dataset prep.
         strategy_version: "v5" or "v7".
     """
     if target_date is None:
@@ -52,7 +43,6 @@ def run_live_inference(
     
     logger.info(f"[run_live_inference] Generating signals for target date: {target_date} (Strategy: {strategy_version})")
     logger.info(f"[run_live_inference] Using model: {model_path}")
-    logger.info(f"[run_live_inference] Regime ID: {regime_id}")
 
     # 1. Initialize Lab and Load Model
     lab = AlphaLab(str(lab_path))

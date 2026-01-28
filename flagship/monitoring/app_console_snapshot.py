@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
@@ -33,17 +32,14 @@ from zoneinfo import ZoneInfo
 
 import polars as pl
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-# Ensure `import flagship` works when running as a script (e.g. `python flagship/...py`)
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from flagship.trading.execution.broker_alpaca import AlpacaAdapter
+from flagship.config import PROJECT_ROOT
 from flagship.trading.execution.broker_ibkr import IbkrAdapter, IbkrConnection, IbkrImportError
 from flagship.trading.config import ALPACA_API_KEY, ALPACA_BASE_URL, ALPACA_SECRET_KEY, LAB_PATH, SETTINGS as VT_SETTINGS
 from flagship.trading.config import load_ibkr_accounts
 from flagship.universe.pg_ticker_db import get_pg_connection
 from vnpy.alpha.lab import AlphaLab
+from vnpy.trader.constant import Interval
 from vnpy.trader.logger import logger
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "logs" / "app"
@@ -51,6 +47,8 @@ DEFAULT_SELECTION_TOP_N = int(os.getenv("FLAGSHIP_APP_SELECTION_TOPN", "10"))
 DEFAULT_SELECTION_DATE_CANDIDATES = int(os.getenv("FLAGSHIP_APP_SELECTION_DATE_CANDIDATES", "30"))
 DEFAULT_MASSIVE_TIMEOUT_SECONDS = int(os.getenv("FLAGSHIP_APP_MASSIVE_TIMEOUT", "10"))
 DEFAULT_MARKET_OPEN_ET = dtime(9, 30)
+DEFAULT_MONITOR_TOP_K = int(os.getenv("FLAGSHIP_APP_MONITOR_TOPK", "200"))
+DEFAULT_MONITOR_WINDOWS = (1, 3, 5)
 EASTERN = ZoneInfo("America/New_York")
 
 
@@ -768,6 +766,33 @@ def _load_signal_parquet(lab_path: Path) -> pl.DataFrame:
     return df
 
 
+def _pick_price_column(df: pl.DataFrame) -> str:
+    if "close_price" in df.columns:
+        return "close_price"
+    if "close" in df.columns:
+        return "close"
+    raise ValueError("price column not found (expected close_price or close)")
+
+
+def _add_return_columns(df: pl.DataFrame, price_col: str, windows: Iterable[int]) -> pl.DataFrame:
+    out = df
+    for k in windows:
+        window = int(k)
+        if window <= 0:
+            continue
+        out = out.with_columns(
+            [
+                (pl.col(price_col) / pl.col(price_col).shift(window).over("vt_symbol") - 1.0).alias(
+                    f"trail_ret_{window}d"
+                ),
+                (pl.col(price_col).shift(-window).over("vt_symbol") / pl.col(price_col) - 1.0).alias(
+                    f"fwd_ret_{window}d"
+                ),
+            ]
+        )
+    return out
+
+
 def _load_recent_selection_dates(max_date: date, limit: int) -> List[date]:
     """
     Return recent trade_date candidates from Postgres daily_selection, bounded by max_date.
@@ -1045,18 +1070,152 @@ def snapshot_selection(output_dir: Path, lab_path: Path, top_n: int = DEFAULT_SE
     return data
 
 
+# ---------------- Monitor Returns ----------------
+def snapshot_monitor_returns(
+    output_dir: Path,
+    lab_path: Path,
+    *,
+    windows: Iterable[int] = DEFAULT_MONITOR_WINDOWS,
+    universe_top_k: int = DEFAULT_MONITOR_TOP_K,
+    spy_symbol: str = "SPY.NASDAQ",
+) -> Dict[str, Any]:
+    """
+    Generate logs/app/monitor_returns.json for Ops Console.
+
+    Returns are computed on close-close basis:
+    - trailing: close_t / close_{t-k} - 1
+    - forward : close_{t+k} / close_t - 1
+    """
+    signal_all = _load_signal_parquet(lab_path)
+    max_dt = signal_all.select(pl.col("datetime").max()).item()
+    if not max_dt:
+        raise ValueError("cannot find max datetime in signal parquet")
+    signal_date = max_dt.date()
+
+    signal_df = _slice_signal_for_date(signal_all, signal_date)
+    if signal_df.is_empty():
+        raise ValueError("signal parquet has no rows for signal_date")
+
+    if "signal" in signal_df.columns:
+        signal_df = signal_df.sort("signal", descending=True)
+
+    if universe_top_k > 0:
+        signal_df = signal_df.head(int(universe_top_k))
+
+    vt_symbols = sorted(set(signal_df["vt_symbol"].to_list()))
+    if spy_symbol not in vt_symbols:
+        vt_symbols.append(spy_symbol)
+
+    max_window = max(int(w) for w in windows if int(w) > 0) if windows else 0
+    buffer_days = max(7, max_window * 2)
+    start_date = signal_date - timedelta(days=buffer_days)
+    end_date = signal_date + timedelta(days=buffer_days)
+
+    lab = AlphaLab(str(lab_path))
+    bar_df = lab.load_bar_df(
+        vt_symbols=vt_symbols,
+        interval=Interval.DAILY,
+        start=start_date.isoformat(),
+        end=end_date.isoformat(),
+        extended_days=0,
+    )
+    if bar_df is None or bar_df.is_empty():
+        raise ValueError("no bar data for monitor returns")
+
+    price_col = _pick_price_column(bar_df)
+    bar_df = bar_df.sort(["vt_symbol", "datetime"])
+    bar_df = _add_return_columns(bar_df, price_col, windows)
+
+    signal_rows = signal_df.select(
+        [
+            "vt_symbol",
+            "datetime",
+            "signal",
+            *[c for c in ["lgb_signal", "p_up"] if c in signal_df.columns],
+        ]
+    )
+
+    returns_rows = (
+        bar_df.filter(pl.col("vt_symbol").is_in(vt_symbols))
+        .filter(pl.col("datetime").dt.date() == signal_date)
+        .select(
+            [
+                "vt_symbol",
+                "datetime",
+                pl.col(price_col).alias("close_t"),
+                *[f"trail_ret_{int(w)}d" for w in windows if int(w) > 0],
+                *[f"fwd_ret_{int(w)}d" for w in windows if int(w) > 0],
+            ]
+        )
+    )
+
+    spy_row = (
+        bar_df.filter(pl.col("vt_symbol") == spy_symbol)
+        .filter(pl.col("datetime").dt.date() == signal_date)
+        .select(
+            [
+                "datetime",
+                pl.col(price_col).alias("spy_close_t"),
+                *[
+                    pl.col(f"trail_ret_{int(w)}d").alias(f"spy_trail_ret_{int(w)}d")
+                    for w in windows
+                    if int(w) > 0
+                ],
+                *[
+                    pl.col(f"fwd_ret_{int(w)}d").alias(f"spy_fwd_ret_{int(w)}d")
+                    for w in windows
+                    if int(w) > 0
+                ],
+            ]
+        )
+    )
+
+    merged = signal_rows.join(returns_rows, on=["vt_symbol", "datetime"], how="left")
+    merged = merged.join(spy_row, on="datetime", how="left")
+
+    for w in windows:
+        window = int(w)
+        if window <= 0:
+            continue
+        merged = merged.with_columns(
+            [
+                (pl.col(f"trail_ret_{window}d") - pl.col(f"spy_trail_ret_{window}d")).alias(
+                    f"trail_excess_{window}d"
+                ),
+                (pl.col(f"fwd_ret_{window}d") - pl.col(f"spy_fwd_ret_{window}d")).alias(
+                    f"fwd_excess_{window}d"
+                ),
+            ]
+        )
+
+    merged = merged.filter(pl.col("vt_symbol") != spy_symbol)
+
+    data = {
+        "generated_at": _now_iso(),
+        "signal_date": signal_date.isoformat(),
+        "windows": [int(w) for w in windows if int(w) > 0],
+        "top_k": int(universe_top_k),
+        "rows": merged.to_dicts(),
+    }
+    target = output_dir / "monitor_returns.json"
+    _atomic_write_json(target, data)
+    logger.info(f"[app_console_snapshot] wrote {target}")
+    return data
+
+
 # ---------------- CLI ----------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate app console snapshots")
     parser.add_argument(
         "mode",
         nargs="+",
-        choices=["portfolio", "selection", "orders", "performance", "market_status", "accounts", "all"],
+        choices=["portfolio", "selection", "orders", "performance", "market_status", "accounts", "monitor", "all"],
         help="Snapshot type(s) to generate (can specify multiple)",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output directory for JSON files")
     parser.add_argument("--lab-path", type=Path, default=LAB_PATH, help="AlphaLab path")
     parser.add_argument("--top-n", type=int, default=DEFAULT_SELECTION_TOP_N, help="Top N selection rows by signal")
+    parser.add_argument("--monitor-top-k", type=int, default=DEFAULT_MONITOR_TOP_K, help="Top K for monitor universe")
     args = parser.parse_args()
 
     if not args.output_dir.is_absolute():
@@ -1067,7 +1226,7 @@ def main() -> None:
 
     modes = set(args.mode)
     if "all" in modes:
-        modes = {"portfolio", "selection", "orders", "performance", "market_status", "accounts"}
+        modes = {"portfolio", "selection", "orders", "performance", "market_status", "accounts", "monitor"}
 
     if "portfolio" in modes:
         snapshot_portfolio(args.output_dir)
@@ -1097,6 +1256,9 @@ def main() -> None:
                 client_id=int(cfg.client_id),
             )
         snapshot_accounts(args.output_dir)
+
+    if "monitor" in modes:
+        snapshot_monitor_returns(args.output_dir, args.lab_path, universe_top_k=args.monitor_top_k)
 
 
 if __name__ == "__main__":

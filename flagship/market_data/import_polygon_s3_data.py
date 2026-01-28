@@ -1,7 +1,6 @@
 import boto3
 import json
 import os
-import sys
 from pathlib import Path
 from datetime import datetime, timedelta, date
 import polars as pl
@@ -10,16 +9,11 @@ import botocore
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Project root
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from vnpy.alpha import AlphaLab
 from vnpy.trader.constant import Interval
 from vnpy.trader.object import BarData
 from vnpy.trader.logger import logger
-from flagship.config import DEFAULT_LAB_DIR
+from flagship.config import DEFAULT_LAB_DIR, PROJECT_ROOT
 
 def load_s3_config():
     vt_setting_path = PROJECT_ROOT / "vt_setting.json"

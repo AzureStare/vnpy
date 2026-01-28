@@ -2,15 +2,9 @@
 Script to automate daily stock selection ($U_t$) based on strategy rules.
 Wraps the logic of `build_daily_selection_to_postgres.py` for a single day.
 """
-import sys
 import argparse
 from datetime import date, datetime, timedelta
 from pathlib import Path
-
-# Add project root to path
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from vnpy.trader.logger import logger
 from flagship.trading.config import LAB_PATH

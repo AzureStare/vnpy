@@ -17,18 +17,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
-
-
-# 动态注入项目根路径（确保 `import flagship` 可用）
-# This file lives in flagship/scripts/tools/, so project root is 3 levels up.
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 from vnpy.trader.logger import logger

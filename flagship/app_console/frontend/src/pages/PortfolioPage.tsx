@@ -54,6 +54,35 @@ type TradingControls = Record<string, unknown> & {
   buy_exposure_multiplier?: number;
 };
 
+type MonitorReturnsRow = {
+  vt_symbol?: string;
+  signal?: number;
+  lgb_signal?: number;
+  p_up?: number;
+  close_t?: number;
+  spy_close_t?: number;
+  trail_ret_1d?: number | null;
+  trail_ret_3d?: number | null;
+  trail_ret_5d?: number | null;
+  trail_excess_1d?: number | null;
+  trail_excess_3d?: number | null;
+  trail_excess_5d?: number | null;
+  fwd_ret_1d?: number | null;
+  fwd_ret_3d?: number | null;
+  fwd_ret_5d?: number | null;
+  fwd_excess_1d?: number | null;
+  fwd_excess_3d?: number | null;
+  fwd_excess_5d?: number | null;
+};
+
+type MonitorReturnsSnapshot = {
+  generated_at?: string;
+  signal_date?: string;
+  windows?: number[];
+  top_k?: number;
+  rows?: MonitorReturnsRow[];
+};
+
 type AccountSummary = {
   account_id: string;
   display_name: string;
@@ -132,6 +161,7 @@ export function PortfolioPage() {
   const [orders, setOrders] = useState<OrdersSnapshot | null>(null);
   const [perf, setPerf] = useState<PerformanceSnapshot | null>(null);
   const [controls, setControls] = useState<TradingControls | null>(null);
+  const [monitor, setMonitor] = useState<MonitorReturnsSnapshot | null>(null);
 
   const prevRankRef = useRef<Map<string, number>>(new Map());
   const [rankDeltaBySymbol, setRankDeltaBySymbol] = useState<Record<string, number>>({});
@@ -200,6 +230,13 @@ export function PortfolioPage() {
       setSelection(sel);
       setOrders(od);
       setPerf(pr);
+
+      try {
+        const mon = await fetchJson<MonitorReturnsSnapshot>("/data/monitor_returns.json");
+        setMonitor(mon);
+      } catch (_) {
+        setMonitor(null);
+      }
 
       // Trading controls (auth API): do not fail the whole refresh if this is transient.
       try {
@@ -422,6 +459,42 @@ export function PortfolioPage() {
   const sparklinePath = useMemo(() => {
     return buildSparklinePath(perfSummary.points, 240, 64);
   }, [perfSummary.points]);
+
+  const [monitorWindow, setMonitorWindow] = useState<number>(1);
+  const [monitorMetric, setMonitorMetric] = useState<"abs" | "excess">("excess");
+  const [monitorDirection, setMonitorDirection] = useState<"trail" | "fwd">("trail");
+
+  const monitorWindows = useMemo(() => {
+    const xs = (monitor?.windows || []).filter((w) => Number.isFinite(w));
+    if (xs.length) return xs;
+    return [1, 3, 5];
+  }, [monitor?.windows]);
+
+  const monitorRows = useMemo(() => {
+    const rows = Array.isArray(monitor?.rows) ? monitor.rows : [];
+    const window = monitorWindow;
+    const suffix = `${window}d`;
+    const valueKey =
+      monitorMetric === "excess"
+        ? `${monitorDirection}_excess_${suffix}`
+        : `${monitorDirection}_ret_${suffix}`;
+
+    const getValue = (row: MonitorReturnsRow): number | null => {
+      const v = (row as Record<string, unknown>)[valueKey];
+      return typeof v === "number" && Number.isFinite(v) ? v : null;
+    };
+
+    const sorted = [...rows].filter((r) => Boolean(r.vt_symbol));
+    sorted.sort((a, b) => {
+      const va = getValue(a);
+      const vb = getValue(b);
+      if (va === null && vb === null) return 0;
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      return vb - va;
+    });
+    return sorted.slice(0, 60);
+  }, [monitor, monitorWindow, monitorMetric, monitorDirection]);
 
   return (
     <div>
@@ -654,6 +727,121 @@ export function PortfolioPage() {
             </CardContent>
           </Card>
         </div>
+
+        {/* Monitor */}
+        <Card className="col-span-12">
+          <CardHeader>
+            <div>
+              <CardTitle>Monitor (Universe Returns)</CardTitle>
+              <CardDescription>
+                signal_date={monitor?.signal_date || "-"} · top_k={monitor?.top_k ?? "-"}
+              </CardDescription>
+            </div>
+            <Badge variant="outline">{fmtUtcTs(monitor?.generated_at)}</Badge>
+          </CardHeader>
+          <CardContent className="pt-2">
+            <div className="mb-4 flex flex-wrap items-center gap-2">
+              <select
+                value={monitorWindow}
+                onChange={(e) => setMonitorWindow(Number(e.target.value))}
+                className="h-9 rounded-md border border-border bg-background px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {monitorWindows.map((w) => (
+                  <option key={w} value={w}>
+                    {w}D window
+                  </option>
+                ))}
+              </select>
+              <select
+                value={monitorMetric}
+                onChange={(e) => setMonitorMetric(e.target.value as "abs" | "excess")}
+                className="h-9 rounded-md border border-border bg-background px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="excess">Sort: Excess return</option>
+                <option value="abs">Sort: Absolute return</option>
+              </select>
+              <select
+                value={monitorDirection}
+                onChange={(e) => setMonitorDirection(e.target.value as "trail" | "fwd")}
+                className="h-9 rounded-md border border-border bg-background px-3 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="trail">Direction: Trailing</option>
+                <option value="fwd">Direction: Forward</option>
+              </select>
+            </div>
+            <div className="overflow-hidden rounded-lg ring-1 ring-border/60">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[80px]">Rank</TableHead>
+                    <TableHead>Symbol</TableHead>
+                    <TableHead className="text-right">Signal</TableHead>
+                    <TableHead className="text-right">p_up</TableHead>
+                    <TableHead className="text-right">Trail Ret {monitorWindow}D</TableHead>
+                    <TableHead className="text-right">Trail Excess {monitorWindow}D</TableHead>
+                    <TableHead className="text-right">Fwd Ret {monitorWindow}D</TableHead>
+                    <TableHead className="text-right">Fwd Excess {monitorWindow}D</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {monitorRows.map((row, idx) => (
+                    <TableRow key={`${row.vt_symbol}_${idx}`}>
+                      <TableCell className="text-xs tabular-nums">{idx + 1}</TableCell>
+                      <TableCell className="font-medium">{row.vt_symbol || "-"}</TableCell>
+                      <TableCell className="text-right tabular-nums">{fmtNumber(row.signal, 4)}</TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {typeof row.p_up === "number" ? fmtPct(row.p_up) : "-"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {typeof row.trail_ret_1d === "number" && monitorWindow === 1
+                          ? fmtPct(row.trail_ret_1d)
+                          : typeof row.trail_ret_3d === "number" && monitorWindow === 3
+                            ? fmtPct(row.trail_ret_3d)
+                            : typeof row.trail_ret_5d === "number" && monitorWindow === 5
+                              ? fmtPct(row.trail_ret_5d)
+                              : "-"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {typeof row.trail_excess_1d === "number" && monitorWindow === 1
+                          ? fmtPct(row.trail_excess_1d)
+                          : typeof row.trail_excess_3d === "number" && monitorWindow === 3
+                            ? fmtPct(row.trail_excess_3d)
+                            : typeof row.trail_excess_5d === "number" && monitorWindow === 5
+                              ? fmtPct(row.trail_excess_5d)
+                              : "-"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {typeof row.fwd_ret_1d === "number" && monitorWindow === 1
+                          ? fmtPct(row.fwd_ret_1d)
+                          : typeof row.fwd_ret_3d === "number" && monitorWindow === 3
+                            ? fmtPct(row.fwd_ret_3d)
+                            : typeof row.fwd_ret_5d === "number" && monitorWindow === 5
+                              ? fmtPct(row.fwd_ret_5d)
+                              : "-"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {typeof row.fwd_excess_1d === "number" && monitorWindow === 1
+                          ? fmtPct(row.fwd_excess_1d)
+                          : typeof row.fwd_excess_3d === "number" && monitorWindow === 3
+                            ? fmtPct(row.fwd_excess_3d)
+                            : typeof row.fwd_excess_5d === "number" && monitorWindow === 5
+                              ? fmtPct(row.fwd_excess_5d)
+                              : "-"}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {!monitorRows.length && (
+                    <TableRow>
+                      <TableCell colSpan={8} className="text-sm text-muted-foreground">
+                        No monitor data yet
+                      </TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
 
         {/* Performance */}
         <Card className="col-span-12 lg:col-span-7">

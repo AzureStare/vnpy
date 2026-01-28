@@ -13,6 +13,7 @@ const LABEL: Record<RouteKey, string> = {
   backtest: "Backtest",
   reports: "Reports",
   settings: "Settings",
+  monitor: "Monitor",
 };
 
 export function Layout(props: {
@@ -23,7 +24,7 @@ export function Layout(props: {
   children: React.ReactNode;
 }) {
   const { route, isAdmin, role, onLogout, children } = props;
-  const tabs = ROUTES.filter((r) => (isAdmin ? true : r === "portfolio" || r === "reports"));
+  const tabs = ROUTES.filter((r) => (isAdmin ? true : r === "accounts" || r === "portfolio" || r === "reports"));
 
   return (
     <div className="min-h-screen bg-slate-50">

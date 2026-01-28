@@ -9,15 +9,9 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, time as dtime
 from pathlib import Path
-import sys
 from typing import Any
 
 import polars as pl
-
-# 动态注入项目根路径
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 import json
 
@@ -25,19 +19,12 @@ from vnpy.trader.constant import Interval
 from vnpy.trader.logger import logger
 from vnpy.trader.setting import SETTINGS
 from vnpy.alpha import AlphaLab, BacktestingEngine
-from flagship.config import VT_SETTING_PATH
+from flagship.config import PROJECT_ROOT, VT_SETTING_PATH
 from flagship.universe.pg_ticker_db import get_pg_connection
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# 延迟导入策略类，以便根据参数选择
-def get_strategy_class(strategy_name: str):
-    if strategy_name.lower() == "v7":
-        from flagship.strategy.flagship_alpha_momentum_strategy_v7 import FlagshipAlphaMomentumStrategy as V7Strategy
-        return V7Strategy
-    else:
-        from flagship.strategy.flagship_alpha_momentum_strategy import FlagshipAlphaMomentumStrategy as V5Strategy
-        return V5Strategy
+from flagship.strategy.registry import get_strategy_spec
 
 from flagship.backtest.backtest_session_alignment import (
     RegularTradingHoursFilteredAlphaLab,
@@ -416,6 +403,7 @@ def run_backtest(
     commission_rate: float | None = None,
     rth_only: bool | None = None,
     strategy_version: str = "v5",
+    dataset_name: str | None = None,
 ) -> dict[str, Any] | None:
     """
     运行 Flagship Alpha-Momentum 策略回测。
@@ -432,6 +420,7 @@ def run_backtest(
         strategy_setting: 策略参数字典
         commission_rate: 交易佣金费率（默认为 None，优先 from strategy_setting 读取，否则默认为 0.0）
         strategy_version: 策略版本 ("v5" 或 "v7")
+        dataset_name: 因子评估使用的数据集名称（为空则跳过因子有效性评估）
     """
     # 设置日志文件（必须在记录日志之前）
     log_path = setup_backtest_logging(lab_path, start, end, signal_name)
@@ -739,9 +728,11 @@ def run_backtest(
     logger.info(f"[run_backtest] 回测引擎参数设置完成")
 
     # 添加策略并运行回测
-    strategy_class = get_strategy_class(strategy_version)
-    logger.info(f"[run_backtest] 添加策略: {strategy_class.__name__} (Version: {strategy_version})")
-    engine.add_strategy(strategy_class, strategy_setting, signal_df)
+    strategy_spec = get_strategy_spec(strategy_version)
+    logger.info(
+        f"[run_backtest] 添加策略: {strategy_spec.strategy_class.__name__} (Version: {strategy_version})"
+    )
+    engine.add_strategy(strategy_spec.strategy_class, strategy_setting, signal_df)
 
     logger.info(f"[run_backtest] 加载历史数据...")
     engine.load_data()
@@ -809,20 +800,8 @@ def run_backtest(
     except Exception as exc:
         logger.warning(f"[run_backtest] market_independence 计算失败，跳过: {exc}")
 
-    # 确定报告文件夹名称（FROM_TO_Scenario格式）并获取regime信息
-    from flagship.backtest.index_regime_windows import REGIME_WINDOWS
-    report_folder_name = None
-    matched_regime = None
-    for regime in REGIME_WINDOWS:
-        if regime.start == start.date() and regime.end == end.date():
-            # 格式：20240102_20240412_regime01
-            report_folder_name = f"{regime.start.strftime('%Y%m%d')}_{regime.end.strftime('%Y%m%d')}_regime{regime.id:02d}"
-            matched_regime = regime
-            break
-    
-    if report_folder_name is None:
-        # 如果没有匹配的regime，使用日期范围
-        report_folder_name = f"{start.date().strftime('%Y%m%d')}_{end.date().strftime('%Y%m%d')}_backtest"
+    # 报告目录：仅按日期范围命名（去除 regime 概念）
+    report_folder_name = f"{start.date().strftime('%Y%m%d')}_{end.date().strftime('%Y%m%d')}_backtest"
     
     report_dir = lab.lab_path / "report" / report_folder_name
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -859,34 +838,6 @@ def run_backtest(
     try:
         html_report_path = report_dir / "report.html"
         
-        # 尝试加载数据集名称（用于因子有效性计算）
-        dataset_name = None
-        if hasattr(engine.strategy, 'dataset_name'):
-            dataset_name = engine.strategy.dataset_name
-        else:
-            # 尝试从信号文件名推断数据集名称
-            if signal_name and "regime" in signal_name:
-                # 如果是lgb信号（LightGBM训练的信号），使用对应的lgb数据集
-                if "_lgb_signal" in signal_name:
-                    # 提取regime ID，例如 flagship_alpha_mom_regime02_lgb_signal -> flagship_alpha_mom_regime02_lgb
-                    import re
-                    match = re.search(r'regime(\d+)', signal_name)
-                    if match:
-                        regime_id = int(match.group(1))
-                        dataset_name = f"flagship_alpha_mom_regime{regime_id:02d}_lgb"
-                    else:
-                        # 回退到v5数据集（因为lgb信号是基于v5因子训练的）
-                        dataset_name = "flagship_alpha_momentum_v5"
-                # v5信号使用v5数据集
-                elif "_v5_" in signal_name or signal_name.endswith("_v5_signal"):
-                    dataset_name = "flagship_alpha_momentum_v5"
-                # 其他情况默认使用v5数据集（不再使用v4）
-                else:
-                    dataset_name = "flagship_alpha_momentum_v5"
-            else:
-                # 默认使用v5数据集
-                dataset_name = "flagship_alpha_momentum_v5"
-        
         # 保存统计结果到临时文件（用于生成报告）
         stats_path = report_dir / "statistics.json"
         with open(stats_path, 'w', encoding='utf-8') as f:
@@ -900,7 +851,6 @@ def run_backtest(
             signal_name=signal_name,
             dataset_name=dataset_name,
             lab=lab,
-            regime=matched_regime,
         )
         logger.info(f"[run_backtest] HTML报告已生成: {html_report_path}")
     except Exception as exc:
@@ -1009,9 +959,8 @@ def generate_html_report_with_charts(
     trade_list_path: Path | None,
     output_path: Path,
     signal_name: str,
-    dataset_name: str,
+    dataset_name: str | None,
     lab: AlphaLab,
-    regime: Any | None = None,
 ) -> None:
     """生成包含图表的HTML报告（包含所有原有内容）"""
     from datetime import datetime
@@ -1093,7 +1042,9 @@ def generate_html_report_with_charts(
                     raise ValueError(f"数据集 {dataset_name} 不存在")
             except Exception as e:
                 logger.error(f"[generate_html_report_with_charts] 无法加载数据集 {dataset_name}: {e}")
-                raise ValueError(f"数据集 {dataset_name} 不存在或加载失败，请确保使用v5数据集") from e
+                raise ValueError(f"数据集 {dataset_name} 不存在或加载失败") from e
+        else:
+            logger.info("[generate_html_report_with_charts] 未提供 dataset_name，跳过因子有效性评估")
         
         signal_df = lab.load_signal(signal_name)
         if dataset and signal_df is not None and not signal_df.is_empty():
@@ -1177,51 +1128,7 @@ def generate_html_report_with_charts(
     # 5. 生成HTML内容
     report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    # 生成regime信息HTML
-    regime_html = ""
-    if regime is not None:
-        # 使用更突出的格式显示regime信息
-        regime_html = f"""
-    <div style="background-color: #e8f4f8; border-left: 4px solid #2196F3; padding: 15px; margin: 20px 0;">
-        <h2 style="color: #1976D2; margin-top: 0;">市场状态 (Market Regime)</h2>
-        <table style="width: 100%; border-collapse: collapse;">
-            <tr>
-                <td style="padding: 5px; width: 150px;"><strong>Regime ID</strong>:</td>
-                <td style="padding: 5px;">{regime.id}</td>
-            </tr>
-            <tr>
-                <td style="padding: 5px;"><strong>标签</strong>:</td>
-                <td style="padding: 5px;">{regime.label}</td>
-            </tr>
-            <tr>
-                <td style="padding: 5px;"><strong>市场特征</strong>:</td>
-                <td style="padding: 5px; color: #d32f2f; font-weight: bold;">{regime.feature}</td>
-            </tr>
-            <tr>
-                <td style="padding: 5px;"><strong>起始日期</strong>:</td>
-                <td style="padding: 5px;">{regime.start}</td>
-            </tr>
-            <tr>
-                <td style="padding: 5px;"><strong>结束日期</strong>:</td>
-                <td style="padding: 5px;">{regime.end}</td>
-            </tr>
-            <tr>
-                <td style="padding: 5px;"><strong>开盘价</strong>:</td>
-                <td style="padding: 5px;">{regime.open_price:,.2f}</td>
-            </tr>
-            <tr>
-                <td style="padding: 5px;"><strong>收盘价</strong>:</td>
-                <td style="padding: 5px;">{regime.close_price:,.2f}</td>
-            </tr>
-            <tr>
-                <td style="padding: 5px;"><strong>涨跌幅</strong>:</td>
-                <td style="padding: 5px; color: {'#d32f2f' if regime.pct_change < 0 else '#388e3c'}; font-weight: bold;">
-                    {regime.pct_change:+.2f}%
-                </td>
-            </tr>
-        </table>
-    </div>
-"""
+    display_dataset_name = dataset_name or "N/A"
     
     # 格式化数值
     def format_value(v: Any) -> str:
@@ -1429,10 +1336,8 @@ def generate_html_report_with_charts(
 <body>
     <h1>Flagship Alpha-Momentum 综合回测报告</h1>
     <p><strong>报告生成时间</strong>: {report_date}</p>
-    <p><strong>数据集</strong>: {dataset_name}</p>
+    <p><strong>数据集</strong>: {display_dataset_name}</p>
     <p><strong>信号名称</strong>: {signal_name}</p>
-    
-    {regime_html}
     
     <div class="note">
         <strong>注意</strong>: 本报告中的价格数据为未调整价格（unadjusted prices），与Polygon API的 <code>adjusted=true</code> 参数返回的调整后价格可能不同。调整后价格会考虑拆股、分红等因素对历史价格的影响。
@@ -1539,6 +1444,12 @@ def main() -> None:
         default="v5",
         help="策略版本 (默认 v5)",
     )
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default=None,
+        help="因子评估使用的数据集名称（为空则跳过评估）",
+    )
     args = parser.parse_args()
 
     interval = Interval.DAILY if args.interval == "daily" else Interval.MINUTE
@@ -1580,6 +1491,7 @@ def main() -> None:
         commission_rate=args.commission_rate,
         rth_only=rth_only,
         strategy_version=strategy_version,
+        dataset_name=args.dataset_name,
     )
 
 

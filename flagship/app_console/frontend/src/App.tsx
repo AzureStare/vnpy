@@ -13,6 +13,7 @@ import { AccountsPage } from "./pages/AccountsPage";
 import { BacktestPage } from "./pages/BacktestPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { MonitorPage } from "./pages/MonitorPage";
 
 type OrdersSnapshot = {
   generated_at?: string;
@@ -151,10 +152,11 @@ function AppInner() {
 
   return (
     <Layout route={route} isAdmin={isAdmin} role={role} onLogout={onLogout}>
-      {route === "accounts" && isAdmin && <AccountsPage />}
+      {route === "accounts" && <AccountsPage />}
       {route === "portfolio" && <PortfolioPage />}
       {route === "backtest" && isAdmin && <BacktestPage />}
       {route === "reports" && <ReportsPage />}
+      {route === "monitor" && isAdmin && <MonitorPage />}
       {route === "settings" && isAdmin && <SettingsPage isAdmin={isAdmin} role={role} alerts={alerts} setAlerts={setAlerts} />}
     </Layout>
   );
