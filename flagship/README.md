@@ -76,11 +76,134 @@ python -m pip install alpaca-py polygon-api-client psycopg2-binary
 
 ### 1) 训练 +（可选）回测 Pipeline
 
+**必选参数**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `--start` | str | 训练/回测起始日期，格式 `YYYY-MM-DD` |
+| `--end` | str | 训练/回测结束日期，格式 `YYYY-MM-DD` |
+
+**可选参数**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--lab-path` | str | `lab/flagship_alpha_momentum` | AlphaLab 数据根目录 |
+| `--use-postgres-selection` | flag | True | 使用 PostgreSQL daily_selection 过滤股票 |
+| `--selection-strategy` | str | `v7` | 构建 daily_selection 的策略版本，可选 `v5` / `v7` |
+| `--dataset-strategy` | str | 同 selection | 生成 AlphaDataset 的策略版本，可选 `v5` / `v7` |
+| `--skip-selection` | flag | - | 跳过 daily_selection 构建 |
+| `--skip-prepare` | flag | - | 同 `--skip-selection`（兼容旧参数） |
+| `--skip-dataset` | flag | - | 跳过 AlphaDataset 生成 |
+| `--valid-days` | int | 60 | VALID 窗口天数 |
+| `--test-days` | int | 60 | TEST 窗口天数 |
+| `--gap-days` | int | 7 | VALID/TEST 前的间隔天数 |
+| `--extended-days` | int | 120 | 额外加载历史天数 |
+| `--max-workers` | int | None | 特征计算并行进程数 |
+| `--skip-diagnostics` | flag | - | 跳过因子诊断报告生成 |
+| `--llm-summary` | flag | False | 诊断报告中启用 LLM 总结（需 OpenAI key） |
+| `--llm-model` | str | `gpt-5.2` | LLM 模型名 |
+| `--llm-max-completion-tokens` | int | 2000 | LLM 最大完成 token 数 |
+| `--skip-train` | flag | - | 跳过训练（若模型已存在） |
+| `--run-backtest` | flag | - | 训练完成后运行回测 |
+| `--backtest-strategy` | str | 同 dataset | 回测策略版本，可选 `v5` / `v7` |
+| `--backtest-capital` | float | 1000000.0 | 回测初始资金 |
+| `--dataset-name` | str | 按日期生成 | 数据集名称 |
+| `--model-name` | str | 按日期生成 | 模型名称 |
+| `--signal-name` | str | 按日期生成 | 信号名称 |
+
+**用法示意（`[]` 表示可选参数）**
+
+```bash
+python -m flagship.scripts.run_lgb_pipeline \
+  --start YYYY-MM-DD \
+  --end YYYY-MM-DD \
+  [--lab-path lab/flagship_alpha_momentum] \
+  [--use-postgres-selection] \
+  [--selection-strategy v5|v7] \
+  [--dataset-strategy v5|v7] \
+  [--skip-selection] \
+  [--skip-prepare] \
+  [--skip-dataset] \
+  [--valid-days 60] \
+  [--test-days 60] \
+  [--gap-days 7] \
+  [--extended-days 120] \
+  [--max-workers 4] \
+  [--skip-diagnostics] \
+  [--llm-summary --llm-model gpt-5.2 --llm-max-completion-tokens 2000] \
+  [--skip-train] \
+  [--run-backtest --backtest-strategy v5|v7 --backtest-capital 1000000] \
+  [--dataset-name <name>] \
+  [--model-name <name>] \
+  [--signal-name <name>]
+```
+
+**示例：全参数（`[]` 表示可选；基于本地已有数据区间，可直接跑）**
+
+```bash
+python -m flagship.scripts.run_lgb_pipeline \
+  --start 2023-02-17 \
+  --end 2025-12-31 \
+  [--lab-path lab/flagship_alpha_momentum] \
+  [--use-postgres-selection] \
+  [--selection-strategy v7] \
+  [--dataset-strategy v7] \
+  [--skip-selection] \
+  [--skip-prepare] \
+  [--skip-dataset] \
+  [--valid-days 60] \
+  [--test-days 60] \
+  [--gap-days 7] \
+  [--extended-days 120] \
+  [--max-workers 4] \
+  [--skip-diagnostics] \
+  [--llm-summary --llm-model gpt-5.2 --llm-max-completion-tokens 2000] \
+  [--skip-train] \
+  [--run-backtest --backtest-strategy v7 --backtest-capital 1000000] \
+  [--dataset-name flagship_alpha_momentum_20240102_20240412_lgb] \
+  [--model-name flagship_alpha_momentum_20240102_20240412_lgb] \
+  [--signal-name flagship_alpha_momentum_20240102_20240412_lgb_signal]
+```
+
+**示例：最小运行（训练 + 回测）**
+
+```bash
+python -m flagship.scripts.run_lgb_pipeline \
+  --start  2023-02-17  \
+  --end 2025-12-31 \
+  --run-backtest
+```
+
+**示例：跳过选股、指定 lab、多进程、跑回测**
+
+```bash
+python -m flagship.scripts.run_lgb_pipeline \
+  --start  2023-02-17  \
+  --end 2025-12-31 \
+  --lab-path lab/flagship_alpha_momentum \
+  --skip-selection \
+  --max-workers 4 \
+  --run-backtest \
+  --backtest-capital 500000
+```
+
+**示例：只生成数据集 + 诊断（不训练、不回测）**
+
 ```bash
 python -m flagship.scripts.run_lgb_pipeline \
   --start 2024-01-02 \
   --end 2024-04-12 \
-  --run-backtest
+  --skip-train
+```
+
+**示例：启用 LLM 诊断总结**
+
+```bash
+python -m flagship.scripts.run_lgb_pipeline \
+  --start 2024-01-02 \
+  --end 2024-04-12 \
+  --llm-summary \
+  --llm-model gpt-4o
 ```
 
 ### 2) 回测入口（统一脚本）
@@ -93,16 +216,16 @@ python -m flagship.scripts.run_lgb_pipeline \
 1) 先跑 pipeline 生成数据/模型/信号：
 ```bash
 python -m flagship.scripts.run_lgb_pipeline \
-  --start 2024-01-02 \
-  --end 2024-04-12 \
+  --start  2023-02-17  \
+  --end 2025-12-31 \
   --run-backtest
 ```
 
 2) 直接回测（已有信号或可用占位信号）：
 ```bash
 python -m flagship.backtest.flagship_alpha_momentum_backtest \
-  --start 2024-01-02 \
-  --end 2024-04-12 \
+  --start  2023-02-17  \
+  --end 2025-12-31 \
   --interval minute \
   --rth-only \
   --strategy v7 \
@@ -111,8 +234,10 @@ python -m flagship.backtest.flagship_alpha_momentum_backtest \
 
 说明：
 - `--strategy v5|v7`：策略版本
-- `--signal-name`：指定信号文件名（不指定则使用默认名）
+- `--signal-name`：指定信号文件名（不指定则自动加载 `lab/flagship_alpha_momentum/signal/` 下最近更新的 parquet）
 - `--no-postgres-selection`：不依赖 Postgres 选股
+- 默认不会生成占位信号：如果 `lab/flagship_alpha_momentum/signal/` 下没有任何可用信号文件，会直接报错提示先生成信号（推荐先跑 `run_lgb_pipeline`）。
+- 如需旧行为（信号缺失时用滚动收益率生成占位信号，仅用于调试），加 `--allow-naive-signal`。
 
 ### 3) 因子诊断报告（相关性/重要性/可选 LLM 总结）
 

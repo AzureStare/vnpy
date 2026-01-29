@@ -23,6 +23,33 @@ from vnpy.alpha.dataset import Segment, AlphaDataset
 from vnpy.trader.logger import logger
 
 
+FORWARD_LOOKAHEAD_COLUMNS: set[str] = {
+    # v7 数据集中用于分析的“远期收益/标签派生”列，训练特征禁止使用
+    "ret_5d",
+    "label_excess_5d",
+}
+
+
+def select_feature_columns(df: pl.DataFrame, *, label_col: str) -> list[str]:
+    """
+    选择训练特征列，显式剔除未来信息泄漏列。
+
+    注意：label_col 可能为 rank_5d / label_excess_5d / label 等，
+    但无论 label_col 选用哪个，都不允许把远期收益列当作特征。
+    """
+    base_exclude = {"datetime", "vt_symbol", "label", label_col}
+    feature_cols = [c for c in df.columns if c not in base_exclude]
+
+    removed = sorted(set(feature_cols).intersection(FORWARD_LOOKAHEAD_COLUMNS))
+    if removed:
+        feature_cols = [c for c in feature_cols if c not in FORWARD_LOOKAHEAD_COLUMNS]
+        logger.warning("[train_flagship_lgb] 已从特征中剔除前瞻列（防未来函数泄漏）：%s", removed)
+
+    for col in FORWARD_LOOKAHEAD_COLUMNS:
+        assert col not in feature_cols, f"Forward-looking column leaked into features: {col}"
+    return feature_cols
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train LightGBM model for Flagship Alpha-Momentum strategy."
@@ -193,8 +220,19 @@ def export_signal(
         return
 
     infer_df = infer_df.sort(["datetime", "vt_symbol"])
-    feature_cols = [c for c in infer_df.columns if c not in ("datetime", "vt_symbol", label_col, "label")]
-    preds = booster.predict(infer_df.select(feature_cols).to_pandas())
+    # 预测时必须与训练时特征维度完全一致（避免 ret_5d 等前瞻列混入导致 shape mismatch）
+    model_feature_cols = booster.feature_name()
+    if not model_feature_cols:
+        raise RuntimeError("[train_flagship_lgb] booster.feature_name() 为空，无法确定预测特征列")
+
+    missing = [c for c in model_feature_cols if c not in infer_df.columns]
+    if missing:
+        raise RuntimeError(
+            "[train_flagship_lgb] infer_df 缺少模型所需特征列，无法导出信号："
+            f"missing={missing}"
+        )
+
+    preds = booster.predict(infer_df.select(list(model_feature_cols)).to_pandas())
     
     # 选择要导出的列：包含所有因子列和特征列，用于回测和因子有效性评估
     # 基础列
@@ -277,7 +315,7 @@ def main() -> None:
         logger.warning("[train_flagship_lgb] 驗證數據為空，使用 TEST 作為驗證數據")
         valid_df = dataset.fetch_learn(Segment.TEST).sort(["datetime", "vt_symbol"])
 
-    feature_cols = [c for c in train_df.columns if c not in ("datetime", "vt_symbol", label_col, "label")]
+    feature_cols = select_feature_columns(train_df, label_col=label_col)
     train_set = build_lgb_dataset(train_df, label_col, feature_cols)
     valid_set = build_lgb_dataset(valid_df, label_col, feature_cols)
     

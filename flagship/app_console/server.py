@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from jose import JWTError, jwt
 import subprocess
 import os
+import sys
 from pathlib import Path
 from datetime import datetime, timedelta, date
 import statistics

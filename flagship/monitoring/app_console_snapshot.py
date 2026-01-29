@@ -38,6 +38,7 @@ from flagship.trading.execution.broker_ibkr import IbkrAdapter, IbkrConnection, 
 from flagship.trading.config import ALPACA_API_KEY, ALPACA_BASE_URL, ALPACA_SECRET_KEY, LAB_PATH, SETTINGS as VT_SETTINGS
 from flagship.trading.config import load_ibkr_accounts
 from flagship.universe.pg_ticker_db import get_pg_connection
+from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
 from vnpy.alpha.lab import AlphaLab
 from vnpy.trader.constant import Interval
 from vnpy.trader.logger import logger
@@ -97,6 +98,91 @@ def _count_open_orders(orders_payload: dict | None) -> int:
         if status in ("new", "accepted", "pending_new", "submitted", "held", "partially_filled"):
             cnt += 1
     return cnt
+
+
+def _emit_portfolio_metrics(data: dict[str, Any]) -> None:
+    try:
+        account = data.get("account") if isinstance(data.get("account"), dict) else {}
+        positions = data.get("positions") if isinstance(data.get("positions"), list) else []
+        positions_count = float(len(positions))
+        total_market_value = 0.0
+        for p in positions:
+            try:
+                total_market_value += float(p.get("market_value") or 0)
+            except Exception:
+                continue
+
+        writer = TextfileMetricsWriter("flagship_ops_portfolio.prom")
+        samples = [
+            Sample("flagship_portfolio_positions_count", positions_count),
+            Sample("flagship_portfolio_positions_market_value", float(total_market_value)),
+            Sample("flagship_portfolio_cash", float(account.get("cash") or 0.0)),
+            Sample("flagship_portfolio_equity", float(account.get("equity") or 0.0)),
+            Sample("flagship_portfolio_buying_power", float(account.get("buying_power") or 0.0)),
+        ]
+        writer.write(
+            samples,
+            help_map={
+                "flagship_portfolio_positions_count": "Number of positions in current portfolio.",
+                "flagship_portfolio_positions_market_value": "Total market value of positions (USD).",
+                "flagship_portfolio_cash": "Account cash balance (USD).",
+                "flagship_portfolio_equity": "Account equity (USD).",
+                "flagship_portfolio_buying_power": "Account buying power (USD).",
+            },
+            type_map={
+                "flagship_portfolio_positions_count": "gauge",
+                "flagship_portfolio_positions_market_value": "gauge",
+                "flagship_portfolio_cash": "gauge",
+                "flagship_portfolio_equity": "gauge",
+                "flagship_portfolio_buying_power": "gauge",
+            },
+        )
+    except Exception as exc:
+        logger.warning(f"[app_console_snapshot] emit portfolio metrics failed: {exc}")
+
+
+def _emit_orders_metrics(data: dict[str, Any]) -> None:
+    try:
+        orders = data.get("orders") if isinstance(data.get("orders"), list) else []
+        total = len(orders)
+        open_cnt = 0
+        rejected_cnt = 0
+        filled_cnt = 0
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            status = str(o.get("status") or "").lower()
+            if status in ("new", "accepted", "pending_new", "submitted", "held", "partially_filled"):
+                open_cnt += 1
+            if status in ("rejected",):
+                rejected_cnt += 1
+            if status in ("filled",):
+                filled_cnt += 1
+
+        writer = TextfileMetricsWriter("flagship_ops_orders.prom")
+        samples = [
+            Sample("flagship_orders_total", float(total)),
+            Sample("flagship_orders_open_count", float(open_cnt)),
+            Sample("flagship_orders_rejected_total", float(rejected_cnt)),
+            Sample("flagship_orders_filled_total", float(filled_cnt)),
+        ]
+        writer.write(
+            samples,
+            help_map={
+                "flagship_orders_total": "Total orders in last snapshot.",
+                "flagship_orders_open_count": "Open orders count in last snapshot.",
+                "flagship_orders_rejected_total": "Rejected orders count in last snapshot.",
+                "flagship_orders_filled_total": "Filled orders count in last snapshot.",
+            },
+            type_map={
+                "flagship_orders_total": "gauge",
+                "flagship_orders_open_count": "gauge",
+                "flagship_orders_rejected_total": "gauge",
+                "flagship_orders_filled_total": "gauge",
+            },
+        )
+    except Exception as exc:
+        logger.warning(f"[app_console_snapshot] emit orders metrics failed: {exc}")
 
 def _load_json_file(path: Path) -> dict | None:
     try:
@@ -476,6 +562,7 @@ def snapshot_portfolio(output_dir: Path) -> Dict[str, Any]:
     target = output_dir / "portfolio.json"
     _atomic_write_json(target, data)
     logger.info(f"[app_console_snapshot] wrote {target}")
+    _emit_portfolio_metrics(data)
     return data
 
 
@@ -561,6 +648,7 @@ def snapshot_orders(output_dir: Path, limit: int = 1000) -> Dict[str, Any]:
     target = output_dir / "orders.json"
     _atomic_write_json(target, data)
     logger.info(f"[app_console_snapshot] wrote {target} ({len(orders)} orders)")
+    _emit_orders_metrics(data)
     return data
 
 

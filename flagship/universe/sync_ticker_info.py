@@ -12,7 +12,7 @@ if __package__ in (None, ""):
 from flagship.config import VT_SETTING_PATH
 from flagship.universe.pg_ticker_db import upsert_ref_ticker, upsert_ticker_detail, get_ref_tickers
 from vnpy.trader.logger import logger
-from polygon import RESTClient
+from polygon.rest import RESTClient
 
 def get_market_cap_from_massive_v3(symbol: str, api_key: str, trade_date: Optional[date] = None) -> Optional[float]:
     """从 Massive.com V3 Ticker Overview API 获取特定日期的市值"""

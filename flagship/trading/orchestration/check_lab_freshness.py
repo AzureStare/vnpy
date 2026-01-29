@@ -19,6 +19,7 @@ AlphaLab parquet 新鲜度检查（bars/signal/dataset）+ 自动修复。
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -41,6 +42,7 @@ from flagship.trading.orchestration.run_live_inference import run_live_inference
 
 
 EASTERN = ZoneInfo("America/New_York")
+DEFAULT_CHECK_MINUTE_BARS = os.getenv("FLAGSHIP_CHECK_MINUTE_BARS", "0") == "1"
 
 
 @dataclass(frozen=True)
@@ -50,7 +52,12 @@ class FreshnessResult:
     bars_total: int
     bars_missing: int
     bars_stale: int
+    minute_bars_total: int
+    minute_bars_missing: int
+    minute_bars_stale: int
     signal_ok: bool
+    signal_mtime_ts: float | None
+    signal_age_seconds: float | None
     model_ok: bool
     dataset_ok: bool
 
@@ -150,6 +157,36 @@ def _check_daily_bars(
     return total, missing, stale
 
 
+def _check_minute_bars(
+    lab: AlphaLab,
+    vt_symbols: Iterable[str],
+    expected_date: date,
+) -> tuple[int, int, int]:
+    """
+    Returns:
+        (total, missing_count, stale_count)
+    """
+    minute_path = lab.minute_path
+    total = 0
+    missing = 0
+    stale = 0
+
+    for vt_symbol in vt_symbols:
+        total += 1
+        file_path = minute_path / f"{vt_symbol}.parquet"
+        if not file_path.exists():
+            missing += 1
+            continue
+        try:
+            max_dt = _max_bar_date(file_path)
+            if max_dt is None or max_dt < expected_date:
+                stale += 1
+        except Exception:
+            stale += 1
+
+    return total, missing, stale
+
+
 def _check_signal_file(lab_path: Path, expected_date: date) -> bool:
     signal_path = lab_path / "signal" / "daily_signal.parquet"
     if not signal_path.exists():
@@ -164,6 +201,16 @@ def _check_signal_file(lab_path: Path, expected_date: date) -> bool:
         return bool(last_dt) and last_dt.date() == expected_date
     except Exception:
         return False
+
+
+def _signal_mtime(lab_path: Path) -> float | None:
+    signal_path = lab_path / "signal" / "daily_signal.parquet"
+    if not signal_path.exists():
+        return None
+    try:
+        return float(signal_path.stat().st_mtime)
+    except Exception:
+        return None
 
 
 def _check_live_model_file(lab_path: Path, expected_date: date) -> bool:
@@ -211,10 +258,22 @@ def _emit_freshness_metrics(result: FreshnessResult, *, ok: bool) -> None:
             Sample("flagship_lab_bars_total", float(result.bars_total)),
             Sample("flagship_lab_bars_missing", float(result.bars_missing)),
             Sample("flagship_lab_bars_stale", float(result.bars_stale)),
+            Sample("flagship_lab_minute_bars_total", float(result.minute_bars_total)),
+            Sample("flagship_lab_minute_bars_missing", float(result.minute_bars_missing)),
+            Sample("flagship_lab_minute_bars_stale", float(result.minute_bars_stale)),
             Sample("flagship_lab_signal_ok", 1.0 if result.signal_ok else 0.0),
             Sample("flagship_lab_model_ok", 1.0 if result.model_ok else 0.0),
             Sample("flagship_lab_dataset_ok", 1.0 if result.dataset_ok else 0.0),
         ]
+
+        if result.signal_mtime_ts is not None:
+            samples.append(
+                Sample("flagship_lab_signal_mtime_timestamp_seconds", float(result.signal_mtime_ts))
+            )
+        if result.signal_age_seconds is not None:
+            samples.append(
+                Sample("flagship_lab_signal_age_seconds", float(result.signal_age_seconds))
+            )
 
         writer.write(
             samples=samples,
@@ -226,7 +285,12 @@ def _emit_freshness_metrics(result: FreshnessResult, *, ok: bool) -> None:
                 "flagship_lab_bars_total": "Total symbols checked (U_t).",
                 "flagship_lab_bars_missing": "Missing daily bar parquet count (U_t).",
                 "flagship_lab_bars_stale": "Stale daily bar parquet count (max(date) < expected_date) (U_t).",
+                "flagship_lab_minute_bars_total": "Total symbols checked for minute bars (U_t).",
+                "flagship_lab_minute_bars_missing": "Missing minute bar parquet count (U_t).",
+                "flagship_lab_minute_bars_stale": "Stale minute bar parquet count (max(date) < expected_date) (U_t).",
                 "flagship_lab_signal_ok": "Signal parquet exists and matches expected_date.",
+                "flagship_lab_signal_mtime_timestamp_seconds": "Signal parquet mtime timestamp (epoch seconds).",
+                "flagship_lab_signal_age_seconds": "Signal parquet age in seconds.",
                 "flagship_lab_model_ok": "Live model file exists and is not older than expected_date.",
                 "flagship_lab_dataset_ok": "Dataset directory freshness check (best-effort).",
             },
@@ -238,7 +302,12 @@ def _emit_freshness_metrics(result: FreshnessResult, *, ok: bool) -> None:
                 "flagship_lab_bars_total": "gauge",
                 "flagship_lab_bars_missing": "gauge",
                 "flagship_lab_bars_stale": "gauge",
+                "flagship_lab_minute_bars_total": "gauge",
+                "flagship_lab_minute_bars_missing": "gauge",
+                "flagship_lab_minute_bars_stale": "gauge",
                 "flagship_lab_signal_ok": "gauge",
+                "flagship_lab_signal_mtime_timestamp_seconds": "gauge",
+                "flagship_lab_signal_age_seconds": "gauge",
                 "flagship_lab_model_ok": "gauge",
                 "flagship_lab_dataset_ok": "gauge",
             },
@@ -255,6 +324,7 @@ def check_lab_freshness(
     check_model: bool = True,
     check_signals: bool = True,
     check_datasets: bool = True,
+    check_minute_bars: bool = DEFAULT_CHECK_MINUTE_BARS,
 ) -> FreshnessResult:
     lab = AlphaLab(str(lab_path))
 
@@ -289,6 +359,13 @@ def check_lab_freshness(
 
     # U_t bars（强制要求对齐）
     total, missing, stale = _check_daily_bars(lab, symbols_to_check, expected_date)
+
+    # U_t minute bars（可选）
+    minute_total = 0
+    minute_missing = 0
+    minute_stale = 0
+    if check_minute_bars:
+        minute_total, minute_missing, minute_stale = _check_minute_bars(lab, symbols_to_check, expected_date)
 
     # U_train bars（仅提示，不阻塞）
     train_total = 0
@@ -328,8 +405,13 @@ def check_lab_freshness(
             model_ok = _check_live_model_file(lab_path, expected_date)
 
     signal_ok = True
+    signal_mtime_ts: float | None = None
+    signal_age_seconds: float | None = None
     if check_signals:
         signal_ok = _check_signal_file(lab_path, expected_date)
+        signal_mtime_ts = _signal_mtime(lab_path)
+        if signal_mtime_ts is not None:
+            signal_age_seconds = max(0.0, float(time.time() - signal_mtime_ts))
         if fix and not signal_ok:
             logger.warning("[check_lab_freshness] signal 缺失/过旧，尝试重新推理生成")
             run_live_inference(
@@ -339,6 +421,9 @@ def check_lab_freshness(
                 output_file=lab_path / "signal" / "daily_signal.parquet",
             )
             signal_ok = _check_signal_file(lab_path, expected_date)
+            signal_mtime_ts = _signal_mtime(lab_path)
+            if signal_mtime_ts is not None:
+                signal_age_seconds = max(0.0, float(time.time() - signal_mtime_ts))
 
     dataset_ok = True
     if check_datasets:
@@ -350,7 +435,12 @@ def check_lab_freshness(
         bars_total=total,
         bars_missing=missing,
         bars_stale=stale,
+        minute_bars_total=minute_total,
+        minute_bars_missing=minute_missing,
+        minute_bars_stale=minute_stale,
         signal_ok=signal_ok,
+        signal_mtime_ts=signal_mtime_ts,
+        signal_age_seconds=signal_age_seconds,
         model_ok=model_ok,
         dataset_ok=dataset_ok,
     )
@@ -358,6 +448,7 @@ def check_lab_freshness(
     logger.info(
         f"[check_lab_freshness] selection={result.selection_count}, "
         f"bars(selection_total={result.bars_total}, missing={result.bars_missing}, stale={result.bars_stale}), "
+        f"minute_bars(total={result.minute_bars_total}, missing={result.minute_bars_missing}, stale={result.minute_bars_stale}), "
         f"train_universe={len(u_train)}, train_bars(missing={train_missing}, stale={train_stale}), "
         f"model_ok={result.model_ok}, signal_ok={result.signal_ok}, dataset_ok={result.dataset_ok}"
     )
@@ -366,6 +457,7 @@ def check_lab_freshness(
         result.selection_count > 0
         and result.bars_missing == 0
         and result.bars_stale == 0
+        and (not check_minute_bars or (result.minute_bars_missing == 0 and result.minute_bars_stale == 0))
         and (result.signal_ok)
         and (result.model_ok)
         and (result.dataset_ok)
@@ -384,6 +476,7 @@ def main() -> None:
     parser.add_argument("--no-check-model", action="store_true", help="Skip live model freshness check (bars-only mode).")
     parser.add_argument("--no-check-signals", action="store_true")
     parser.add_argument("--no-check-datasets", action="store_true")
+    parser.add_argument("--check-minute-bars", action="store_true", help="Check minute bars freshness for U_t.")
     args = parser.parse_args()
 
     lab_path = Path(args.lab_path)
@@ -401,6 +494,7 @@ def main() -> None:
         check_model=not args.no_check_model,
         check_signals=not args.no_check_signals,
         check_datasets=not args.no_check_datasets,
+        check_minute_bars=bool(args.check_minute_bars),
     )
 
     # 若仍不满足 freshness，返回非 0，便于 cron 报警

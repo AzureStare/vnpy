@@ -36,6 +36,7 @@ from vnpy.trader.logger import logger
 
 from flagship.config import PROJECT_ROOT
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
+from flagship.monitoring.data_source_health import DataSourceHealthMonitor
 from flagship.trading.config import LAB_PATH, LIVE_MODEL_PATH, LIVE_LR_MODEL_PATH, DAILY_SIGNAL_FILE
 from flagship.trading.calendar import (
     describe_trading_date,
@@ -223,6 +224,12 @@ def run_daily_cycle(
     metrics.holiday_mode = "1" if is_market_closed_day(trading_date) else "0"
     metrics.start()
 
+    # Data source health probe (best-effort)
+    try:
+        DataSourceHealthMonitor(min_interval_seconds=300).emit()
+    except Exception as exc:
+        logger.warning(f"[DailyCycle] data source health probe failed: {exc}")
+
     logger.info(f"[DailyCycle] trading_date={trading_date} {describe_trading_date(trading_date)}")
 
     lab = AlphaLab(str(lab_path))
@@ -258,6 +265,7 @@ def run_daily_cycle(
                     check_model=False,
                     check_signals=False,
                     check_datasets=False,
+                    check_minute_bars=True,
                 )
             metrics.mark_done()
             return
@@ -288,7 +296,12 @@ def run_daily_cycle(
 
         # 4.5) Freshness check & auto-fix
         with _step(metrics, "4_5_check_lab_freshness"):
-            check_lab_freshness(lab_path=lab_path, expected_date=data_date, fix=True)
+            check_lab_freshness(
+                lab_path=lab_path,
+                expected_date=data_date,
+                fix=True,
+                check_minute_bars=True,
+            )
 
         # 5) Train model (weekly on Mondays, or if missing)
         # Also train when LR meta model is missing, to ensure inference can produce p_up/final_signal.

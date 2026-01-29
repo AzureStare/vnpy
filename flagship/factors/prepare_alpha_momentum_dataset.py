@@ -20,6 +20,9 @@ DEFAULT_VALID_DAYS = 60
 DEFAULT_TEST_DAYS = 60
 DEFAULT_GAP_DAYS = 7
 DEFAULT_EXTENDED_DAYS = 120
+DEFAULT_SPLIT_MODE = "ratio"
+DEFAULT_VALID_RATIO = 0.15
+DEFAULT_TEST_RATIO = 0.15
 
 
 @dataclass(frozen=True)
@@ -29,8 +32,11 @@ class PrepareConfig:
     strategy: str
     start_date: date
     end_date: date
+    split_mode: str
     valid_days: int
     test_days: int
+    valid_ratio: float
+    test_ratio: float
     gap_days: int
     extended_days: int
     max_workers: int | None
@@ -42,9 +48,8 @@ def _parse_date(value: str) -> date:
 
 def _build_periods(cfg: PrepareConfig) -> tuple[tuple[str, str], tuple[str, str], tuple[str, str]]:
     assert cfg.start_date <= cfg.end_date, "start_date must be <= end_date"
-    valid_days = max(int(cfg.valid_days), 1)
-    test_days = max(int(cfg.test_days), 1)
     gap_days = max(int(cfg.gap_days), 0)
+    split_mode = str(cfg.split_mode).strip().lower()
 
     total_days = (cfg.end_date - cfg.start_date).days + 1
     min_required = 2 * gap_days + 2
@@ -52,6 +57,49 @@ def _build_periods(cfg: PrepareConfig) -> tuple[tuple[str, str], tuple[str, str]
         raise ValueError(
             f"区间过短：总天数={total_days}，至少需要 {min_required} 天才能完成切分"
         )
+
+    if split_mode not in {"fixed", "ratio"}:
+        raise ValueError(f"Unsupported split_mode: {split_mode} (expected fixed|ratio)")
+
+    if split_mode == "fixed":
+        valid_days = max(int(cfg.valid_days), 1)
+        test_days = max(int(cfg.test_days), 1)
+    else:
+        valid_ratio = float(cfg.valid_ratio)
+        test_ratio = float(cfg.test_ratio)
+        if not (0.0 < valid_ratio < 1.0):
+            raise ValueError(f"valid_ratio must be in (0,1), got {valid_ratio}")
+        if not (0.0 < test_ratio < 1.0):
+            raise ValueError(f"test_ratio must be in (0,1), got {test_ratio}")
+
+        # ratio 模式：按区间比例切分，但需保留 gap 并确保 train/valid/test 至少各 1 天
+        usable = total_days - 2 * gap_days
+        if usable < 3:
+            raise ValueError(
+                f"区间过短：total_days={total_days}，gap_days={gap_days}，"
+                f"扣除 gap 后仅剩 usable={usable}（至少需要 3 天用于 train/valid/test）"
+            )
+        remaining = usable - 1  # 至少预留 1 天给 train
+        valid_days = max(1, int(round(remaining * valid_ratio)))
+        test_days = max(1, int(round(remaining * test_ratio)))
+
+        overflow = valid_days + test_days - remaining
+        if overflow > 0:
+            # 优先从更大的窗口扣减，确保两者都 >= 1
+            if valid_days >= test_days:
+                valid_days = max(1, valid_days - overflow)
+            else:
+                test_days = max(1, test_days - overflow)
+            if valid_days + test_days > remaining:
+                # 仍然溢出时做兜底：强制 test 保留 1 天，其余给 valid
+                test_days = 1
+                valid_days = max(1, remaining - test_days)
+            logger.warning(
+                "[prepare_dataset] ratio 切分窗口过大，已自动调整 valid/test 为 %s/%s 天（remaining=%s）",
+                valid_days,
+                test_days,
+                remaining,
+            )
 
     required_non_train = valid_days + test_days + 2 * gap_days
     if required_non_train >= total_days:
@@ -150,8 +198,27 @@ def main() -> None:
     parser.add_argument("--strategy", type=str, choices=["v5", "v7"], default="v7")
     parser.add_argument("--start", type=str, required=True)
     parser.add_argument("--end", type=str, required=True)
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        choices=["fixed", "ratio"],
+        default=DEFAULT_SPLIT_MODE,
+        help="数据集切分方式：fixed=固定天数窗口；ratio=按区间比例切分（默认 ratio）",
+    )
     parser.add_argument("--valid-days", type=int, default=DEFAULT_VALID_DAYS)
     parser.add_argument("--test-days", type=int, default=DEFAULT_TEST_DAYS)
+    parser.add_argument(
+        "--valid-ratio",
+        type=float,
+        default=DEFAULT_VALID_RATIO,
+        help="ratio 模式下 VALID 占比（0,1），默认 0.15",
+    )
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=DEFAULT_TEST_RATIO,
+        help="ratio 模式下 TEST 占比（0,1），默认 0.15",
+    )
     parser.add_argument("--gap-days", type=int, default=DEFAULT_GAP_DAYS)
     parser.add_argument("--extended-days", type=int, default=DEFAULT_EXTENDED_DAYS)
     parser.add_argument("--max-workers", type=int, default=None)
@@ -164,8 +231,11 @@ def main() -> None:
         strategy=str(args.strategy),
         start_date=_parse_date(args.start),
         end_date=_parse_date(args.end),
+        split_mode=str(args.split_mode),
         valid_days=int(args.valid_days),
         test_days=int(args.test_days),
+        valid_ratio=float(args.valid_ratio),
+        test_ratio=float(args.test_ratio),
         gap_days=int(args.gap_days),
         extended_days=int(args.extended_days),
         max_workers=args.max_workers if args.max_workers else None,

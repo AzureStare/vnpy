@@ -38,6 +38,7 @@ from flagship.trading.orchestration.check_lab_freshness import check_lab_freshne
 from flagship.trading.execution.open_rebalance import StrategyRunner, execute_rebalance
 from flagship.trading.controls import get_buy_exposure_multiplier, get_disabled_vt_symbols
 from flagship.trading.realtime.polygon_ws import PolygonTradePriceCache
+from flagship.monitoring.data_source_health import DataSourceHealthMonitor
 
 
 EASTERN = ZoneInfo("America/New_York")
@@ -261,6 +262,7 @@ def run_daemon(
 
     state = _load_state(state_path)
     metrics_writer = TextfileMetricsWriter("flagship_executor_daemon.prom")
+    health_monitor = DataSourceHealthMonitor(min_interval_seconds=300)
 
     errors_total = 0
     ws_cache: PolygonTradePriceCache | None = None
@@ -273,6 +275,11 @@ def run_daemon(
             now_utc = _clock_now_utc(clock)
             now_et = now_utc.astimezone(EASTERN)
             trade_date = now_et.date()
+
+            try:
+                health_monitor.maybe_emit()
+            except Exception as exc:
+                logger.warning(f"[ExecutorDaemon] data source health probe failed: {exc}")
 
             is_open = bool(getattr(clock, "is_open", False))
             next_open_utc = _clock_next_open_utc(clock)

@@ -30,6 +30,7 @@ from vnpy.alpha.strategy import AlphaStrategy
 
 from flagship.config.polygon_config import get_polygon_api_key
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
+from flagship.monitoring.order_metrics import classify_order_error
 from flagship.trading.execution.broker_alpaca import AlpacaAdapter
 from flagship.trading.config import DAILY_SIGNAL_FILE, LAB_PATH
 from flagship.trading.controls import get_disabled_vt_symbols
@@ -176,6 +177,11 @@ class LiveEngine:
         self.root_close: dict[str, float] = {}
         self.orders: dict[str, Any] = {}
         self._order_count = 0
+        self.order_submitted_total = 0
+        self.order_failed_total = 0
+        self.order_rejected_total = 0
+        self.order_skipped_total = 0
+        self.order_error_reasons: dict[str, int] = {}
         self.pending_exit_roots: dict[str, datetime] = {}
         self.open_sell_roots_cache: set[str] = set()
         self.open_sell_roots_cache_ts: datetime | None = None
@@ -242,6 +248,7 @@ class LiveEngine:
             logger.warning(
                 f"[IntradayRunner] exit-only: ignore OPEN order {oid} {vt_symbol} {direction} {volume}"
             )
+            self.order_skipped_total += 1
             return []
 
         root = vt_symbol.split(".")[0]
@@ -252,21 +259,33 @@ class LiveEngine:
         last_exit_at = self.pending_exit_roots.get(root)
         if last_exit_at and (now - last_exit_at).total_seconds() < EXIT_ORDER_COOLDOWN_SECONDS:
             logger.info(f"[IntradayRunner] {root} 离场冷却中，跳过重复卖单")
+            self.order_skipped_total += 1
             return []
         if root in self._get_open_sell_roots():
             logger.info(f"[IntradayRunner] {root} 已有未完成卖单，跳过重复卖单")
             self.pending_exit_roots.setdefault(root, now)
+            self.order_skipped_total += 1
             return []
 
         # 平多仓 -> Alpaca SELL
         if offset == Offset.CLOSE and direction == Direction.SHORT:
             sell_qty = min(int(volume), int(current_qty))
             if sell_qty <= 0:
+                self.order_skipped_total += 1
                 return []
             if OrderSide is None:
                 logger.error("[IntradayRunner] alpaca-py OrderSide not available, cannot send orders.")
+                self.order_failed_total += 1
                 return []
-            self.adapter.place_order(root, sell_qty, OrderSide.SELL)
+            try:
+                self.adapter.place_order(root, sell_qty, OrderSide.SELL)
+                self.order_submitted_total += 1
+            except Exception as exc:
+                self.order_failed_total += 1
+                reason, rejected = classify_order_error(exc)
+                self.order_error_reasons[reason] = self.order_error_reasons.get(reason, 0) + 1
+                if rejected:
+                    self.order_rejected_total += 1
             self.pending_exit_roots[root] = now
             return []
 
@@ -274,27 +293,48 @@ class LiveEngine:
         if offset == Offset.CLOSE and direction == Direction.LONG:
             buy_qty = int(volume)
             if buy_qty <= 0:
+                self.order_skipped_total += 1
                 return []
             if OrderSide is None:
                 logger.error("[IntradayRunner] alpaca-py OrderSide not available, cannot send orders.")
+                self.order_failed_total += 1
                 return []
-            self.adapter.place_order(root, buy_qty, OrderSide.BUY)
+            try:
+                self.adapter.place_order(root, buy_qty, OrderSide.BUY)
+                self.order_submitted_total += 1
+            except Exception as exc:
+                self.order_failed_total += 1
+                reason, rejected = classify_order_error(exc)
+                self.order_error_reasons[reason] = self.order_error_reasons.get(reason, 0) + 1
+                if rejected:
+                    self.order_rejected_total += 1
             return []
 
         # full 模式允许开仓下单
         if offset == Offset.OPEN and direction == Direction.LONG:
             buy_qty = int(volume)
             if buy_qty <= 0:
+                self.order_skipped_total += 1
                 return []
             if OrderSide is None:
                 logger.error("[IntradayRunner] alpaca-py OrderSide not available, cannot send orders.")
+                self.order_failed_total += 1
                 return []
-            self.adapter.place_order(root, buy_qty, OrderSide.BUY)
+            try:
+                self.adapter.place_order(root, buy_qty, OrderSide.BUY)
+                self.order_submitted_total += 1
+            except Exception as exc:
+                self.order_failed_total += 1
+                reason, rejected = classify_order_error(exc)
+                self.order_error_reasons[reason] = self.order_error_reasons.get(reason, 0) + 1
+                if rejected:
+                    self.order_rejected_total += 1
             return []
 
         if offset == Offset.OPEN and direction == Direction.SHORT:
             # 不支持
             logger.warning(f"[IntradayRunner] ignore SHORT OPEN {vt_symbol} volume={volume}")
+            self.order_skipped_total += 1
             return []
 
         return []
@@ -633,7 +673,31 @@ def main() -> None:
                 name="flagship_intraday_runner_ws_consecutive_errors",
                 value=float(ws_consecutive_errors),
             ),
+            Sample(
+                name="flagship_intraday_runner_order_submitted_total",
+                value=float(engine.order_submitted_total),
+            ),
+            Sample(
+                name="flagship_intraday_runner_order_failed_total",
+                value=float(engine.order_failed_total),
+            ),
+            Sample(
+                name="flagship_intraday_runner_order_rejected_total",
+                value=float(engine.order_rejected_total),
+            ),
+            Sample(
+                name="flagship_intraday_runner_order_skipped_total",
+                value=float(engine.order_skipped_total),
+            ),
         ]
+        for reason, count in sorted(engine.order_error_reasons.items()):
+            samples.append(
+                Sample(
+                    name="flagship_intraday_runner_order_errors_total",
+                    value=float(count),
+                    labels={"reason": reason},
+                )
+            )
         if heartbeat_dt is not None:
             samples.append(
                 Sample(
@@ -651,6 +715,11 @@ def main() -> None:
                 "flagship_intraday_runner_ws_errors_total": "Total WS errors observed in current process.",
                 "flagship_intraday_runner_ws_consecutive_errors": "Consecutive WS errors (for fallback/backoff).",
                 "flagship_intraday_runner_last_processed_minute": "Last processed minute timestamp (ET).",
+                "flagship_intraday_runner_order_submitted_total": "Orders submitted by intraday runner (process lifetime).",
+                "flagship_intraday_runner_order_failed_total": "Orders failed by intraday runner (process lifetime).",
+                "flagship_intraday_runner_order_rejected_total": "Orders rejected by broker (process lifetime).",
+                "flagship_intraday_runner_order_skipped_total": "Orders skipped by runner (process lifetime).",
+                "flagship_intraday_runner_order_errors_total": "Order errors by reason (process lifetime).",
             },
             type_map={
                 "flagship_intraday_runner_heartbeat_timestamp_seconds": "gauge",
@@ -659,6 +728,11 @@ def main() -> None:
                 "flagship_intraday_runner_ws_errors_total": "gauge",
                 "flagship_intraday_runner_ws_consecutive_errors": "gauge",
                 "flagship_intraday_runner_last_processed_minute": "gauge",
+                "flagship_intraday_runner_order_submitted_total": "gauge",
+                "flagship_intraday_runner_order_failed_total": "gauge",
+                "flagship_intraday_runner_order_rejected_total": "gauge",
+                "flagship_intraday_runner_order_skipped_total": "gauge",
+                "flagship_intraday_runner_order_errors_total": "gauge",
             },
         )
 

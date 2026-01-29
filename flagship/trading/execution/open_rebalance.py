@@ -27,6 +27,7 @@ from vnpy.trader.logger import logger
 from vnpy.trader.object import BarData
 
 from flagship.monitoring.textfile_metrics import Sample, TextfileMetricsWriter
+from flagship.monitoring.order_metrics import classify_order_error
 from flagship.trading.config import LAB_PATH
 from flagship.trading.controls import get_disabled_vt_symbols
 from flagship.trading.execution.broker_base import BrokerAdapter, OrderSide
@@ -195,6 +196,8 @@ class StrategyRunner:
         return targets
 
 
+
+
 def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_exposure_multiplier: float = 1.0) -> None:
     """
     Compare targets with actual positions and execute orders (market orders).
@@ -204,6 +207,10 @@ def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_
     metrics_writer = TextfileMetricsWriter("flagship_executor.prom")
     sell_orders_submitted = 0
     buy_orders_submitted = 0
+    sell_orders_failed = 0
+    buy_orders_failed = 0
+    order_rejected_total = 0
+    error_reasons: dict[str, int] = {}
     buy_scale_ratio = 1.0
 
     current_positions = adapter.get_positions()
@@ -223,6 +230,11 @@ def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_
                     adapter.place_order(symbol, sell_qty, OrderSide.SELL)
                     sell_orders_submitted += 1
                 except Exception as exc:
+                    sell_orders_failed += 1
+                    reason, rejected = classify_order_error(exc)
+                    error_reasons[reason] = error_reasons.get(reason, 0) + 1
+                    if rejected:
+                        order_rejected_total += 1
                     logger.error(f"[OpenRebalance] sell order failed {symbol} qty={sell_qty}: {exc}")
 
     # Liquidate positions not in targets
@@ -234,6 +246,11 @@ def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_
                 adapter.place_order(symbol, int(current_qty), OrderSide.SELL)
                 sell_orders_submitted += 1
             except Exception as exc:
+                sell_orders_failed += 1
+                reason, rejected = classify_order_error(exc)
+                error_reasons[reason] = error_reasons.get(reason, 0) + 1
+                if rejected:
+                    order_rejected_total += 1
                 logger.error(f"[OpenRebalance] liquidation sell failed {symbol} qty={int(current_qty)}: {exc}")
 
     time.sleep(2.0)
@@ -329,26 +346,48 @@ def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_
                     adapter.place_order(symbol, qty_slice, OrderSide.BUY)
                     buy_orders_submitted += 1
                 except Exception as exc:
+                    buy_orders_failed += 1
+                    reason, rejected = classify_order_error(exc)
+                    error_reasons[reason] = error_reasons.get(reason, 0) + 1
+                    if rejected:
+                        order_rejected_total += 1
                     logger.error(f"[OpenRebalance] failed to place order {symbol}: {exc}")
         
         if not is_last_step:
             time.sleep(twap_interval_s)
 
+    samples = [
+        Sample("flagship_executor_last_rebalance_timestamp_seconds", float(time.time())),
+        Sample("flagship_executor_sell_orders_submitted", float(sell_orders_submitted)),
+        Sample("flagship_executor_buy_orders_submitted", float(buy_orders_submitted)),
+        Sample("flagship_executor_sell_orders_failed", float(sell_orders_failed)),
+        Sample("flagship_executor_buy_orders_failed", float(buy_orders_failed)),
+        Sample("flagship_executor_order_rejected_total", float(order_rejected_total)),
+        Sample("flagship_executor_buy_scale_ratio", float(buy_scale_ratio)),
+        Sample("flagship_executor_buy_exposure_multiplier", float(m)),
+        Sample("flagship_executor_buying_power", float(buying_power)),
+        Sample("flagship_executor_budget", float(budget)),
+        Sample("flagship_executor_total_estimated_buy_cost", float(total_estimated_cost)),
+    ]
+    for reason, count in sorted(error_reasons.items()):
+        samples.append(
+            Sample(
+                "flagship_executor_order_errors_total",
+                float(count),
+                labels={"reason": reason},
+            )
+        )
+
     metrics_writer.write(
-        samples=[
-            Sample("flagship_executor_last_rebalance_timestamp_seconds", float(time.time())),
-            Sample("flagship_executor_sell_orders_submitted", float(sell_orders_submitted)),
-            Sample("flagship_executor_buy_orders_submitted", float(buy_orders_submitted)),
-            Sample("flagship_executor_buy_scale_ratio", float(buy_scale_ratio)),
-            Sample("flagship_executor_buy_exposure_multiplier", float(m)),
-            Sample("flagship_executor_buying_power", float(buying_power)),
-            Sample("flagship_executor_budget", float(budget)),
-            Sample("flagship_executor_total_estimated_buy_cost", float(total_estimated_cost)),
-        ],
+        samples=samples,
         help_map={
             "flagship_executor_last_rebalance_timestamp_seconds": "Last rebalance timestamp (epoch seconds).",
             "flagship_executor_sell_orders_submitted": "Number of sell orders submitted in last rebalance run.",
             "flagship_executor_buy_orders_submitted": "Number of buy orders submitted in last rebalance run.",
+            "flagship_executor_sell_orders_failed": "Number of sell orders failed in last rebalance run.",
+            "flagship_executor_buy_orders_failed": "Number of buy orders failed in last rebalance run.",
+            "flagship_executor_order_rejected_total": "Rejected orders count in last rebalance run.",
+            "flagship_executor_order_errors_total": "Order errors by reason in last rebalance run.",
             "flagship_executor_buy_scale_ratio": "Buy scaling ratio applied due to buying power constraint (1.0=no scale).",
             "flagship_executor_buy_exposure_multiplier": "Buy-side exposure multiplier applied to budget (0..1).",
             "flagship_executor_buying_power": "Buying power observed at the start of buy planning.",
@@ -359,6 +398,10 @@ def execute_rebalance(adapter: BrokerAdapter, targets: Dict[str, float], *, buy_
             "flagship_executor_last_rebalance_timestamp_seconds": "gauge",
             "flagship_executor_sell_orders_submitted": "gauge",
             "flagship_executor_buy_orders_submitted": "gauge",
+            "flagship_executor_sell_orders_failed": "gauge",
+            "flagship_executor_buy_orders_failed": "gauge",
+            "flagship_executor_order_rejected_total": "gauge",
+            "flagship_executor_order_errors_total": "gauge",
             "flagship_executor_buy_scale_ratio": "gauge",
             "flagship_executor_buy_exposure_multiplier": "gauge",
             "flagship_executor_buying_power": "gauge",

@@ -223,7 +223,57 @@ def save_backtest_report(
     logger.info(f"[save_backtest_report] 回测报告已保存到: {report_dir}")
 
 
-def load_signal(lab: AlphaLab, name: str) -> pl.DataFrame:
+def _normalize_signal_df(signal_df: pl.DataFrame) -> pl.DataFrame:
+    required_columns = {"datetime", "vt_symbol", "signal"}
+    missing = required_columns.difference(signal_df.columns)
+    if missing:
+        raise RuntimeError(f"Signal DataFrame missing columns: {sorted(missing)}")
+
+    # 确保正确的数据类型和排序
+    return (
+        signal_df.with_columns(
+            pl.col("datetime").cast(pl.Datetime, strict=False),
+            pl.col("vt_symbol").cast(pl.Utf8),
+            pl.col("signal").cast(pl.Float64),
+        )
+        .sort(["datetime", "vt_symbol"])
+    )
+
+
+def _load_latest_signal_from_folder(lab: AlphaLab) -> tuple[str, pl.DataFrame]:
+    """
+    从 lab/signal 目录中选择“最近更新”的 parquet 作为信号。
+
+    选择策略：
+    - 按文件 mtime 倒序尝试；
+    - 找到第一个满足最小列要求（datetime/vt_symbol/signal）的文件即返回；
+    - 若目录为空或均无效则抛错。
+    """
+    candidates = sorted(
+        lab.signal_path.glob("*.parquet"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise RuntimeError(f"No signal parquet found under {lab.signal_path}")
+
+    last_error: Exception | None = None
+    for path in candidates:
+        try:
+            df = pl.read_parquet(path)
+            df = _normalize_signal_df(df)
+            return path.stem, df
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+
+    raise RuntimeError(
+        f"No valid signal parquet found under {lab.signal_path}. "
+        f"Last error: {last_error}"
+    )
+
+
+def load_signal(lab: AlphaLab, name: str | None) -> pl.DataFrame:
     """
     加载模型信号用于回测。
 
@@ -232,23 +282,24 @@ def load_signal(lab: AlphaLab, name: str) -> pl.DataFrame:
         - vt_symbol: 合约代码，例如 'AAPL.NASDAQ'
         - signal: 数值得分，越高越好
     """
-    signal_df: pl.DataFrame | None = lab.load_signal(name)
-    if signal_df is None:
-        raise RuntimeError(f"Signal file not found for name={name!r}")
+    # 优先按名称精确加载；若缺失则回退到 signal 目录最近更新文件
+    requested_name = (name or "").strip()
+    if requested_name:
+        signal_df: pl.DataFrame | None = lab.load_signal(requested_name)
+        if signal_df is not None:
+            return _normalize_signal_df(signal_df)
 
-    required_columns = {"datetime", "vt_symbol", "signal"}
-    missing = required_columns.difference(signal_df.columns)
-    if missing:
-        raise RuntimeError(f"Signal DataFrame missing columns: {sorted(missing)}")
+        logger.warning(
+            f"[load_signal] Signal file not found for name={requested_name!r}, "
+            f"fallback to latest parquet under {lab.signal_path}"
+        )
 
-    # 确保正确的数据类型和排序
-    signal_df = signal_df.with_columns(
-        pl.col("datetime").cast(pl.Datetime, strict=False),
-        pl.col("vt_symbol").cast(pl.Utf8),
-        pl.col("signal").cast(pl.Float64),
-    ).sort(["datetime", "vt_symbol"])
-
-    return signal_df
+    selected_name, selected_df = _load_latest_signal_from_folder(lab)
+    if requested_name and selected_name != requested_name:
+        logger.info(f"[load_signal] Selected latest signal: {selected_name}")
+    elif not requested_name:
+        logger.info(f"[load_signal] Auto-selected latest signal: {selected_name}")
+    return selected_df
 
 
 def load_daily_selection_from_postgres(
@@ -369,7 +420,8 @@ def setup_backtest_logging(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     start_str = start.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
-    signal_short = signal_name.replace("flagship_alpha_momentum", "fam").replace("_signal", "")
+    safe_signal_name = signal_name or "auto_signal"
+    signal_short = safe_signal_name.replace("flagship_alpha_momentum", "fam").replace("_signal", "")
     
     log_filename = f"backtest_{timestamp}_{start_str}_{end_str}_{signal_short}.log"
     log_path = log_dir / log_filename
@@ -392,7 +444,7 @@ def run_backtest(
     start: datetime,
     end: datetime,
     interval: Interval = Interval.MINUTE,
-    signal_name: str = "flagship_alpha_momentum",
+    signal_name: str | None = None,
     initial_capital: int = 1_000_000,
     risk_free: float = 0.02,
     annual_days: int = 252,
@@ -404,6 +456,7 @@ def run_backtest(
     rth_only: bool | None = None,
     strategy_version: str = "v5",
     dataset_name: str | None = None,
+    allow_naive_signal: bool = False,
 ) -> dict[str, Any] | None:
     """
     运行 Flagship Alpha-Momentum 策略回测。
@@ -423,7 +476,7 @@ def run_backtest(
         dataset_name: 因子评估使用的数据集名称（为空则跳过因子有效性评估）
     """
     # 设置日志文件（必须在记录日志之前）
-    log_path = setup_backtest_logging(lab_path, start, end, signal_name)
+    log_path = setup_backtest_logging(lab_path, start, end, signal_name or "auto_signal")
     
     logger.info("=" * 80)
     logger.info(f"[run_backtest] 开始运行回测")
@@ -431,7 +484,7 @@ def run_backtest(
     logger.info(f"[run_backtest] Lab 路径: {lab_path}")
     logger.info(f"[run_backtest] 回测日期范围: {start} 到 {end}")
     logger.info(f"[run_backtest] K线周期: {interval}")
-    logger.info(f"[run_backtest] 信号文件名: {signal_name}")
+    logger.info(f"[run_backtest] 信号文件名: {signal_name or '(auto: latest under lab/signal)'}")
     logger.info(f"[run_backtest] 初始资金: {initial_capital:,}")
     logger.info(f"[run_backtest] 使用PostgreSQL选股: {use_postgres_selection}")
     logger.info(f"[run_backtest] 日志文件: {log_path}")
@@ -475,23 +528,31 @@ def run_backtest(
     # Universe 文件选股（legacy）已废弃：当前以 PostgreSQL daily_selection 为主。
     # 如需强制限定回测标的，请通过 run_backtest(vt_symbols=...) 传入。
     # 尝试加载信号
-    logger.info(f"[run_backtest] 尝试加载信号文件: {signal_name}")
+    logger.info(f"[run_backtest] 尝试加载信号文件: {signal_name or '(auto: latest under lab/signal)'}")
     signal_df = None
     try:
         signal_df = load_signal(lab, signal_name)
         logger.info(f"[run_backtest] 成功加载信号: {len(signal_df)} 行数据")
     except RuntimeError as exc:
-        logger.warning(f"[run_backtest] 信号文件不存在: {exc}")
-        logger.info(f"[run_backtest] 从 lab 推断股票列表...")
-        # 如果信号不存在，从 lab 推断股票列表并生成占位信号
+        # 默认：不再自动生成占位信号（避免“信号缺失时误跑很久”）。
+        # 如需旧行为可显式开启 allow_naive_signal。
+        if not allow_naive_signal:
+            raise RuntimeError(
+                "[run_backtest] 未找到可用信号文件。请先生成模型信号（推荐跑 pipeline）：\n"
+                "  python -m flagship.scripts.run_lgb_pipeline --start YYYY-MM-DD --end YYYY-MM-DD --run-backtest\n"
+                f"或至少确保 {Path(lab_path) / 'signal'} 目录下存在可用的 *.parquet（含 datetime/vt_symbol/signal）。\n"
+                f"原始错误: {exc}"
+            ) from exc
+
+        logger.warning(f"[run_backtest] 信号不可用: {exc}")
+        logger.info("[run_backtest] allow_naive_signal=True，回退为占位信号（基于滚动收益率）...")
         inferred_symbols = infer_vt_symbols_from_lab(lab, interval)
         if not inferred_symbols:
-            logger.error(f"[run_backtest] 无法推断股票列表，lab 中无数据")
-            raise RuntimeError("No vt_symbols found in lab and no signal available")
-        
-        logger.info(f"[run_backtest] 生成占位信号（基于滚动收益率）...")
+            logger.error("[run_backtest] 无法推断股票列表，lab 中无数据")
+            raise RuntimeError("No vt_symbols found in lab and no signal available") from exc
+
         signal_df = generate_naive_signal(lab, inferred_symbols, interval, start, end)
-        logger.warning(f"[run_backtest] 使用占位信号，建议先构建正式信号")
+        logger.warning("[run_backtest] 使用占位信号（naive），结果仅用于调试，不代表模型信号表现")
 
     if signal_df is not None and not signal_df.is_empty():
         signal_snapshot = signal_is_daily_snapshot(signal_df)
@@ -1405,8 +1466,13 @@ def main() -> None:
     parser.add_argument(
         "--signal-name",
         type=str,
-        default="flagship_alpha_momentum",
-        help="信号文件名（默认 flagship_alpha_momentum）",
+        default=None,
+        help="信号文件名（默认自动选择 lab/signal 下最近更新的 parquet）",
+    )
+    parser.add_argument(
+        "--allow-naive-signal",
+        action="store_true",
+        help="当信号缺失时允许生成占位信号（基于滚动收益率，仅用于调试；默认关闭）",
     )
     parser.add_argument(
         "--capital",
@@ -1474,10 +1540,8 @@ def main() -> None:
     else:
         end = end_in
 
-    # 如果信号名包含 v7 且 strategy 是默认值 v5，自动切换到 v7
+    # 策略版本以 CLI 参数为准（signal-name 允许为空，自动选最新信号）
     strategy_version = args.strategy
-    if "v7" in args.signal_name.lower() and strategy_version == "v5":
-        strategy_version = "v7"
 
     run_backtest(
         lab_path=args.lab_path,
@@ -1492,6 +1556,7 @@ def main() -> None:
         rth_only=rth_only,
         strategy_version=strategy_version,
         dataset_name=args.dataset_name,
+        allow_naive_signal=bool(args.allow_naive_signal),
     )
 
 
